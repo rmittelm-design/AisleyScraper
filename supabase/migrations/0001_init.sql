@@ -21,7 +21,6 @@ create table if not exists shopify_products (
   description text,
   sku text,
   updated_at text,
-  position integer,
   price_cents bigint,
   images jsonb not null,
   supabase_images jsonb not null default '[]'::jsonb,

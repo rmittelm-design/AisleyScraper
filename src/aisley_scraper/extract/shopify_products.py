@@ -253,7 +253,6 @@ def extract_products_from_products_json(
                 description=prod.get("body_html"),
                 sku=_extract_explicit_sku(prod),
                 updated_at=str(prod.get("updated_at")) if prod.get("updated_at") is not None else None,
-                position=_to_int(prod.get("position")),
                 price_cents=_extract_explicit_price_cents(prod),
                 images=images,
                 gender_label=_extract_explicit_gender_label(prod),

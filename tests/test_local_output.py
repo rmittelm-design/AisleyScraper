@@ -23,7 +23,6 @@ def test_write_local_results_creates_json(tmp_path: Path) -> None:
                 description=None,
                 images=["https://cdn.example.com/a.jpg"],
                 updated_at="2026-01-01T12:00:00Z",
-                position=3,
                 product_type="Tops",
                 product_url="https://example.com/products/item",
             )
@@ -38,6 +37,5 @@ def test_write_local_results_creates_json(tmp_path: Path) -> None:
     assert "https://cdn.example.com/a.jpg" in payload
     assert '"product_id": "1"' in payload
     assert '"updated_at": "2026-01-01T12:00:00Z"' in payload
-    assert '"position": 3' in payload
     assert '"product_type": "Tops"' in payload
     assert '"product_url": "https://example.com/products/item"' in payload

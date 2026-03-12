@@ -29,7 +29,6 @@ class ProductRecord:
     images: list[str]
     sku: str | None = None
     updated_at: str | None = None
-    position: int | None = None
     price_cents: int | None = None
     supabase_images: list[str] = field(default_factory=list)
     gender_label: str | None = None

@@ -38,7 +38,7 @@ Local mode notes:
 ## Requirements handled
 
 - Store profile extraction: store name, website, instagram (online), or address (offline).
-- Product extraction: item name, description, `sku`, `price_cents` (integer), `updated_at`, `position`, images, sizes/colors/brand only when explicitly present and associated with product image context.
+- Product extraction: item name, description, `sku`, `price_cents` (integer), `updated_at`, images, sizes/colors/brand only when explicitly present and associated with product image context.
 - Product extraction also includes `gender_label` (`male` / `female` / `unisex`) only when explicitly present in scraped product data.
 - Image persistence: scraped source image URLs are kept in `products.images`, and uploaded Supabase public URLs are stored in `products.supabase_images`.
 - Supabase persistence with idempotent upserts.

@@ -117,7 +117,6 @@ class SupabaseRestRepository:
             "description": product.description,
             "sku": product.sku,
             "updated_at": product.updated_at,
-            "position": product.position,
             "price_cents": product.price_cents,
             "images": product.images,
             "supabase_images": product.supabase_images,

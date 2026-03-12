@@ -42,7 +42,6 @@ class Repository:
           description text,
                     sku text,
                     updated_at text,
-                    position integer,
           price_cents bigint,
           images jsonb not null,
           supabase_images jsonb not null default '[]'::jsonb,
@@ -62,12 +61,12 @@ class Repository:
         alter table shopify_products add column if not exists gender_label text;
         alter table shopify_products add column if not exists price_cents bigint;
                 alter table shopify_products add column if not exists updated_at text;
-                alter table shopify_products add column if not exists position integer;
                 alter table shopify_products add column if not exists sku text;
             alter table shopify_products add column if not exists product_type text;
                 alter table shopify_products add column if not exists product_url text;
                 alter table shopify_products add column if not exists unavailable boolean not null default false;
                 alter table shopify_products add column if not exists scraped boolean not null default true;
+                alter table shopify_products drop column if exists position;
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -131,8 +130,8 @@ class Repository:
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         sql = """
-                        insert into shopify_products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, position, price_cents, images, supabase_images, gender_label, sizes, colors, brand, product_type, unavailable)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        insert into shopify_products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, sizes, colors, brand, product_type, unavailable)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         on conflict (store_id, product_id) do update
                     set product_handle = case when shopify_products.product_handle is distinct from excluded.product_handle then excluded.product_handle else shopify_products.product_handle end,
                             product_url = case when shopify_products.product_url is distinct from excluded.product_url then excluded.product_url else shopify_products.product_url end,
@@ -140,7 +139,6 @@ class Repository:
                             description = case when shopify_products.description is distinct from excluded.description then excluded.description else shopify_products.description end,
                             sku = case when shopify_products.sku is distinct from excluded.sku then excluded.sku else shopify_products.sku end,
                             updated_at = case when shopify_products.updated_at is distinct from excluded.updated_at then excluded.updated_at else shopify_products.updated_at end,
-                            position = case when shopify_products.position is distinct from excluded.position then excluded.position else shopify_products.position end,
                             price_cents = case when shopify_products.price_cents is distinct from excluded.price_cents then excluded.price_cents else shopify_products.price_cents end,
                             images = case when shopify_products.images is distinct from excluded.images then excluded.images else shopify_products.images end,
                             supabase_images = case when shopify_products.supabase_images is distinct from excluded.supabase_images then excluded.supabase_images else shopify_products.supabase_images end,
@@ -166,7 +164,6 @@ class Repository:
                         product.description,
                         product.sku,
                         product.updated_at,
-                        product.position,
                         product.price_cents,
                         json.dumps(product.images),
                         json.dumps(product.supabase_images),
