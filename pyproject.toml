@@ -1,0 +1,36 @@
+[project]
+name = "aisley-scraper"
+version = "0.1.0"
+description = "Shopify store intelligence scraper"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.27.0",
+  "beautifulsoup4>=4.12.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.4.0",
+  "python-dotenv>=1.0.1",
+  "psycopg[binary]>=3.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "mypy>=1.10.0",
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+aisley-scraper = "aisley_scraper.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+strict = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
