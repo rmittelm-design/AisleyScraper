@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import time
 
 import httpx
 
@@ -35,16 +36,32 @@ class SupabaseRestRepository:
         if headers:
             req_headers.update(headers)
 
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.request(
-                method,
-                f"{self._base_url}{path}",
-                params=params,
-                json=json_body,
-                headers=req_headers,
-            )
-            response.raise_for_status()
-            return response
+        attempts = 4
+        retry_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+
+        for attempt in range(1, attempts + 1):
+            try:
+                with httpx.Client(timeout=self._timeout) as client:
+                    response = client.request(
+                        method,
+                        f"{self._base_url}{path}",
+                        params=params,
+                        json=json_body,
+                        headers=req_headers,
+                    )
+                    response.raise_for_status()
+                    return response
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                if status not in retry_statuses or attempt == attempts:
+                    raise
+            except httpx.RequestError:
+                if attempt == attempts:
+                    raise
+
+            time.sleep(0.25 * attempt)
+
+        raise RuntimeError("supabase request failed without explicit exception")
 
     def ensure_schema(self) -> None:
         # REST mode assumes migrations are already applied.

@@ -143,19 +143,6 @@ def run_crawl(limit: int | None) -> int:
                 finally:
                     await enrich_fetcher.close()
 
-            def _safe_enrich_product(product) -> None:
-                if not product.images or product.gender_probs_csv:
-                    return
-                try:
-                    asyncio.run(_enrich_products_only([product]))
-                except Exception as exc:
-                    logger.warning(
-                        "Gender enrichment failed for store=%s product=%s: %s",
-                        store_id,
-                        product.product_id,
-                        exc,
-                    )
-
             def _safe_upload_new_product_images(product) -> list[str]:
                 if not product.images:
                     return []
@@ -197,15 +184,23 @@ def run_crawl(limit: int | None) -> int:
                     return existing_supabase_images
 
             def _safe_upsert_product(product) -> None:
-                try:
-                    repo.upsert_product(store_id, product)
-                except Exception as exc:
-                    logger.warning(
-                        "Final upsert failed for store=%s product=%s: %s",
-                        store_id,
-                        product.product_id,
-                        exc,
-                    )
+                attempts = 3
+                for attempt in range(1, attempts + 1):
+                    try:
+                        repo.upsert_product(store_id, product)
+                        return True
+                    except Exception as exc:
+                        logger.warning(
+                            "Final upsert failed for store=%s product=%s attempt=%s/%s: %s",
+                            store_id,
+                            product.product_id,
+                            attempt,
+                            attempts,
+                            exc,
+                        )
+                        if attempt < attempts:
+                            continue
+                return False
 
             processing_products = list(preliminary_products)
             postprocess_failed = False
@@ -219,27 +214,52 @@ def run_crawl(limit: int | None) -> int:
                 processing_products = []
 
             finalized_ids = {p.product_id for p in processing_products}
+            final_upsert_failures: list[str] = []
+
+            fallback_products = [
+                product
+                for product in preliminary_products
+                if product.product_id not in finalized_ids
+            ]
+
+            # Restore source images first, then run a single enrichment batch.
+            for product in fallback_products:
+                product.images = original_images_by_product_id.get(product.product_id, [])
+
+            fallback_products_needing_enrich = [
+                product
+                for product in fallback_products
+                if product.images and not product.gender_probs_csv
+            ]
+            if fallback_products_needing_enrich:
+                try:
+                    asyncio.run(_enrich_products_only(fallback_products_needing_enrich))
+                except Exception as exc:
+                    logger.warning(
+                        "Fallback gender enrichment batch failed for %s (store_id=%s): %s",
+                        seed.store_url,
+                        store_id,
+                        exc,
+                    )
+
             for product in preliminary_products:
                 if product.product_id in finalized_ids:
                     continue
-                # Fallback: preserve original source images and upload/sync even if validation rejected all.
-                product.images = original_images_by_product_id.get(product.product_id, [])
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is None:
                     if product.images:
-                        _safe_enrich_product(product)
                         product.supabase_images = _safe_upload_new_product_images(product)
                     else:
                         product.supabase_images = []
                 else:
-                    _safe_enrich_product(product)
                     existing_images, existing_supabase_images = existing_image_state
                     product.supabase_images = _safe_sync_existing_product_images(
                         product,
                         existing_images,
                         existing_supabase_images,
                     )
-                _safe_upsert_product(product)
+                if not _safe_upsert_product(product):
+                    final_upsert_failures.append(product.product_id)
 
             # If postprocess failed globally, all products were handled through fallback branch above.
             if postprocess_failed:
@@ -258,7 +278,17 @@ def run_crawl(limit: int | None) -> int:
                         existing_supabase_images,
                     )
 
-                _safe_upsert_product(product)
+                if not _safe_upsert_product(product):
+                    final_upsert_failures.append(product.product_id)
+
+            if final_upsert_failures:
+                logger.error(
+                    "Store finalize incomplete for %s (store_id=%s), failed final upserts=%s",
+                    seed.store_url,
+                    store_id,
+                    len(final_upsert_failures),
+                )
+                return False
 
             return True
 
