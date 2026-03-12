@@ -8,11 +8,13 @@ from urllib.parse import urlparse
 from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.orchestrator import scrape_many, scrape_many_stream
+from aisley_scraper.crawl.image_verifier import verify_product_images
 from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
 from aisley_scraper.gender_probs import enrich_gender_probabilities_for_products
 from aisley_scraper.ingest.csv_loader import load_store_seeds
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import ScrapeResult, StoreSeed
+from aisley_scraper.normalize.products import enforce_attribute_policy
 from aisley_scraper.storage import StorageUploader
 
 
@@ -79,7 +81,6 @@ def run_crawl(limit: int | None) -> int:
     chunk_size = max(1, settings.crawl_global_concurrency)
 
     repo = SupabaseRestRepository(settings)
-    gender_fetcher = Fetcher(settings)
 
     try:
         repo.ensure_schema()
@@ -94,15 +95,89 @@ def run_crawl(limit: int | None) -> int:
                 return False
 
             store_id = repo.upsert_store(outcome.store)
+            existing_state_by_product_id: dict[str, tuple[list[str], list[str]] | None] = {}
+            preliminary_products: list = []
+            original_images_by_product_id: dict[str, list[str]] = {}
+
             for product in outcome.products:
                 existing_image_state = repo.get_product_image_state(store_id, product.product_id)
+                existing_state_by_product_id[product.product_id] = existing_image_state
+                original_images_by_product_id[product.product_id] = list(product.images)
+                if existing_image_state is None and product.unavailable:
+                    continue
+
+                # Insert early so rows become visible while validation/upload continues.
+                repo.upsert_product(store_id, product)
+                preliminary_products.append(product)
+
+            if not preliminary_products:
+                return True
+
+            async def _postprocess_products(products: list) -> None:
+                postprocess_fetcher = Fetcher(settings)
+                try:
+                    await verify_product_images(
+                        products=products,
+                        fetcher=postprocess_fetcher,
+                        settings=settings,
+                    )
+                    await enrich_gender_probabilities_for_products(
+                        products=products,
+                        fetcher=postprocess_fetcher,
+                        concurrency=settings.image_validation_concurrency,
+                    )
+                finally:
+                    await postprocess_fetcher.close()
+
+            async def _enrich_products_only(products: list) -> None:
+                enrich_fetcher = Fetcher(settings)
+                try:
+                    await enrich_gender_probabilities_for_products(
+                        products=products,
+                        fetcher=enrich_fetcher,
+                        concurrency=settings.image_validation_concurrency,
+                    )
+                finally:
+                    await enrich_fetcher.close()
+
+            processing_products = list(preliminary_products)
+            asyncio.run(_postprocess_products(processing_products))
+            processing_products = [enforce_attribute_policy(p) for p in processing_products if p.images]
+
+            finalized_ids = {p.product_id for p in processing_products}
+            for product in preliminary_products:
+                if product.product_id in finalized_ids:
+                    continue
+                # Fallback: preserve original source images and upload/sync even if validation rejected all.
+                product.images = original_images_by_product_id.get(product.product_id, [])
+                existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is None:
-                    if product.unavailable:
-                        continue
+                    if product.images:
+                        if not product.gender_probs_csv:
+                            asyncio.run(_enrich_products_only([product]))
+                        product.supabase_images = uploader.upload_product_images(
+                            product.images,
+                            store_id=store_id,
+                            product_id=product.product_id,
+                        )
+                    else:
+                        product.supabase_images = []
+                else:
+                    if product.images and not product.gender_probs_csv:
+                        asyncio.run(_enrich_products_only([product]))
+                    existing_images, existing_supabase_images = existing_image_state
+                    product.supabase_images = uploader.sync_product_images(
+                        current_source_urls=product.images,
+                        existing_source_urls=existing_images,
+                        existing_supabase_urls=existing_supabase_images,
+                        store_id=store_id,
+                        product_id=product.product_id,
+                    )
+                repo.upsert_product(store_id, product)
 
-                    # Insert early so new rows are visible while uploads continue.
-                    repo.upsert_product(store_id, product)
-
+            for product in processing_products:
+                existing_image_state = existing_state_by_product_id.get(product.product_id)
+                if existing_image_state is None:
                     if product.images:
                         product.supabase_images = uploader.upload_product_images(
                             product.images,
@@ -119,16 +194,6 @@ def run_crawl(limit: int | None) -> int:
                         product_id=product.product_id,
                     )
 
-                # Backfill missing probabilities for scraped products that have no explicit gender.
-                if product.gender_label is None and not product.gender_probs_csv and product.images:
-                    asyncio.run(
-                        enrich_gender_probabilities_for_products(
-                            products=[product],
-                            fetcher=gender_fetcher,
-                            concurrency=settings.image_validation_concurrency,
-                        )
-                    )
-
                 repo.upsert_product(store_id, product)
 
             return True
@@ -137,7 +202,7 @@ def run_crawl(limit: int | None) -> int:
             processed_in_batch = 0
             success_in_batch = 0
 
-            async for seed, outcome in scrape_many_stream(batch, settings):
+            async for seed, outcome in scrape_many_stream(batch, settings, include_postprocess=False):
                 processed_in_batch += 1
                 persisted_ok = await asyncio.to_thread(_persist_store_result, seed, outcome)
                 if persisted_ok:
@@ -156,7 +221,7 @@ def run_crawl(limit: int | None) -> int:
         print(f"Crawled {success_count}/{len(seeds)} stores successfully")
         return 0
     finally:
-        asyncio.run(gender_fetcher.close())
+        pass
 
 
 def main() -> int:

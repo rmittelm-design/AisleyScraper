@@ -54,7 +54,7 @@ async def scrape_many(seeds: list[StoreSeed], settings: Settings) -> list[tuple[
 
 
 async def scrape_many_stream(
-    seeds: list[StoreSeed], settings: Settings
+    seeds: list[StoreSeed], settings: Settings, *, include_postprocess: bool = True
 ) -> AsyncIterator[tuple[StoreSeed, ScrapeResult | Exception]]:
     fetcher = Fetcher(settings)
     semaphore = asyncio.Semaphore(settings.crawl_global_concurrency)
@@ -62,7 +62,18 @@ async def scrape_many_stream(
     async def _run(seed: StoreSeed) -> tuple[StoreSeed, ScrapeResult | Exception]:
         async with semaphore:
             try:
-                return seed, await scrape_store(seed, settings, fetcher)
+                if include_postprocess:
+                    return seed, await scrape_store(seed, settings, fetcher)
+
+                base = seed.store_url.rstrip("/")
+                homepage = await fetcher.get_text(base)
+                store = classify_store(homepage, base, settings)
+
+                products_url = f"{base}/products.json?limit={settings.shopify_products_page_limit}&page=1"
+                payload = await fetcher.get_json(products_url)
+                extracted = extract_products_from_products_json(payload, settings, base_url=base)
+                products = [enforce_attribute_policy(p) for p in extracted if p.images]
+                return seed, ScrapeResult(store=store, products=products)
             except Exception as exc:
                 return seed, exc
 
