@@ -148,7 +148,7 @@ def test_run_crawl_skips_new_unavailable_products(monkeypatch) -> None:
     exit_code = cli.run_crawl(limit=None)
 
     assert exit_code == 0
-    assert _FakeRestRepo.inserted_products == ["p-2"]
+    assert _FakeRestRepo.inserted_products == ["p-2", "p-2"]
     assert _FakeUploader.uploaded_for == ["p-2"]
 
 

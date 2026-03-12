@@ -99,6 +99,10 @@ def run_crawl(limit: int | None) -> int:
                 if existing_image_state is None:
                     if product.unavailable:
                         continue
+
+                    # Insert early so new rows are visible while uploads continue.
+                    repo.upsert_product(store_id, product)
+
                     if product.images:
                         product.supabase_images = uploader.upload_product_images(
                             product.images,
