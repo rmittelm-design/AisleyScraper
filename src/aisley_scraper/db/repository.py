@@ -46,6 +46,7 @@ class Repository:
           images jsonb not null,
           supabase_images jsonb not null default '[]'::jsonb,
           gender_label text,
+          gender_probs_csv text,
           sizes jsonb not null default '[]'::jsonb,
           colors jsonb not null default '[]'::jsonb,
           brand text,
@@ -59,6 +60,7 @@ class Repository:
 
                 alter table shopify_stores add column if not exists scraped boolean not null default true;
         alter table shopify_products add column if not exists gender_label text;
+        alter table shopify_products add column if not exists gender_probs_csv text;
         alter table shopify_products add column if not exists price_cents bigint;
                 alter table shopify_products add column if not exists updated_at text;
                 alter table shopify_products add column if not exists sku text;
@@ -130,8 +132,8 @@ class Repository:
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         sql = """
-                        insert into shopify_products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, sizes, colors, brand, product_type, unavailable)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        insert into shopify_products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, gender_probs_csv, sizes, colors, brand, product_type, unavailable)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         on conflict (store_id, product_id) do update
                     set product_handle = case when shopify_products.product_handle is distinct from excluded.product_handle then excluded.product_handle else shopify_products.product_handle end,
                             product_url = case when shopify_products.product_url is distinct from excluded.product_url then excluded.product_url else shopify_products.product_url end,
@@ -143,6 +145,7 @@ class Repository:
                             images = case when shopify_products.images is distinct from excluded.images then excluded.images else shopify_products.images end,
                             supabase_images = case when shopify_products.supabase_images is distinct from excluded.supabase_images then excluded.supabase_images else shopify_products.supabase_images end,
                             gender_label = case when shopify_products.gender_label is distinct from excluded.gender_label then excluded.gender_label else shopify_products.gender_label end,
+                            gender_probs_csv = case when shopify_products.gender_probs_csv is distinct from excluded.gender_probs_csv then excluded.gender_probs_csv else shopify_products.gender_probs_csv end,
                             sizes = case when shopify_products.sizes is distinct from excluded.sizes then excluded.sizes else shopify_products.sizes end,
                             colors = case when shopify_products.colors is distinct from excluded.colors then excluded.colors else shopify_products.colors end,
                             brand = case when shopify_products.brand is distinct from excluded.brand then excluded.brand else shopify_products.brand end,
@@ -168,6 +171,7 @@ class Repository:
                         json.dumps(product.images),
                         json.dumps(product.supabase_images),
                         product.gender_label,
+                        product.gender_probs_csv,
                         json.dumps(product.sizes),
                         json.dumps(product.colors),
                         product.brand,

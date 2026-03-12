@@ -32,6 +32,7 @@ class ProductRecord:
     price_cents: int | None = None
     supabase_images: list[str] = field(default_factory=list)
     gender_label: str | None = None
+    gender_probs_csv: str | None = None
     sizes: list[str] = field(default_factory=list)
     colors: list[str] = field(default_factory=list)
     brand: str | None = None

@@ -121,6 +121,7 @@ class SupabaseRestRepository:
             "images": product.images,
             "supabase_images": product.supabase_images,
             "gender_label": product.gender_label,
+            "gender_probs_csv": product.gender_probs_csv,
             "sizes": product.sizes,
             "colors": product.colors,
             "brand": product.brand,

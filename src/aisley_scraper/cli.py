@@ -6,8 +6,10 @@ import logging
 from urllib.parse import urlparse
 
 from aisley_scraper.config import get_settings
+from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.orchestrator import scrape_many
 from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
+from aisley_scraper.gender_probs import enrich_gender_probabilities_for_products
 from aisley_scraper.ingest.csv_loader import load_store_seeds
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import StoreSeed
@@ -77,50 +79,65 @@ def run_crawl(limit: int | None) -> int:
     chunk_size = max(1, settings.crawl_global_concurrency)
 
     repo = SupabaseRestRepository(settings)
+    gender_fetcher = Fetcher(settings)
 
-    repo.ensure_schema()
-    uploader = StorageUploader(settings)
+    try:
+        repo.ensure_schema()
+        uploader = StorageUploader(settings)
 
-    success_count = 0
-    processed_count = 0
-    for start in range(0, len(seeds), chunk_size):
-        batch = seeds[start : start + chunk_size]
-        batch_results = asyncio.run(scrape_many(batch, settings))
+        success_count = 0
+        processed_count = 0
+        for start in range(0, len(seeds), chunk_size):
+            batch = seeds[start : start + chunk_size]
+            batch_results = asyncio.run(scrape_many(batch, settings))
 
-        for seed, outcome in batch_results:
-            processed_count += 1
-            if isinstance(outcome, Exception):
-                print(f"FAIL {seed.store_url}: {outcome}")
-                continue
+            for seed, outcome in batch_results:
+                processed_count += 1
+                if isinstance(outcome, Exception):
+                    print(f"FAIL {seed.store_url}: {outcome}")
+                    continue
 
-            store_id = repo.upsert_store(outcome.store)
-            for product in outcome.products:
-                existing_image_state = repo.get_product_image_state(store_id, product.product_id)
-                if existing_image_state is None:
-                    if product.unavailable:
-                        continue
-                    if product.images:
-                        product.supabase_images = uploader.upload_product_images(
-                            product.images,
+                store_id = repo.upsert_store(outcome.store)
+                for product in outcome.products:
+                    existing_image_state = repo.get_product_image_state(store_id, product.product_id)
+                    if existing_image_state is None:
+                        if product.unavailable:
+                            continue
+                        if product.images:
+                            product.supabase_images = uploader.upload_product_images(
+                                product.images,
+                                store_id=store_id,
+                                product_id=product.product_id,
+                            )
+                    else:
+                        existing_images, existing_supabase_images = existing_image_state
+                        product.supabase_images = uploader.sync_product_images(
+                            current_source_urls=product.images,
+                            existing_source_urls=existing_images,
+                            existing_supabase_urls=existing_supabase_images,
                             store_id=store_id,
                             product_id=product.product_id,
                         )
-                else:
-                    existing_images, existing_supabase_images = existing_image_state
-                    product.supabase_images = uploader.sync_product_images(
-                        current_source_urls=product.images,
-                        existing_source_urls=existing_images,
-                        existing_supabase_urls=existing_supabase_images,
-                        store_id=store_id,
-                        product_id=product.product_id,
-                    )
-                repo.upsert_product(store_id, product)
-            success_count += 1
 
-        print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
+                    # Backfill missing probabilities for scraped products that have no explicit gender.
+                    if product.gender_label is None and not product.gender_probs_csv and product.images:
+                        asyncio.run(
+                            enrich_gender_probabilities_for_products(
+                                products=[product],
+                                fetcher=gender_fetcher,
+                                concurrency=settings.image_validation_concurrency,
+                            )
+                        )
 
-    print(f"Crawled {success_count}/{len(seeds)} stores successfully")
-    return 0
+                    repo.upsert_product(store_id, product)
+                success_count += 1
+
+            print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
+
+        print(f"Crawled {success_count}/{len(seeds)} stores successfully")
+        return 0
+    finally:
+        asyncio.run(gender_fetcher.close())
 
 
 def main() -> int:
