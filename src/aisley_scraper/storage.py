@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
+import time
 from collections import defaultdict
 from urllib.parse import urlparse
 
@@ -53,27 +54,40 @@ class StorageUploader:
             "apikey": self._settings.supabase_service_role_key,
         }
 
-        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-            source_resp = client.get(image_url)
-            source_resp.raise_for_status()
+        attempts = 3
+        last_exc: Exception | None = None
 
-            content_type = source_resp.headers.get("content-type", "application/octet-stream")
-            ext = self._extension_from_url_or_content_type(image_url, content_type)
-            object_path = self._object_path(store_id, product_id, index, ext)
+        for attempt in range(1, attempts + 1):
+            try:
+                with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                    source_resp = client.get(image_url)
+                    source_resp.raise_for_status()
 
-            upload_url = (
-                f"{self._settings.supabase_url.rstrip('/')}/storage/v1/object/"
-                f"{self._settings.supabase_storage_bucket}/{object_path}"
-            )
-            upload_headers = {
-                **headers,
-                "Content-Type": content_type,
-                "x-upsert": "true",
-            }
-            upload_resp = client.post(upload_url, headers=upload_headers, content=source_resp.content)
-            upload_resp.raise_for_status()
+                    content_type = source_resp.headers.get("content-type", "application/octet-stream")
+                    ext = self._extension_from_url_or_content_type(image_url, content_type)
+                    object_path = self._object_path(store_id, product_id, index, ext)
 
-        return self._public_url(object_path)
+                    upload_url = (
+                        f"{self._settings.supabase_url.rstrip('/')}/storage/v1/object/"
+                        f"{self._settings.supabase_storage_bucket}/{object_path}"
+                    )
+                    upload_headers = {
+                        **headers,
+                        "Content-Type": content_type,
+                        "x-upsert": "true",
+                    }
+                    upload_resp = client.post(upload_url, headers=upload_headers, content=source_resp.content)
+                    upload_resp.raise_for_status()
+
+                return self._public_url(object_path)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    time.sleep(0.3 * attempt)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("image upload failed without explicit exception")
 
     def delete_images(self, public_urls: list[str]) -> None:
         object_paths = [
@@ -124,11 +138,6 @@ class StorageUploader:
                 continue
             pending_uploads.append((output_idx, source_url, output_idx + 1))
 
-        reused_set = set(reused_supabase_urls)
-        stale_urls = [url for url in existing_supabase_urls if url not in reused_set]
-        if stale_urls:
-            self.delete_images(stale_urls)
-
         uploaded_by_source: dict[str, str] = {}
         for output_idx, source_url, image_index in pending_uploads:
             if source_url in uploaded_by_source:
@@ -137,6 +146,12 @@ class StorageUploader:
             uploaded_url = self.upload_image_from_url(source_url, store_id, product_id, image_index)
             uploaded_by_source[source_url] = uploaded_url
             result[output_idx] = uploaded_url
+
+        reused_set = set(reused_supabase_urls)
+        final_set = reused_set | set(uploaded_by_source.values())
+        stale_urls = [url for url in existing_supabase_urls if url not in final_set]
+        if stale_urls:
+            self.delete_images(stale_urls)
 
         return [url for url in result if url is not None]
 

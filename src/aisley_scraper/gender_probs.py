@@ -188,13 +188,31 @@ def _score_image_bytes_with_clip(image_bytes: bytes) -> tuple[float, float, floa
 
 
 async def _score_image_url(fetcher: Fetcher, image_url: str) -> tuple[float, float, float] | None:
-    try:
-        content = await fetcher.get_bytes(image_url)
-    except Exception as exc:
-        logger.info("Failed to fetch image for CLIP scoring %s: %s", image_url, exc)
-        return None
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        try:
+            content = await fetcher.get_bytes(image_url)
+        except Exception as exc:
+            logger.info(
+                "Failed to fetch image for CLIP scoring %s (attempt %s/%s): %s",
+                image_url,
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(0.2 * attempt)
+                continue
+            return None
 
-    return await asyncio.to_thread(_score_image_bytes_with_clip, content)
+        scored = await asyncio.to_thread(_score_image_bytes_with_clip, content)
+        if scored is not None:
+            return scored
+        if attempt < attempts:
+            await asyncio.sleep(0.1 * attempt)
+
+    logger.info("CLIP scoring produced no result for %s after %s attempts", image_url, attempts)
+    return None
 
 
 async def enrich_gender_probabilities_for_products(
