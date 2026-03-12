@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 
 from aisley_scraper.config import Settings
 from aisley_scraper.crawl.fetcher import Fetcher
@@ -49,4 +50,28 @@ async def scrape_many(seeds: list[StoreSeed], settings: Settings) -> list[tuple[
     try:
         return await asyncio.gather(*[_run(seed) for seed in seeds])
     finally:
+        await fetcher.close()
+
+
+async def scrape_many_stream(
+    seeds: list[StoreSeed], settings: Settings
+) -> AsyncIterator[tuple[StoreSeed, ScrapeResult | Exception]]:
+    fetcher = Fetcher(settings)
+    semaphore = asyncio.Semaphore(settings.crawl_global_concurrency)
+
+    async def _run(seed: StoreSeed) -> tuple[StoreSeed, ScrapeResult | Exception]:
+        async with semaphore:
+            try:
+                return seed, await scrape_store(seed, settings, fetcher)
+            except Exception as exc:
+                return seed, exc
+
+    tasks = [asyncio.create_task(_run(seed)) for seed in seeds]
+    try:
+        for task in asyncio.as_completed(tasks):
+            yield await task
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
         await fetcher.close()

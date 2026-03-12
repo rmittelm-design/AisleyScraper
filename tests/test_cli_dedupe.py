@@ -129,14 +129,13 @@ def test_run_crawl_skips_new_unavailable_products(monkeypatch) -> None:
             if product.gender_label is None and not product.gender_probs_csv:
                 product.gender_probs_csv = "0.2,0.5,0.3"
 
-    async def _fake_scrape_many(seeds: list[StoreSeed], _settings: Settings):
-        _ = seeds
-        _ = _settings
-        return [(seed, outcome)]
+    async def _fake_scrape_many_stream(seeds: list[StoreSeed], _settings: Settings):
+        _ = (seeds, _settings)
+        yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
-    monkeypatch.setattr(cli, "scrape_many", _fake_scrape_many)
+    monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
     monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
@@ -216,13 +215,13 @@ def test_run_crawl_falls_back_to_rest_without_db_credentials(monkeypatch) -> Non
         _ = (products, fetcher, concurrency)
         return None
 
-    async def _fake_scrape_many(seeds: list[StoreSeed], _settings: Settings):
+    async def _fake_scrape_many_stream(seeds: list[StoreSeed], _settings: Settings):
         _ = (seeds, _settings)
-        return [(seed, outcome)]
+        yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
-    monkeypatch.setattr(cli, "scrape_many", _fake_scrape_many)
+    monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
     monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
@@ -328,13 +327,13 @@ def test_run_crawl_backfills_missing_gender_probs_for_existing_product(monkeypat
         for product in products:
             product.gender_probs_csv = "0.11,0.22,0.67"
 
-    async def _fake_scrape_many(seeds: list[StoreSeed], _settings: Settings):
+    async def _fake_scrape_many_stream(seeds: list[StoreSeed], _settings: Settings):
         _ = (seeds, _settings)
-        return [(seed, outcome)]
+        yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
-    monkeypatch.setattr(cli, "scrape_many", _fake_scrape_many)
+    monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
     monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
