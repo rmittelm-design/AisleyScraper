@@ -14,7 +14,6 @@ class Settings(BaseSettings):
 
     supabase_url: str = Field(alias="SUPABASE_URL")
     supabase_service_role_key: str = Field(alias="SUPABASE_SERVICE_ROLE_KEY")
-    supabase_db_dsn: str | None = Field(default=None, alias="SUPABASE_DB_DSN")
     supabase_schema: str = Field(default="public", alias="SUPABASE_SCHEMA")
     supabase_storage_bucket: str = Field(alias="SUPABASE_STORAGE_BUCKET")
     supabase_storage_path: str = Field(alias="SUPABASE_STORAGE_PATH")
@@ -75,7 +74,6 @@ class Settings(BaseSettings):
         if normalized not in {"supabase", "local"}:
             raise ValueError("PERSISTENCE_TARGET must be one of: supabase, local")
         return normalized
-
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

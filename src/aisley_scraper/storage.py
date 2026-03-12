@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
+from collections import defaultdict
 from urllib.parse import urlparse
 
 import httpx
@@ -37,6 +38,14 @@ class StorageUploader:
         bucket = self._settings.supabase_storage_bucket
         return f"{root}/storage/v1/object/public/{bucket}/{object_path}"
 
+    def _object_path_from_public_url(self, public_url: str) -> str | None:
+        root = self._settings.supabase_url.rstrip("/")
+        bucket = self._settings.supabase_storage_bucket
+        prefix = f"{root}/storage/v1/object/public/{bucket}/"
+        if not public_url.startswith(prefix):
+            return None
+        return public_url[len(prefix) :]
+
     def upload_image_from_url(self, image_url: str, store_id: int, product_id: str, index: int) -> str:
         timeout = httpx.Timeout(30.0)
         headers = {
@@ -65,6 +74,71 @@ class StorageUploader:
             upload_resp.raise_for_status()
 
         return self._public_url(object_path)
+
+    def delete_images(self, public_urls: list[str]) -> None:
+        object_paths = [
+            path
+            for path in (self._object_path_from_public_url(url) for url in public_urls)
+            if path
+        ]
+        if not object_paths:
+            return
+
+        timeout = httpx.Timeout(30.0)
+        headers = {
+            "Authorization": f"Bearer {self._settings.supabase_service_role_key}",
+            "apikey": self._settings.supabase_service_role_key,
+        }
+        base_url = f"{self._settings.supabase_url.rstrip('/')}/storage/v1/object/{self._settings.supabase_storage_bucket}/"
+
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            for object_path in object_paths:
+                resp = client.delete(f"{base_url}{object_path}", headers=headers)
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
+
+    def sync_product_images(
+        self,
+        current_source_urls: list[str],
+        existing_source_urls: list[str],
+        existing_supabase_urls: list[str],
+        store_id: int,
+        product_id: str,
+    ) -> list[str]:
+        # Keep a queue so duplicate source URLs can safely reuse matching existing files.
+        existing_by_source: dict[str, list[str]] = defaultdict(list)
+        for source_url, supabase_url in zip(existing_source_urls, existing_supabase_urls):
+            existing_by_source[source_url].append(supabase_url)
+
+        result: list[str | None] = [None] * len(current_source_urls)
+        reused_supabase_urls: list[str] = []
+        pending_uploads: list[tuple[int, str, int]] = []
+
+        for output_idx, source_url in enumerate(current_source_urls):
+            reusable = existing_by_source.get(source_url)
+            if reusable:
+                reused_url = reusable.pop(0)
+                result[output_idx] = reused_url
+                reused_supabase_urls.append(reused_url)
+                continue
+            pending_uploads.append((output_idx, source_url, output_idx + 1))
+
+        reused_set = set(reused_supabase_urls)
+        stale_urls = [url for url in existing_supabase_urls if url not in reused_set]
+        if stale_urls:
+            self.delete_images(stale_urls)
+
+        uploaded_by_source: dict[str, str] = {}
+        for output_idx, source_url, image_index in pending_uploads:
+            if source_url in uploaded_by_source:
+                result[output_idx] = uploaded_by_source[source_url]
+                continue
+            uploaded_url = self.upload_image_from_url(source_url, store_id, product_id, image_index)
+            uploaded_by_source[source_url] = uploaded_url
+            result[output_idx] = uploaded_url
+
+        return [url for url in result if url is not None]
 
     def upload_product_images(self, image_urls: list[str], store_id: int, product_id: str) -> list[str]:
         uploaded: list[str] = []

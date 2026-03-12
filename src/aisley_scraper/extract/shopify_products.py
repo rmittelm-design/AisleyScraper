@@ -166,7 +166,7 @@ def _variant_availability_signal(variant: dict[str, Any]) -> bool | None:
     return None
 
 
-def _is_sold_out_product(prod: dict[str, Any]) -> bool:
+def _is_unavailable_product(prod: dict[str, Any]) -> bool:
     product_available = _to_bool(prod.get("available"))
     if product_available is False:
         return True
@@ -220,8 +220,7 @@ def extract_products_from_products_json(
         product_id = str(prod.get("id") or "")
         if not product_id:
             continue
-        if _is_sold_out_product(prod):
-            continue
+        unavailable = _is_unavailable_product(prod)
 
         images = [img.get("src") for img in prod.get("images", []) if img.get("src")]
         options = prod.get("options", [])
@@ -265,6 +264,7 @@ def extract_products_from_products_json(
                 if prod.get("product_type") is not None
                 else None,
                 product_url=_extract_product_url(prod, base_url),
+                unavailable=unavailable,
                 raw=prod,
             )
         )

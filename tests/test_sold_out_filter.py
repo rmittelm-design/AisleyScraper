@@ -12,7 +12,7 @@ def _settings() -> Settings:
     )
 
 
-def test_skip_product_when_product_available_false() -> None:
+def test_mark_unavailable_when_product_available_false() -> None:
     payload = {
         "products": [
             {
@@ -30,10 +30,12 @@ def test_skip_product_when_product_available_false() -> None:
     }
 
     out = extract_products_from_products_json(payload, _settings())
-    assert out == []
+    assert len(out) == 1
+    assert out[0].product_id == "101"
+    assert out[0].unavailable is True
 
 
-def test_skip_product_when_all_variants_unavailable() -> None:
+def test_mark_unavailable_when_all_variants_unavailable() -> None:
     payload = {
         "products": [
             {
@@ -53,7 +55,9 @@ def test_skip_product_when_all_variants_unavailable() -> None:
     }
 
     out = extract_products_from_products_json(payload, _settings())
-    assert out == []
+    assert len(out) == 1
+    assert out[0].product_id == "102"
+    assert out[0].unavailable is True
 
 
 def test_keep_product_when_any_variant_available() -> None:
@@ -78,3 +82,4 @@ def test_keep_product_when_any_variant_available() -> None:
     out = extract_products_from_products_json(payload, _settings())
     assert len(out) == 1
     assert out[0].product_id == "103"
+    assert out[0].unavailable is False

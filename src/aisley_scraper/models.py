@@ -38,6 +38,7 @@ class ProductRecord:
     brand: str | None = None
     product_type: str | None = None
     product_url: str | None = None
+    unavailable: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
 

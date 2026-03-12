@@ -15,7 +15,6 @@ Update these required values in `.env`:
 
 - `SUPABASE_URL`: your Supabase project URL (for example `https://xxxx.supabase.co`).
 - `SUPABASE_SERVICE_ROLE_KEY`: backend service role key (used for Storage uploads).
-- `SUPABASE_DB_DSN`: direct Postgres DSN used for DB writes/upserts.
 - `SUPABASE_STORAGE_BUCKET`: bucket name for uploaded product images.
 - `SUPABASE_STORAGE_PATH`: folder prefix inside the bucket (for example `aisley`).
 - `PERSISTENCE_TARGET`: `supabase` (default) or `local`.
@@ -29,6 +28,7 @@ Recommended preflight checks:
 - Ensure the storage bucket exists in Supabase and is readable if you plan to use public URLs.
 - Ensure your CSV has the expected URL column (default `store_url`) or update `INPUT_CSV_URL_COLUMN`.
 - Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_GLOBAL_QPS`) before large runs.
+- Writes use Supabase REST (`/rest/v1`) with `SUPABASE_SERVICE_ROLE_KEY`.
 
 Local mode notes:
 
