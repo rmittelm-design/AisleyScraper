@@ -20,7 +20,7 @@ async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) ->
     products_url = f"{base}/products.json?limit={settings.shopify_products_page_limit}&page=1"
     try:
         payload = await fetcher.get_json(products_url)
-        extracted = extract_products_from_products_json(payload, settings)
+        extracted = extract_products_from_products_json(payload, settings, base_url=base)
         await verify_product_images(products=extracted, fetcher=fetcher, settings=settings)
         products = [enforce_attribute_policy(p) for p in extracted if p.images]
     except Exception:

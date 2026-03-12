@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from urllib.parse import urlparse
 
 from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.orchestrator import scrape_many
@@ -10,6 +11,18 @@ from aisley_scraper.db.repository import Repository
 from aisley_scraper.ingest.csv_loader import load_store_seeds
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.storage import StorageUploader
+
+
+def _dedupe_seeds_by_domain(seeds: list[StoreSeed]) -> list[StoreSeed]:
+    seen_domains: set[str] = set()
+    deduped: list[StoreSeed] = []
+    for seed in seeds:
+        domain = urlparse(seed.store_url).netloc.strip().lower()
+        if not domain or domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        deduped.append(seed)
+    return deduped
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -44,6 +57,7 @@ def run_crawl(limit: int | None) -> int:
     _setup_logging(settings.log_level)
 
     seeds = load_store_seeds(settings.input_csv_path, settings)
+    seeds = _dedupe_seeds_by_domain(seeds)
     if limit is not None:
         seeds = seeds[:limit]
     else:

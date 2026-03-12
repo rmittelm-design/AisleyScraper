@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import re
 from typing import Any
+from urllib.parse import urljoin
 
 from aisley_scraper.config import Settings
 from aisley_scraper.models import ProductRecord
@@ -24,14 +26,49 @@ def _to_int(value: Any) -> int | None:
             return None
     return None
 
+
+def _to_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        return None
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in {"true", "1", "yes", "y", "on"}:
+            return True
+        if token in {"false", "0", "no", "n", "off"}:
+            return False
+    return None
+
 def _normalize_gender_token(value: str) -> str | None:
     token = value.strip().lower()
-    if token in {"male", "man", "men", "mens", "boy", "boys"}:
+    compact = token.replace("'", "").replace("\u2019", "")
+
+    if compact in {"male", "man", "men", "mens", "boy", "boys"}:
         return "male"
-    if token in {"female", "woman", "women", "womens", "girl", "girls"}:
+    if compact in {"female", "woman", "women", "womens", "girl", "girls"}:
         return "female"
-    if token in {"unisex", "all-gender", "all genders", "gender neutral", "gender-neutral"}:
+    if compact in {"unisex", "all-gender", "all genders", "gender neutral", "gender-neutral"}:
         return "unisex"
+
+    # Support common tag shapes like women's-clothing, mens_wear, for-women.
+    words = [w for w in re.split(r"[^a-z0-9]+", compact) if w]
+    if not words:
+        return None
+    word_set = set(words)
+
+    if "unisex" in word_set:
+        return "unisex"
+    if {"all", "gender"}.issubset(word_set) or {"gender", "neutral"}.issubset(word_set):
+        return "unisex"
+
+    if word_set & {"women", "womens", "woman", "female", "girl", "girls"}:
+        return "female"
+    if word_set & {"men", "mens", "man", "male", "boy", "boys"}:
+        return "male"
+
     return None
 
 def _extract_explicit_gender_label(prod: dict[str, Any]) -> str | None:
@@ -113,7 +150,68 @@ def _extract_explicit_sku(prod: dict[str, Any]) -> str | None:
     return None
 
 
-def extract_products_from_products_json(payload: dict[str, Any], settings: Settings) -> list[ProductRecord]:
+def _variant_availability_signal(variant: dict[str, Any]) -> bool | None:
+    explicit = _to_bool(variant.get("available"))
+    if explicit is not None:
+        return explicit
+
+    inventory_policy = str(variant.get("inventory_policy", "")).strip().lower()
+    if inventory_policy == "continue":
+        return True
+
+    quantity = _to_int(variant.get("inventory_quantity"))
+    if quantity is not None:
+        return quantity > 0
+
+    return None
+
+
+def _is_sold_out_product(prod: dict[str, Any]) -> bool:
+    product_available = _to_bool(prod.get("available"))
+    if product_available is False:
+        return True
+
+    variants = [v for v in prod.get("variants", []) if isinstance(v, dict)]
+    if not variants:
+        return False
+
+    has_signal = False
+    for variant in variants:
+        variant_available = _variant_availability_signal(variant)
+        if variant_available is None:
+            continue
+        has_signal = True
+        if variant_available:
+            return False
+
+    return has_signal
+
+
+def _extract_product_url(prod: dict[str, Any], base_url: str | None) -> str | None:
+    for key in ("online_store_url", "url"):
+        value = prod.get(key)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                if base_url:
+                    return urljoin(f"{base_url.rstrip('/')}/", candidate)
+                return candidate
+
+    handle = prod.get("handle")
+    if isinstance(handle, str):
+        handle_clean = handle.strip().strip("/")
+        if handle_clean and base_url:
+            return f"{base_url.rstrip('/')}/products/{handle_clean}"
+
+    return None
+
+
+def extract_products_from_products_json(
+    payload: dict[str, Any],
+    settings: Settings,
+    *,
+    base_url: str | None = None,
+) -> list[ProductRecord]:
     _ = settings
     products_raw = payload.get("products", [])
     out: list[ProductRecord] = []
@@ -121,6 +219,8 @@ def extract_products_from_products_json(payload: dict[str, Any], settings: Setti
     for prod in products_raw:
         product_id = str(prod.get("id") or "")
         if not product_id:
+            continue
+        if _is_sold_out_product(prod):
             continue
 
         images = [img.get("src") for img in prod.get("images", []) if img.get("src")]
@@ -161,6 +261,10 @@ def extract_products_from_products_json(payload: dict[str, Any], settings: Setti
                 sizes=sorted(sizes),
                 colors=sorted(colors),
                 brand=(prod.get("vendor") or None),
+                product_type=(str(prod.get("product_type")).strip() or None)
+                if prod.get("product_type") is not None
+                else None,
+                product_url=_extract_product_url(prod, base_url),
                 raw=prod,
             )
         )

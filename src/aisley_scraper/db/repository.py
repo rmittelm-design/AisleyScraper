@@ -34,6 +34,7 @@ class Repository:
           store_id bigint not null references stores(id) on delete cascade,
           product_id text not null,
           product_handle text,
+          product_url text,
           item_name text not null,
           description text,
                     sku text,
@@ -46,6 +47,7 @@ class Repository:
           sizes jsonb not null default '[]'::jsonb,
           colors jsonb not null default '[]'::jsonb,
           brand text,
+          product_type text,
                     scraped boolean not null default true,
           first_seen_at timestamptz default now(),
           last_seen_at timestamptz default now(),
@@ -58,6 +60,8 @@ class Repository:
                 alter table products add column if not exists updated_at text;
                 alter table products add column if not exists position integer;
                 alter table products add column if not exists sku text;
+            alter table products add column if not exists product_type text;
+                alter table products add column if not exists product_url text;
                 alter table products add column if not exists scraped boolean not null default true;
         """
         with self._connect() as conn:
@@ -106,10 +110,11 @@ class Repository:
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         sql = """
-                insert into products (store_id, product_id, product_handle, item_name, description, sku, updated_at, position, price_cents, images, supabase_images, gender_label, sizes, colors, brand)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                insert into products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, position, price_cents, images, supabase_images, gender_label, sizes, colors, brand, product_type)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         on conflict (store_id, product_id) do update
           set product_handle = excluded.product_handle,
+              product_url = excluded.product_url,
               item_name = excluded.item_name,
               description = excluded.description,
               sku = excluded.sku,
@@ -122,6 +127,7 @@ class Repository:
               sizes = excluded.sizes,
               colors = excluded.colors,
               brand = excluded.brand,
+              product_type = excluded.product_type,
               last_seen_at = now();
         """
 
@@ -133,6 +139,7 @@ class Repository:
                         store_id,
                         product.product_id,
                         product.product_handle,
+                        product.product_url,
                         product.item_name,
                         product.description,
                         product.sku,
@@ -145,6 +152,7 @@ class Repository:
                         json.dumps(product.sizes),
                         json.dumps(product.colors),
                         product.brand,
+                        product.product_type,
                     ),
                 )
             conn.commit()

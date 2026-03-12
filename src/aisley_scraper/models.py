@@ -36,6 +36,8 @@ class ProductRecord:
     sizes: list[str] = field(default_factory=list)
     colors: list[str] = field(default_factory=list)
     brand: str | None = None
+    product_type: str | None = None
+    product_url: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 

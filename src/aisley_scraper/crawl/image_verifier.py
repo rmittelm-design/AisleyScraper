@@ -78,3 +78,6 @@ async def verify_product_images(
 
     for product in products:
         product.images = [url for url in product.images if verdicts.get(url.strip(), False)]
+
+    # Keep only products that still have at least one validated image.
+    products[:] = [product for product in products if product.images]

@@ -54,3 +54,59 @@ def test_extract_gender_none_when_not_explicit() -> None:
     out = extract_products_from_products_json(payload, _settings())
     assert len(out) == 1
     assert out[0].gender_label is None
+
+
+def test_extract_gender_from_women_tag_variants() -> None:
+    payload = {
+        "products": [
+            {
+                "id": 3,
+                "title": "Dress",
+                "handle": "dress",
+                "body_html": "",
+                "images": [{"src": "https://cdn.example.com/dress.jpg"}],
+                "options": [],
+                "variants": [],
+                "vendor": "Brand",
+                "tags": "new, women's-clothing, sale",
+            },
+            {
+                "id": 4,
+                "title": "Skirt",
+                "handle": "skirt",
+                "body_html": "",
+                "images": [{"src": "https://cdn.example.com/skirt.jpg"}],
+                "options": [],
+                "variants": [],
+                "vendor": "Brand",
+                "tags": "womens, summer",
+            },
+        ]
+    }
+
+    out = extract_products_from_products_json(payload, _settings())
+    assert len(out) == 2
+    assert out[0].gender_label == "female"
+    assert out[1].gender_label == "female"
+
+
+def test_extract_gender_from_mens_tag_variant() -> None:
+    payload = {
+        "products": [
+            {
+                "id": 5,
+                "title": "Jacket",
+                "handle": "jacket",
+                "body_html": "",
+                "images": [{"src": "https://cdn.example.com/jacket.jpg"}],
+                "options": [],
+                "variants": [],
+                "vendor": "Brand",
+                "tags": "mens-wear, winter",
+            }
+        ]
+    }
+
+    out = extract_products_from_products_json(payload, _settings())
+    assert len(out) == 1
+    assert out[0].gender_label == "male"

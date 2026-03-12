@@ -53,3 +53,25 @@ def test_extract_price_from_variant_minimum() -> None:
     out = extract_products_from_products_json(payload, _settings())
     assert len(out) == 1
     assert out[0].price_cents == 12099
+
+
+def test_extract_product_type() -> None:
+    payload = {
+        "products": [
+            {
+                "id": 12,
+                "title": "Loafer",
+                "handle": "loafer",
+                "body_html": "",
+                "images": [{"src": "https://cdn.example.com/loafer.jpg"}],
+                "options": [],
+                "variants": [],
+                "product_type": "Shoes",
+                "vendor": "Brand",
+            }
+        ]
+    }
+
+    out = extract_products_from_products_json(payload, _settings())
+    assert len(out) == 1
+    assert out[0].product_type == "Shoes"
