@@ -47,3 +47,10 @@ class Fetcher:
             if isinstance(payload, dict):
                 return payload
             return {}
+
+    async def get_bytes(self, url: str) -> bytes:
+        domain = urlparse(url).netloc
+        async with self._domain_semaphores[domain]:
+            response = await self._client.get(url)
+            response.raise_for_status()
+            return response.content

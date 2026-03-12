@@ -4,6 +4,7 @@ import asyncio
 
 from aisley_scraper.config import Settings
 from aisley_scraper.crawl.fetcher import Fetcher
+from aisley_scraper.crawl.image_verifier import verify_product_images
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreSeed
@@ -20,6 +21,7 @@ async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) ->
     try:
         payload = await fetcher.get_json(products_url)
         extracted = extract_products_from_products_json(payload, settings)
+        await verify_product_images(products=extracted, fetcher=fetcher, settings=settings)
         products = [enforce_attribute_policy(p) for p in extracted if p.images]
     except Exception:
         products = []

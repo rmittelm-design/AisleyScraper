@@ -43,13 +43,29 @@ class Settings(BaseSettings):
     shopify_products_page_limit: int = Field(default=250, alias="SHOPIFY_PRODUCTS_PAGE_LIMIT")
     shopify_products_max_pages: int = Field(default=100, alias="SHOPIFY_PRODUCTS_MAX_PAGES")
 
+    image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
+    image_validation_concurrency: int = Field(default=8, alias="IMAGE_VALIDATION_CONCURRENCY")
+    image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
+
     classify_require_ecom_signal: bool = Field(default=True, alias="CLASSIFY_REQUIRE_ECOM_SIGNAL")
 
-    @field_validator("crawl_global_concurrency", "crawl_per_domain_concurrency", "crawl_global_qps")
+    @field_validator(
+        "crawl_global_concurrency",
+        "crawl_per_domain_concurrency",
+        "crawl_global_qps",
+        "image_validation_concurrency",
+    )
     @classmethod
     def positive_int(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("must be > 0")
+        return value
+
+    @field_validator("image_validation_max_retries")
+    @classmethod
+    def non_negative_int(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must be >= 0")
         return value
 
     @field_validator("persistence_target")

@@ -22,6 +22,7 @@ Update these required values in `.env`:
 - `LOCAL_OUTPUT_PATH`: local JSON output path used when `PERSISTENCE_TARGET=local`.
 - `INPUT_CSV_PATH`: path to your input CSV file.
 - `USER_AGENT` (optional): crawler user agent with contact info. Defaults to blank if unset.
+- `IMAGE_VALIDATION_USE_GCLOUD_VISION` (optional): `true` (default) runs Google Vision NSFW checks for images; set to `false` to skip that step.
 
 Recommended preflight checks:
 
