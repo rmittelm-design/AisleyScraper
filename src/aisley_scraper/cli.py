@@ -18,6 +18,9 @@ from aisley_scraper.normalize.products import enforce_attribute_policy
 from aisley_scraper.storage import StorageUploader
 
 
+logger = logging.getLogger(__name__)
+
+
 def _dedupe_seeds_by_domain(seeds: list[StoreSeed]) -> list[StoreSeed]:
     seen_domains: set[str] = set()
     deduped: list[StoreSeed] = []
@@ -140,9 +143,80 @@ def run_crawl(limit: int | None) -> int:
                 finally:
                     await enrich_fetcher.close()
 
+            def _safe_enrich_product(product) -> None:
+                if not product.images or product.gender_probs_csv:
+                    return
+                try:
+                    asyncio.run(_enrich_products_only([product]))
+                except Exception as exc:
+                    logger.warning(
+                        "Gender enrichment failed for store=%s product=%s: %s",
+                        store_id,
+                        product.product_id,
+                        exc,
+                    )
+
+            def _safe_upload_new_product_images(product) -> list[str]:
+                if not product.images:
+                    return []
+                try:
+                    return uploader.upload_product_images(
+                        product.images,
+                        store_id=store_id,
+                        product_id=product.product_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Image upload failed for store=%s product=%s: %s",
+                        store_id,
+                        product.product_id,
+                        exc,
+                    )
+                    return []
+
+            def _safe_sync_existing_product_images(
+                product,
+                existing_images: list[str],
+                existing_supabase_images: list[str],
+            ) -> list[str]:
+                try:
+                    return uploader.sync_product_images(
+                        current_source_urls=product.images,
+                        existing_source_urls=existing_images,
+                        existing_supabase_urls=existing_supabase_images,
+                        store_id=store_id,
+                        product_id=product.product_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Image sync failed for store=%s product=%s: %s",
+                        store_id,
+                        product.product_id,
+                        exc,
+                    )
+                    return existing_supabase_images
+
+            def _safe_upsert_product(product) -> None:
+                try:
+                    repo.upsert_product(store_id, product)
+                except Exception as exc:
+                    logger.warning(
+                        "Final upsert failed for store=%s product=%s: %s",
+                        store_id,
+                        product.product_id,
+                        exc,
+                    )
+
             processing_products = list(preliminary_products)
-            asyncio.run(_postprocess_products(processing_products))
-            processing_products = [enforce_attribute_policy(p) for p in processing_products if p.images]
+            postprocess_failed = False
+            try:
+                asyncio.run(_postprocess_products(processing_products))
+                processing_products = [enforce_attribute_policy(p) for p in processing_products if p.images]
+            except Exception as exc:
+                # Do not leave early-upserted rows incomplete when postprocess fails.
+                logger.warning("Postprocess failed for %s: %s", seed.store_url, exc)
+                postprocess_failed = True
+                processing_products = []
 
             finalized_ids = {p.product_id for p in processing_products}
             for product in preliminary_products:
@@ -153,48 +227,38 @@ def run_crawl(limit: int | None) -> int:
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is None:
                     if product.images:
-                        if not product.gender_probs_csv:
-                            asyncio.run(_enrich_products_only([product]))
-                        product.supabase_images = uploader.upload_product_images(
-                            product.images,
-                            store_id=store_id,
-                            product_id=product.product_id,
-                        )
+                        _safe_enrich_product(product)
+                        product.supabase_images = _safe_upload_new_product_images(product)
                     else:
                         product.supabase_images = []
                 else:
-                    if product.images and not product.gender_probs_csv:
-                        asyncio.run(_enrich_products_only([product]))
+                    _safe_enrich_product(product)
                     existing_images, existing_supabase_images = existing_image_state
-                    product.supabase_images = uploader.sync_product_images(
-                        current_source_urls=product.images,
-                        existing_source_urls=existing_images,
-                        existing_supabase_urls=existing_supabase_images,
-                        store_id=store_id,
-                        product_id=product.product_id,
+                    product.supabase_images = _safe_sync_existing_product_images(
+                        product,
+                        existing_images,
+                        existing_supabase_images,
                     )
-                repo.upsert_product(store_id, product)
+                _safe_upsert_product(product)
+
+            # If postprocess failed globally, all products were handled through fallback branch above.
+            if postprocess_failed:
+                return True
 
             for product in processing_products:
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is None:
                     if product.images:
-                        product.supabase_images = uploader.upload_product_images(
-                            product.images,
-                            store_id=store_id,
-                            product_id=product.product_id,
-                        )
+                        product.supabase_images = _safe_upload_new_product_images(product)
                 else:
                     existing_images, existing_supabase_images = existing_image_state
-                    product.supabase_images = uploader.sync_product_images(
-                        current_source_urls=product.images,
-                        existing_source_urls=existing_images,
-                        existing_supabase_urls=existing_supabase_images,
-                        store_id=store_id,
-                        product_id=product.product_id,
+                    product.supabase_images = _safe_sync_existing_product_images(
+                        product,
+                        existing_images,
+                        existing_supabase_images,
                     )
 
-                repo.upsert_product(store_id, product)
+                _safe_upsert_product(product)
 
             return True
 
