@@ -379,7 +379,7 @@ def test_run_crawl_backfills_missing_gender_probs_for_existing_product(monkeypat
     assert _FakeRestRepo.upserted_gender_probs == "0.11,0.22,0.67"
 
 
-def test_run_crawl_does_not_abort_on_enrich_failure_for_existing_product(monkeypatch) -> None:
+def test_run_crawl_recovers_after_transient_enrich_failure_for_existing_product(monkeypatch) -> None:
     settings = Settings(
         LOG_LEVEL="INFO",
         SUPABASE_URL="https://x.supabase.co",
@@ -468,6 +468,8 @@ def test_run_crawl_does_not_abort_on_enrich_failure_for_existing_product(monkeyp
         async def close(self) -> None:
             return None
 
+    enrich_calls = {"n": 0}
+
     async def _fake_enrich_gender_probabilities_for_products(
         *,
         products: list[ProductRecord],
@@ -475,9 +477,10 @@ def test_run_crawl_does_not_abort_on_enrich_failure_for_existing_product(monkeyp
         concurrency: int,
     ) -> None:
         _ = (fetcher, concurrency)
+        enrich_calls["n"] += 1
+        if enrich_calls["n"] == 1:
+            raise RuntimeError("synthetic transient enrich failure")
         for product in products:
-            if product.product_id == "p-20":
-                raise RuntimeError("synthetic enrich failure")
             product.gender_probs_csv = "0.10,0.80,0.10"
 
     async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
@@ -511,8 +514,10 @@ def test_run_crawl_does_not_abort_on_enrich_failure_for_existing_product(monkeyp
     exit_code = cli.run_crawl(limit=1)
 
     assert exit_code == 0
-    # Two early upserts plus two fallback final upserts.
-    assert _FakeRestRepo.final_upserts == ["p-20", "p-21", "p-20", "p-21"]
+    # Two early upserts plus at least one finalize/repair pass for both products.
+    assert _FakeRestRepo.final_upserts[:2] == ["p-20", "p-21"]
+    assert _FakeRestRepo.final_upserts.count("p-20") >= 2
+    assert _FakeRestRepo.final_upserts.count("p-21") >= 2
 
 
 def test_run_crawl_marks_store_failed_when_final_upsert_never_succeeds(monkeypatch, capsys) -> None:
@@ -850,3 +855,118 @@ def test_run_crawl_fallback_restored_images_get_gender_probs_when_verifier_empti
 
     assert exit_code == 0
     assert _FakeRestRepo.last_gender_probs == "0.25,0.5,0.25"
+
+
+def test_run_crawl_repairs_transient_upload_failure_in_finalize(monkeypatch) -> None:
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+    )
+
+    seed = StoreSeed(store_url="https://example.com")
+    outcome = ScrapeResult(
+        store=StoreProfile(
+            store_name="Example",
+            website="https://example.com",
+            store_type="online",
+        ),
+        products=[
+            ProductRecord(
+                product_id="repair-1",
+                product_handle="repair-1",
+                item_name="Repair Item",
+                description=None,
+                images=["https://cdn.example.com/repair.jpg"],
+                gender_label=None,
+            )
+        ],
+    )
+
+    class _FakeRestRepo:
+        last_supa_len = 0
+
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def ensure_schema(self) -> None:
+            return None
+
+        def upsert_store(self, store: StoreProfile) -> int:
+            _ = store
+            return 1
+
+        def get_product_image_state(self, store_id: int, product_id: str):
+            _ = (store_id, product_id)
+            return None
+
+        def upsert_product(self, store_id: int, product: ProductRecord) -> None:
+            _ = store_id
+            if product.product_id == "repair-1":
+                _FakeRestRepo.last_supa_len = len(product.supabase_images)
+
+    class _FakeUploader:
+        calls = 0
+
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def upload_product_images(self, image_urls: list[str], store_id: int, product_id: str) -> list[str]:
+            _ = (image_urls, store_id, product_id)
+            _FakeUploader.calls += 1
+            if _FakeUploader.calls == 1:
+                return []
+            return ["https://x.supabase.co/storage/repair-1.jpg"]
+
+    class _FakeFetcher:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        async def close(self) -> None:
+            return None
+
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+        _ = (products, fetcher, settings)
+        return None
+
+    async def _fake_enrich_gender_probabilities_for_products(
+        *,
+        products: list[ProductRecord],
+        fetcher: object,
+        concurrency: int,
+    ) -> None:
+        _ = (fetcher, concurrency)
+        for product in products:
+            product.gender_probs_csv = "0.2,0.6,0.2"
+
+    async def _fake_scrape_many_stream(
+        seeds: list[StoreSeed],
+        _settings: Settings,
+        *,
+        include_postprocess: bool = True,
+    ):
+        _ = (seeds, _settings, include_postprocess)
+        yield (seed, outcome)
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
+    monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
+    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
+    monkeypatch.setattr(cli, "verify_product_images", _fake_verify_product_images)
+    monkeypatch.setattr(
+        cli,
+        "enrich_gender_probabilities_for_products",
+        _fake_enrich_gender_probabilities_for_products,
+    )
+
+    exit_code = cli.run_crawl(limit=1)
+
+    assert exit_code == 0
+    assert _FakeUploader.calls >= 2
+    assert _FakeRestRepo.last_supa_len == 1

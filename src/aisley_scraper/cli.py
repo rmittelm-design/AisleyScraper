@@ -261,10 +261,6 @@ def run_crawl(limit: int | None) -> int:
                 if not _safe_upsert_product(product):
                     final_upsert_failures.append(product.product_id)
 
-            # If postprocess failed globally, all products were handled through fallback branch above.
-            if postprocess_failed:
-                return True
-
             for product in processing_products:
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is None:
@@ -281,6 +277,56 @@ def run_crawl(limit: int | None) -> int:
                 if not _safe_upsert_product(product):
                     final_upsert_failures.append(product.product_id)
 
+            # One more repair pass for products that still have source images but are missing
+            # uploaded image URLs and/or gender probabilities.
+            missing_required_fields = [
+                product
+                for product in preliminary_products
+                if product.images and (not product.supabase_images or not product.gender_probs_csv)
+            ]
+            if missing_required_fields:
+                missing_gender = [product for product in missing_required_fields if not product.gender_probs_csv]
+                if missing_gender:
+                    try:
+                        asyncio.run(_enrich_products_only(missing_gender))
+                    except Exception as exc:
+                        logger.warning(
+                            "Repair enrichment batch failed for %s (store_id=%s): %s",
+                            seed.store_url,
+                            store_id,
+                            exc,
+                        )
+
+                for product in missing_required_fields:
+                    if not product.supabase_images:
+                        existing_image_state = existing_state_by_product_id.get(product.product_id)
+                        if existing_image_state is None:
+                            product.supabase_images = _safe_upload_new_product_images(product)
+                        else:
+                            existing_images, existing_supabase_images = existing_image_state
+                            product.supabase_images = _safe_sync_existing_product_images(
+                                product,
+                                existing_images,
+                                existing_supabase_images,
+                            )
+
+                    if not _safe_upsert_product(product):
+                        final_upsert_failures.append(product.product_id)
+
+            unresolved_required_fields = [
+                product.product_id
+                for product in preliminary_products
+                if product.images and (not product.supabase_images or not product.gender_probs_csv)
+            ]
+            if unresolved_required_fields:
+                logger.error(
+                    "Store finalize unresolved required fields for %s (store_id=%s), products=%s",
+                    seed.store_url,
+                    store_id,
+                    len(unresolved_required_fields),
+                )
+                return False
+
             if final_upsert_failures:
                 logger.error(
                     "Store finalize incomplete for %s (store_id=%s), failed final upserts=%s",
@@ -289,6 +335,10 @@ def run_crawl(limit: int | None) -> int:
                     len(final_upsert_failures),
                 )
                 return False
+
+            # If postprocess failed globally, all products were handled through fallback branch.
+            if postprocess_failed:
+                return True
 
             return True
 
