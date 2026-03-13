@@ -43,10 +43,6 @@ class Settings(BaseSettings):
     shopify_products_max_pages: int = Field(default=100, alias="SHOPIFY_PRODUCTS_MAX_PAGES")
 
     image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
-    image_validation_use_gcloud_vision: bool = Field(
-        default=True,
-        alias="IMAGE_VALIDATION_USE_GCLOUD_VISION",
-    )
     image_validation_concurrency: int = Field(default=4, alias="IMAGE_VALIDATION_CONCURRENCY")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
 

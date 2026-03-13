@@ -196,34 +196,6 @@ def _encode_jpeg(pil_img, quality: int = 92) -> bytes:
     return buf.getvalue()
 
 
-def _encode_jpeg_downscaled(pil_img, *, max_side: int = 1024, quality: int = 82) -> bytes:
-    """Encode a downscaled JPEG for analysis (e.g., Vision API).
-
-    This intentionally trades some fidelity for speed and smaller payload size.
-    """
-
-    try:
-        from PIL import Image
-    except Exception as exc:  # pragma: no cover
-        raise ImageValidationFailure(
-            code="server_missing_dependency",
-            message="Server is missing Pillow; image conversion is unavailable.",
-            details={"dependency": "Pillow", "error": str(exc)},
-        )
-
-    rgb = pil_img.convert("RGB")
-    w, h = rgb.size
-    longest = max(int(w), int(h)) if w and h else 0
-    if longest and longest > int(max_side):
-        scale = float(max_side) / float(longest)
-        new_w = max(1, int(round(float(w) * scale)))
-        new_h = max(1, int(round(float(h) * scale)))
-        rgb = rgb.resize((new_w, new_h), resample=Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    rgb.save(buf, format="JPEG", quality=int(quality), optimize=True)
-    return buf.getvalue()
-
-
 def assess_image_quality(pil_img) -> dict[str, Any]:
     try:
         import cv2
@@ -447,26 +419,6 @@ def warmup_quality_checks(*, strict: bool = False) -> None:
         logger.warning("Quality warmup failed: %s", exc)
 
 
-def warmup_gcv(*, strict: bool = False) -> None:
-    """Warm up Google Vision client construction.
-
-    This does not make an API call; it just builds the client/channel.
-    """
-
-    if not _gcv_nsfw_check_enabled():
-        logger.info("GCV client warmup skipped: IMAGE_VALIDATION_USE_GCLOUD_VISION=false")
-        return
-
-    start = time.perf_counter()
-    try:
-        _ = _get_gcv_client()
-        logger.info("GCV client warmup ok (%.2fs)", time.perf_counter() - start)
-    except Exception as exc:
-        if strict:
-            raise
-        logger.warning("GCV client warmup failed (%.2fs): %r", time.perf_counter() - start, exc)
-
-
 def _format_probs_csv(values: list[float]) -> str:
     # Stable + compact string for storage.
     return ",".join(f"{v:.6f}" for v in values)
@@ -603,207 +555,6 @@ def product_probability_clip(pil_img) -> dict[str, Any]:
         }
 
 
-_GCV_LOCK = threading.Lock()
-_GCV_CLIENT = None
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
-def _deploy_on_gcloud() -> bool:
-    # Explicit flag remains supported.
-    if _env_bool("DEPLOY_ON_GCLOUD", False):
-        return True
-
-    # Cloud Run always exposes K_SERVICE; prefer runtime detection so a baked local
-    # .env value cannot accidentally force file-based credentials in production.
-    if (os.environ.get("K_SERVICE") or "").strip():
-        return True
-
-    return False
-
-
-def _gcv_nsfw_check_enabled() -> bool:
-    env_name = "IMAGE_VALIDATION_USE_GCLOUD_VISION"
-    if os.environ.get(env_name) is not None:
-        return _env_bool(env_name, True)
-
-    # Fall back to Settings so values from `.env` are respected even when they are
-    # not exported into process environment variables.
-    try:
-        from aisley_scraper.config import get_settings
-
-        return bool(get_settings().image_validation_use_gcloud_vision)
-    except Exception:
-        return True
-
-
-def _get_gcv_client():
-    global _GCV_CLIENT
-    with _GCV_LOCK:
-        if _GCV_CLIENT is not None:
-            return _GCV_CLIENT
-        try:
-            from google.cloud import vision
-        except Exception as exc:  # pragma: no cover
-            raise ImageValidationFailure(
-                code="nsfw_check_unavailable",
-                message="Server is missing Google Cloud Vision dependencies; NSFW verification is unavailable.",
-                details={"dependency": "google-cloud-vision", "error": str(exc)},
-            )
-        try:
-            if _deploy_on_gcloud():
-                # On GCP (Cloud Run/GCE/GKE), rely on the runtime service account (ADC).
-                # Guard against accidentally baked local .env values that set
-                # GOOGLE_APPLICATION_CREDENTIALS to a non-existent workstation path.
-                os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
-                _GCV_CLIENT = vision.ImageAnnotatorClient()
-            else:
-                # Local/dev: use a service account JSON key file.
-                creds_path = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
-                if creds_path and os.path.exists(creds_path):
-                    try:
-                        import google.auth
-                    except Exception as exc:
-                        raise ImageValidationFailure(
-                            code="nsfw_check_unavailable",
-                            message="Server is missing google-auth; NSFW verification is unavailable.",
-                            details={"dependency": "google-auth", "error": str(exc)},
-                        )
-                    # Supports both service account keys and user ADC files (authorized_user).
-                    credentials, _ = google.auth.load_credentials_from_file(creds_path)
-                    _GCV_CLIENT = vision.ImageAnnotatorClient(credentials=credentials)
-                else:
-                    # If file-based credentials are missing (or not set), attempt ADC as a resilient fallback.
-                    # This covers Cloud Run environments where a local dev path is accidentally configured.
-                    try:
-                        _GCV_CLIENT = vision.ImageAnnotatorClient()
-                    except Exception as adc_exc:
-                        if not creds_path:
-                            raise ImageValidationFailure(
-                                code="nsfw_check_unavailable",
-                                message="GOOGLE_APPLICATION_CREDENTIALS must be set when DEPLOY_ON_GCLOUD=false.",
-                                details={"expected_env": "GOOGLE_APPLICATION_CREDENTIALS", "adc_fallback_error": repr(adc_exc)},
-                            )
-                        raise ImageValidationFailure(
-                            code="nsfw_check_unavailable",
-                            message="Google Cloud Vision client could not be initialized; NSFW verification is unavailable.",
-                            details={"error": repr(adc_exc), "path": creds_path},
-                        )
-
-            return _GCV_CLIENT
-        except ImageValidationFailure:
-            raise
-        except FileNotFoundError as exc:
-            raise ImageValidationFailure(
-                code="nsfw_check_unavailable",
-                message="Google Cloud Vision credentials file not found.",
-                details={"path": os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"), "error": str(exc)},
-            )
-        except Exception as exc:
-            raise ImageValidationFailure(
-                code="nsfw_check_unavailable",
-                message="Google Cloud Vision client could not be initialized; NSFW verification is unavailable.",
-                details={"error": str(exc)},
-            )
-
-
-def nsfw_check_gcv(image_bytes: bytes) -> dict[str, Any]:
-    try:
-        from google.cloud import vision
-    except Exception as exc:  # pragma: no cover
-        raise ImageValidationFailure(
-            code="nsfw_check_unavailable",
-            message="Server is missing Google Cloud Vision dependencies; NSFW verification is unavailable.",
-            details={"dependency": "google-cloud-vision", "error": str(exc)},
-        )
-
-    client = _get_gcv_client()
-    image = vision.Image(content=image_bytes)
-
-    # Retry transient Google API failures to avoid dropping items on temporary outages.
-    max_attempts = 3
-    response = None
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = client.safe_search_detection(image=image)
-            break
-        except Exception as exc:
-            last_exc = exc
-
-            # Normalize common GCP failures into a structured error.
-            try:
-                from google.api_core import exceptions as gexc
-            except Exception:
-                gexc = None
-
-            if gexc is not None and isinstance(exc, (gexc.PermissionDenied, gexc.Forbidden, gexc.Unauthorized)):
-                # Typically SERVICE_DISABLED (Vision API not enabled) or missing IAM.
-                raise ImageValidationFailure(
-                    code="nsfw_check_unavailable",
-                    message="NSFW verification is unavailable: Cloud Vision API is disabled or access is denied for the configured project.",
-                    details={"error": repr(exc)},
-                )
-
-            is_transient = False
-            if gexc is not None and isinstance(
-                exc,
-                (
-                    gexc.ServiceUnavailable,
-                    gexc.DeadlineExceeded,
-                    gexc.InternalServerError,
-                    gexc.TooManyRequests,
-                ),
-            ):
-                is_transient = True
-
-            if is_transient and attempt < max_attempts:
-                # Backoff: 0.5s, 1.0s
-                time.sleep(0.5 * attempt)
-                continue
-
-            raise ImageValidationFailure(
-                code="nsfw_check_unavailable",
-                message="NSFW verification is unavailable due to a Google Vision API error.",
-                details={"error": repr(exc), "attempt": attempt},
-            )
-
-    if response is None:
-        raise ImageValidationFailure(
-            code="nsfw_check_unavailable",
-            message="NSFW verification is unavailable due to a Google Vision API error.",
-            details={"error": repr(last_exc) if last_exc else "unknown"},
-        )
-    if getattr(response, "error", None) and getattr(response.error, "message", ""):
-        raise ImageValidationFailure(
-            code="nsfw_check_failed",
-            message="NSFW verification failed.",
-            details={"error": response.error.message},
-        )
-    safe = response.safe_search_annotation
-    return {
-        "adult": int(safe.adult),
-        "violence": int(safe.violence),
-        "racy": int(safe.racy),
-        "medical": int(safe.medical),
-    }
-
-
-def is_nsfw_gcv(result: dict[str, Any]) -> bool:
-    likely = 4
-    return (int(result.get("adult", 0)) >= likely) or (int(result.get("violence", 0)) >= likely)
-
-
 def validate_and_normalize_upload(
     *,
     content: bytes,
@@ -818,7 +569,7 @@ def validate_and_normalize_upload(
       - normalized_content_type
       - quality
       - product
-      - nsfw
+    - nsfw (always None)
     """
 
     if not content:
@@ -979,30 +730,7 @@ def validate_and_normalize_upload(
             },
         )
 
-    nsfw: dict[str, Any]
-    if _gcv_nsfw_check_enabled():
-        # Google Vision SafeSearch does not require full-resolution; send a smaller JPEG payload for speed.
-        try:
-            t0 = time.perf_counter()
-            gcv_bytes = _encode_jpeg_downscaled(pil_img, max_side=1024, quality=82)
-            timings["gcv_prep_s"] = time.perf_counter() - t0
-            timings["gcv_input_bytes"] = float(len(gcv_bytes))
-        except Exception:
-            # If downscale/encode fails for any reason, fall back to the normalized bytes.
-            gcv_bytes = normalized_bytes
-            timings["gcv_input_bytes"] = float(len(gcv_bytes))
-
-        t0 = time.perf_counter()
-        nsfw = nsfw_check_gcv(gcv_bytes)
-        timings["gcv_nsfw_s"] = time.perf_counter() - t0
-        if is_nsfw_gcv(nsfw):
-            raise ImageValidationFailure(
-                code="unsafe_content",
-                message="Image was rejected due to unsafe content.",
-                details={"nsfw": nsfw},
-            )
-    else:
-        nsfw = {"skipped": True, "reason": "disabled_by_env"}
+    nsfw = None
 
     return {
         "ok": True,
