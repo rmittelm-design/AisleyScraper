@@ -1,4 +1,4 @@
-create table if not exists shopify_stores (
+create table if not exists public.shopify_stores (
   id bigserial primary key,
   website text unique not null,
   store_name text not null,
@@ -11,9 +11,9 @@ create table if not exists shopify_stores (
   last_seen_at timestamptz default now()
 );
 
-create table if not exists shopify_products (
+create table if not exists public.shopify_products (
   id bigserial primary key,
-  store_id bigint not null references shopify_stores(id) on delete cascade,
+  store_id bigint not null references public.shopify_stores(id) on delete cascade,
   product_id text not null,
   product_handle text,
   product_url text,
@@ -25,6 +25,7 @@ create table if not exists shopify_products (
   images jsonb not null,
   supabase_images jsonb not null default '[]'::jsonb,
   gender_label text,
+  gender_probs_csv text,
   sizes jsonb not null default '[]'::jsonb,
   colors jsonb not null default '[]'::jsonb,
   brand text,
@@ -36,4 +37,4 @@ create table if not exists shopify_products (
   unique (store_id, product_id)
 );
 
-create index if not exists idx_shopify_products_store_id on shopify_products(store_id);
+create index if not exists idx_shopify_products_store_id on public.shopify_products(store_id);
