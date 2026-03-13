@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from uuid import uuid4
 from urllib.parse import urlparse
 
 from aisley_scraper.config import get_settings
@@ -16,6 +19,10 @@ from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import ScrapeResult, StoreSeed
 from aisley_scraper.normalize.products import enforce_attribute_policy
 from aisley_scraper.storage import StorageUploader
+from aisley_scraper.storage_integrity import (
+    delete_orphan_storage_objects,
+    detect_orphan_storage_objects,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -42,12 +49,103 @@ def _build_parser() -> argparse.ArgumentParser:
 
     crawl = sub.add_parser("crawl-stores")
     crawl.add_argument("--limit", type=int, default=None)
+    crawl.add_argument("--run-id", required=False)
+    crawl.add_argument("--fresh", action="store_true")
 
     return parser
 
 
 def _setup_logging(level: str) -> None:
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO))
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    file_handler = RotatingFileHandler(
+        ".aisley_scraper.log",
+        maxBytes=10_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(root.level)
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(fmt)
+    root.addHandler(console_handler)
+
+
+def _get_store_urls_from_repo(repo: SupabaseRestRepository) -> list[str]:
+    list_all = getattr(repo, "list_all_store_websites", None)
+    if callable(list_all):
+        return list_all()
+    return []
+
+
+def _resolve_run_id(state_path: str, run_id: str | None, fresh: bool) -> str:
+    state_file = Path(state_path)
+
+    if fresh:
+        resolved = run_id or str(uuid4())
+        state_file.write_text(resolved, encoding="utf-8")
+        return resolved
+
+    if run_id:
+        state_file.write_text(run_id, encoding="utf-8")
+        return run_id
+
+    if state_file.exists():
+        persisted = state_file.read_text(encoding="utf-8").strip()
+        if persisted:
+            return persisted
+
+    resolved = str(uuid4())
+    state_file.write_text(resolved, encoding="utf-8")
+    return resolved
+
+
+def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
+    audit = detect_orphan_storage_objects(settings)
+    orphan_paths = list(audit["orphan_paths"])
+    if not orphan_paths:
+        logger.info(
+            "Orphan preflight passed linked=%s stored=%s orphans=0",
+            audit["linked_paths"],
+            audit["stored_paths"],
+        )
+        return
+
+    deleted = delete_orphan_storage_objects(settings, orphan_paths, batch_size=batch_size)
+    logger.warning(
+        "Orphan preflight auto-clean deleted=%s linked=%s stored=%s",
+        deleted,
+        audit["linked_paths"],
+        audit["stored_paths"],
+    )
+
+    verify = detect_orphan_storage_objects(settings)
+    remaining_orphans = list(verify["orphan_paths"])
+    if remaining_orphans:
+        raise RuntimeError(f"orphan preflight failed: remaining_orphans={len(remaining_orphans)}")
+
+
+def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreSeed]:
+    csv_seeds = _dedupe_seeds_by_domain(load_store_seeds(settings.input_csv_path, settings))
+    db_websites = _get_store_urls_from_repo(repo)
+
+    db_seeds = [StoreSeed(store_url=website) for website in db_websites]
+    db_seeds = _dedupe_seeds_by_domain(db_seeds)
+
+    seen_domains = {urlparse(seed.store_url).netloc.strip().lower() for seed in db_seeds}
+    csv_new = [
+        seed
+        for seed in csv_seeds
+        if urlparse(seed.store_url).netloc.strip().lower() not in seen_domains
+    ]
+    return db_seeds + csv_new
 
 
 def run_ingest(csv_path: str | None) -> int:
@@ -60,18 +158,23 @@ def run_ingest(csv_path: str | None) -> int:
     return 0
 
 
-def run_crawl(limit: int | None) -> int:
+def run_crawl(
+    limit: int | None,
+    run_id: str | None = None,
+    fresh: bool = False,
+    *,
+    enforce_preflight: bool = False,
+) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
 
-    seeds = load_store_seeds(settings.input_csv_path, settings)
-    seeds = _dedupe_seeds_by_domain(seeds)
-    if limit is not None:
-        seeds = seeds[:limit]
-    else:
-        seeds = seeds[: settings.crawl_max_stores_per_run]
-
     if settings.persistence_target == "local":
+        seeds = load_store_seeds(settings.input_csv_path, settings)
+        seeds = _dedupe_seeds_by_domain(seeds)
+        if limit is not None:
+            seeds = seeds[:limit]
+        else:
+            seeds = seeds[: settings.crawl_max_stores_per_run]
         results = asyncio.run(scrape_many(seeds, settings))
         success_count, fail_count = write_local_results(settings.local_output_path, results)
         print(
@@ -80,13 +183,37 @@ def run_crawl(limit: int | None) -> int:
         )
         return 0
 
-    # Persist in batches so rows start appearing in Supabase before the full crawl ends.
-    chunk_size = max(1, settings.crawl_global_concurrency)
+    # Persist in small batches to keep runtime memory bounded.
+    chunk_size = max(1, min(10, settings.crawl_global_concurrency))
 
     repo = SupabaseRestRepository(settings)
 
     try:
         repo.ensure_schema()
+        if enforce_preflight:
+            _run_orphan_preflight(settings)
+
+        all_seeds = _build_db_first_seeds(settings, repo)
+        all_seeds = _dedupe_seeds_by_domain(all_seeds)
+        if limit is not None:
+            all_seeds = all_seeds[:limit]
+        else:
+            all_seeds = all_seeds[: settings.crawl_max_stores_per_run]
+
+        resolved_run_id = _resolve_run_id(settings.crawl_run_state_path, run_id, fresh)
+        init_run = getattr(repo, "initialize_crawl_run", None)
+        if callable(init_run):
+            init_run(run_id=resolved_run_id, websites=[seed.store_url for seed in all_seeds])
+
+        list_pending = getattr(repo, "list_all_run_store_websites", None)
+        if callable(list_pending):
+            eligible_urls = set(
+                list_pending(run_id=resolved_run_id, statuses=["pending", "failed"])
+            )
+            seeds = [seed for seed in all_seeds if seed.store_url in eligible_urls]
+        else:
+            seeds = all_seeds
+
         uploader = StorageUploader(settings)
 
         success_count = 0
@@ -541,6 +668,24 @@ def run_crawl(limit: int | None) -> int:
             async for seed, outcome in scrape_many_stream(batch, settings, include_postprocess=False):
                 processed_in_batch += 1
                 persisted_ok = await asyncio.to_thread(_persist_store_result, seed, outcome)
+
+                mark_status = getattr(repo, "mark_run_store_status", None)
+                if callable(mark_status):
+                    if persisted_ok:
+                        mark_status(
+                            run_id=resolved_run_id,
+                            website=seed.store_url,
+                            status="completed",
+                        )
+                    else:
+                        error_message = str(outcome) if isinstance(outcome, Exception) else "store_persist_failed"
+                        mark_status(
+                            run_id=resolved_run_id,
+                            website=seed.store_url,
+                            status="failed",
+                            error_message=error_message,
+                        )
+
                 if persisted_ok:
                     success_in_batch += 1
 
@@ -555,6 +700,16 @@ def run_crawl(limit: int | None) -> int:
             print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
 
         print(f"Crawled {success_count}/{len(seeds)} stores successfully")
+
+        count_status = getattr(repo, "count_run_store_status", None)
+        if callable(count_status):
+            pending = count_status(run_id=resolved_run_id, status="pending")
+            failed = count_status(run_id=resolved_run_id, status="failed")
+            if pending == 0 and failed == 0:
+                state_file = Path(settings.crawl_run_state_path)
+                if state_file.exists():
+                    state_file.unlink()
+
         return 0
     finally:
         pass
@@ -567,7 +722,12 @@ def main() -> int:
     if args.command == "ingest-stores":
         return run_ingest(args.csv)
     if args.command == "crawl-stores":
-        return run_crawl(args.limit)
+        return run_crawl(
+            args.limit,
+            run_id=args.run_id,
+            fresh=args.fresh,
+            enforce_preflight=True,
+        )
 
     return 1
 

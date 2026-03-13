@@ -16,6 +16,45 @@ Env-driven Shopify store scraper that ingests URLs from CSV and persists store +
 3. Run `aisley-scraper ingest-stores --csv ./data/stores.csv`.
 4. Run `aisley-scraper crawl-stores`.
 
+If you are upgrading an existing deployment, apply the new migration before crawling:
+
+- `supabase/migrations/20260313120000_add_crawl_store_runs.sql`
+
+Restart behavior for `crawl-stores`:
+
+- Crawl source is DB-first: existing `shopify_stores` are processed first, then unseen CSV stores are appended.
+- A run id is persisted in `.aisley_active_run_id` by default, so restarts resume from pending/failed stores in the same run.
+- Use `--fresh` to start a new run id.
+- Use `--run-id <id>` to explicitly resume a specific run.
+
+Before every crawl run (Supabase mode), orphaned storage objects are checked and auto-cleaned; crawl starts only when no orphans remain.
+
+## Crawl Run Modes
+
+Start a new crawl run id:
+
+```bash
+aisley-scraper crawl-stores --fresh
+```
+
+Resume from the active run id stored at `CRAWL_RUN_STATE_PATH` (default `.aisley_active_run_id`):
+
+```bash
+aisley-scraper crawl-stores
+```
+
+Resume a specific run id explicitly:
+
+```bash
+aisley-scraper crawl-stores --run-id <run-id>
+```
+
+Limit stores in a run (useful for canary runs):
+
+```bash
+aisley-scraper crawl-stores --fresh --limit 50
+```
+
 ## Before Running
 
 Update these required values in `.env`:
@@ -35,6 +74,8 @@ Recommended preflight checks:
 - Ensure the storage bucket exists in Supabase and is readable if you plan to use public URLs.
 - Ensure your CSV has the expected URL column (default `store_url`) or update `INPUT_CSV_URL_COLUMN`.
 - Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_GLOBAL_QPS`) before large runs.
+- Default concurrency is conservative for long-run stability: `CRAWL_GLOBAL_CONCURRENCY=15`, `IMAGE_VALIDATION_CONCURRENCY=4`.
+- Optional: set `CRAWL_RUN_STATE_PATH` to change where the active run id is stored (default `.aisley_active_run_id`).
 - Writes use Supabase REST (`/rest/v1`) with `SUPABASE_SERVICE_ROLE_KEY`.
 
 Local mode notes:

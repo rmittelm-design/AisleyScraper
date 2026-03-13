@@ -67,6 +67,191 @@ class SupabaseRestRepository:
         # REST mode assumes migrations are already applied.
         return None
 
+    def list_store_websites(self, *, limit: int = 1000, offset: int = 0) -> list[str]:
+        response = self._request(
+            "GET",
+            "/shopify_stores",
+            params={
+                "select": "website",
+                "order": "id.asc",
+                "limit": str(max(1, limit)),
+                "offset": str(max(0, offset)),
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            return []
+
+        websites: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            website = row.get("website")
+            if isinstance(website, str) and website:
+                websites.append(website)
+        return websites
+
+    def list_all_store_websites(self) -> list[str]:
+        websites: list[str] = []
+        offset = 0
+        page_size = 1000
+
+        while True:
+            batch = self.list_store_websites(limit=page_size, offset=offset)
+            if not batch:
+                break
+            websites.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+        return websites
+
+    def initialize_crawl_run(self, *, run_id: str, websites: list[str]) -> None:
+        if not websites:
+            return
+
+        now = self._utc_now_iso()
+        payload = [
+            {
+                "run_id": run_id,
+                "website": website,
+                "status": "pending",
+                "attempt_count": 0,
+                "created_at": now,
+                "updated_at": now,
+            }
+            for website in websites
+        ]
+        self._request(
+            "POST",
+            "/crawl_store_runs",
+            params={"on_conflict": "run_id,website"},
+            json_body=payload,
+            headers={"Prefer": "resolution=ignore-duplicates,return=minimal"},
+        )
+
+    def list_run_store_websites(
+        self,
+        *,
+        run_id: str,
+        statuses: list[str],
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[str]:
+        if not statuses:
+            return []
+
+        encoded_statuses = ",".join(statuses)
+        response = self._request(
+            "GET",
+            "/crawl_store_runs",
+            params={
+                "select": "website",
+                "run_id": f"eq.{run_id}",
+                "status": f"in.({encoded_statuses})",
+                "order": "id.asc",
+                "limit": str(max(1, limit)),
+                "offset": str(max(0, offset)),
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            return []
+
+        out: list[str] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            website = row.get("website")
+            if isinstance(website, str) and website:
+                out.append(website)
+        return out
+
+    def list_all_run_store_websites(self, *, run_id: str, statuses: list[str]) -> list[str]:
+        websites: list[str] = []
+        offset = 0
+        page_size = 1000
+
+        while True:
+            batch = self.list_run_store_websites(
+                run_id=run_id,
+                statuses=statuses,
+                limit=page_size,
+                offset=offset,
+            )
+            if not batch:
+                break
+            websites.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+        return websites
+
+    def mark_run_store_status(
+        self,
+        *,
+        run_id: str,
+        website: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        attempt_count = 1
+        current = self._request(
+            "GET",
+            "/crawl_store_runs",
+            params={
+                "select": "attempt_count",
+                "run_id": f"eq.{run_id}",
+                "website": f"eq.{website}",
+                "limit": "1",
+            },
+        ).json()
+        if isinstance(current, list) and current and isinstance(current[0], dict):
+            existing_attempts = current[0].get("attempt_count")
+            if isinstance(existing_attempts, int):
+                attempt_count = existing_attempts + 1
+
+        payload: dict[str, object] = {
+            "status": status,
+            "attempt_count": attempt_count,
+            "last_attempt_at": self._utc_now_iso(),
+            "updated_at": self._utc_now_iso(),
+        }
+        if error_message:
+            payload["error_message"] = error_message[:2000]
+
+        self._request(
+            "PATCH",
+            "/crawl_store_runs",
+            params={
+                "run_id": f"eq.{run_id}",
+                "website": f"eq.{website}",
+            },
+            json_body=payload,
+            headers={"Prefer": "return=minimal"},
+        )
+
+    def count_run_store_status(self, *, run_id: str, status: str) -> int:
+        response = self._request(
+            "GET",
+            "/crawl_store_runs",
+            params={
+                "select": "id",
+                "run_id": f"eq.{run_id}",
+                "status": f"eq.{status}",
+            },
+            headers={"Prefer": "count=exact"},
+        )
+        count_header = response.headers.get("content-range", "")
+        if "/" not in count_header:
+            return 0
+        try:
+            return int(count_header.split("/")[-1])
+        except ValueError:
+            return 0
+
     def upsert_store(self, store: StoreProfile) -> int:
         payload: dict[str, object] = {
             "website": store.website,

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     input_csv_notes_column: str = Field(default="notes", alias="INPUT_CSV_NOTES_COLUMN")
 
     crawl_max_stores_per_run: int = Field(default=1000, alias="CRAWL_MAX_STORES_PER_RUN")
-    crawl_global_concurrency: int = Field(default=40, alias="CRAWL_GLOBAL_CONCURRENCY")
+    crawl_global_concurrency: int = Field(default=15, alias="CRAWL_GLOBAL_CONCURRENCY")
     crawl_per_domain_concurrency: int = Field(default=2, alias="CRAWL_PER_DOMAIN_CONCURRENCY")
     crawl_global_qps: int = Field(default=8, alias="CRAWL_GLOBAL_QPS")
     crawl_request_timeout_sec: int = Field(default=25, alias="CRAWL_REQUEST_TIMEOUT_SEC")
@@ -43,8 +43,10 @@ class Settings(BaseSettings):
     shopify_products_max_pages: int = Field(default=100, alias="SHOPIFY_PRODUCTS_MAX_PAGES")
 
     image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
-    image_validation_concurrency: int = Field(default=8, alias="IMAGE_VALIDATION_CONCURRENCY")
+    image_validation_concurrency: int = Field(default=4, alias="IMAGE_VALIDATION_CONCURRENCY")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
+
+    crawl_run_state_path: str = Field(default=".aisley_active_run_id", alias="CRAWL_RUN_STATE_PATH")
 
     classify_require_ecom_signal: bool = Field(default=True, alias="CLASSIFY_REQUIRE_ECOM_SIGNAL")
 

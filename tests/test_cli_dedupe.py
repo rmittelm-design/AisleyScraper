@@ -1333,3 +1333,171 @@ def test_run_crawl_skips_upsert_for_products_without_images(monkeypatch) -> None
     assert _FakeRestRepo.upsert_count == 0
     assert _FakeRestRepo.deleted_product_ids == ["no-img-1"]
     assert "https://x.supabase.co/original.jpg" in _FakeUploader.deleted_urls
+
+
+def test_run_crawl_db_first_resume_processes_pending_only(monkeypatch) -> None:
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+    )
+
+    csv_seeds = [
+        StoreSeed(store_url="https://existing-db.com"),
+        StoreSeed(store_url="https://new-from-csv.com"),
+    ]
+
+    processed_store_urls: list[str] = []
+    status_updates: list[tuple[str, str]] = []
+    initialized_websites: list[str] = []
+
+    class _FakeRepo:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def ensure_schema(self) -> None:
+            return None
+
+        def list_all_store_websites(self) -> list[str]:
+            return ["https://existing-db.com", "https://already-db-only.com"]
+
+        def initialize_crawl_run(self, *, run_id: str, websites: list[str]) -> None:
+            _ = run_id
+            initialized_websites.extend(websites)
+
+        def list_all_run_store_websites(self, *, run_id: str, statuses: list[str]) -> list[str]:
+            _ = run_id
+            _ = statuses
+            return ["https://already-db-only.com"]
+
+        def mark_run_store_status(
+            self,
+            *,
+            run_id: str,
+            website: str,
+            status: str,
+            error_message: str | None = None,
+        ) -> None:
+            _ = run_id
+            _ = error_message
+            status_updates.append((website, status))
+
+        def count_run_store_status(self, *, run_id: str, status: str) -> int:
+            _ = run_id
+            _ = status
+            return 1
+
+        def upsert_store(self, store: StoreProfile) -> int:
+            processed_store_urls.append(store.website)
+            return 1
+
+        def get_product_image_state(self, store_id: int, product_id: str):
+            _ = (store_id, product_id)
+            return None
+
+        def upsert_product(self, store_id: int, product: ProductRecord) -> None:
+            _ = (store_id, product)
+
+    class _FakeUploader:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+    async def _fake_scrape_many_stream(
+        seeds: list[StoreSeed],
+        _settings: Settings,
+        *,
+        include_postprocess: bool = True,
+    ):
+        _ = _settings
+        _ = include_postprocess
+        for seed in seeds:
+            yield (
+                seed,
+                ScrapeResult(
+                    store=StoreProfile(
+                        store_name="Store",
+                        website=seed.store_url,
+                        store_type="online",
+                    ),
+                    products=[],
+                ),
+            )
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: csv_seeds)
+    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
+    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: "run-1")
+
+    exit_code = cli.run_crawl(limit=None)
+
+    assert exit_code == 0
+    assert processed_store_urls == ["https://already-db-only.com"]
+    assert ("https://already-db-only.com", "completed") in status_updates
+    assert initialized_websites == [
+        "https://existing-db.com",
+        "https://already-db-only.com",
+        "https://new-from-csv.com",
+    ]
+
+
+def test_run_crawl_enforce_preflight_executes_orphan_gate(monkeypatch) -> None:
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+    )
+
+    preflight_calls = 0
+
+    class _FakeRepo:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def ensure_schema(self) -> None:
+            return None
+
+        def list_all_store_websites(self) -> list[str]:
+            return []
+
+        def initialize_crawl_run(self, *, run_id: str, websites: list[str]) -> None:
+            _ = (run_id, websites)
+
+        def list_all_run_store_websites(self, *, run_id: str, statuses: list[str]) -> list[str]:
+            _ = (run_id, statuses)
+            return []
+
+        def count_run_store_status(self, *, run_id: str, status: str) -> int:
+            _ = (run_id, status)
+            return 0
+
+    class _FakeUploader:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+    def _fake_preflight(_settings: Settings, *, batch_size: int = 200) -> None:
+        nonlocal preflight_calls
+        _ = batch_size
+        _ = _settings
+        preflight_calls += 1
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [])
+    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: "run-2")
+    monkeypatch.setattr(cli, "_run_orphan_preflight", _fake_preflight)
+
+    exit_code = cli.run_crawl(limit=None, enforce_preflight=True)
+
+    assert exit_code == 0
+    assert preflight_calls == 1
