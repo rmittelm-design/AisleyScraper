@@ -13,16 +13,44 @@ from aisley_scraper.models import ProductRecord, ScrapeResult, StoreSeed
 from aisley_scraper.normalize.products import enforce_attribute_policy
 
 
+async def _fetch_all_products(
+    *,
+    base: str,
+    settings: Settings,
+    fetcher: Fetcher,
+) -> list[ProductRecord]:
+    page_limit = max(1, settings.shopify_products_page_limit)
+    max_pages = max(1, settings.shopify_products_max_pages)
+
+    all_products: list[ProductRecord] = []
+    seen_product_ids: set[str] = set()
+
+    for page in range(1, max_pages + 1):
+        products_url = f"{base}/products.json?limit={page_limit}&page={page}"
+        payload = await fetcher.get_json(products_url)
+        extracted = extract_products_from_products_json(payload, settings, base_url=base)
+
+        for product in extracted:
+            if product.product_id in seen_product_ids:
+                continue
+            seen_product_ids.add(product.product_id)
+            all_products.append(product)
+
+        products_raw = payload.get("products", []) if isinstance(payload, dict) else []
+        if not isinstance(products_raw, list) or not products_raw:
+            break
+
+    return all_products
+
+
 async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) -> ScrapeResult:
     base = seed.store_url.rstrip("/")
     homepage = await fetcher.get_text(base)
     store = classify_store(homepage, base, settings)
 
     products: list[ProductRecord] = []
-    products_url = f"{base}/products.json?limit={settings.shopify_products_page_limit}&page=1"
     try:
-        payload = await fetcher.get_json(products_url)
-        extracted = extract_products_from_products_json(payload, settings, base_url=base)
+        extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
         await verify_product_images(products=extracted, fetcher=fetcher, settings=settings)
         await enrich_gender_probabilities_for_products(
             products=extracted,
@@ -69,9 +97,7 @@ async def scrape_many_stream(
                 homepage = await fetcher.get_text(base)
                 store = classify_store(homepage, base, settings)
 
-                products_url = f"{base}/products.json?limit={settings.shopify_products_page_limit}&page=1"
-                payload = await fetcher.get_json(products_url)
-                extracted = extract_products_from_products_json(payload, settings, base_url=base)
+                extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
                 products = [enforce_attribute_policy(p) for p in extracted if p.images]
                 return seed, ScrapeResult(store=store, products=products)
             except Exception as exc:

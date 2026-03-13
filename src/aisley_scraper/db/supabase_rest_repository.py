@@ -166,3 +166,43 @@ class SupabaseRestRepository:
             },
             headers={"Prefer": "return=minimal"},
         )
+
+    def list_products_for_integrity_scan(self, *, limit: int, offset: int) -> list[dict[str, object]]:
+        response = self._request(
+            "GET",
+            "/shopify_products",
+            params={
+                "select": "store_id,product_id,images,supabase_images,gender_label,gender_probs_csv",
+                "images": "neq.[]",
+                "order": "id.asc",
+                "limit": str(max(1, limit)),
+                "offset": str(max(0, offset)),
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def patch_product_integrity_fields(
+        self,
+        *,
+        store_id: int,
+        product_id: str,
+        supabase_images: list[str],
+        gender_probs_csv: str,
+    ) -> None:
+        self._request(
+            "PATCH",
+            "/shopify_products",
+            params={
+                "store_id": f"eq.{store_id}",
+                "product_id": f"eq.{product_id}",
+            },
+            json_body={
+                "supabase_images": supabase_images,
+                "gender_probs_csv": gender_probs_csv,
+                "last_seen_at": self._utc_now_iso(),
+            },
+            headers={"Prefer": "return=minimal"},
+        )

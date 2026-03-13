@@ -122,6 +122,44 @@ def run_crawl(limit: int | None) -> int:
             def _skip_no_image_product(product) -> bool:
                 if product.images:
                     return False
+
+                existing_image_state = existing_state_by_product_id.get(product.product_id)
+                if existing_image_state is not None:
+                    _, existing_supabase_images = existing_image_state
+                    if existing_supabase_images:
+                        try:
+                            uploader.delete_images(existing_supabase_images)
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed deleting existing images for no-image product store=%s product=%s: %s",
+                                store_id,
+                                product.product_id,
+                                exc,
+                            )
+
+                if product.supabase_images:
+                    try:
+                        uploader.delete_images(product.supabase_images)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed deleting newly-uploaded images for no-image product store=%s product=%s: %s",
+                            store_id,
+                            product.product_id,
+                            exc,
+                        )
+
+                delete_product = getattr(repo, "delete_product", None)
+                if callable(delete_product):
+                    try:
+                        delete_product(store_id, product.product_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed deleting no-image product row store=%s product=%s: %s",
+                            store_id,
+                            product.product_id,
+                            exc,
+                        )
+
                 if product.product_id in placeholder_inserted_product_ids:
                     _cleanup_placeholder_rows([product.product_id])
                 return True
@@ -166,6 +204,28 @@ def run_crawl(limit: int | None) -> int:
                 finally:
                     await enrich_fetcher.close()
 
+            def _try_enrich_from_supabase_images(product) -> None:
+                if product.gender_probs_csv:
+                    return
+                if not product.supabase_images:
+                    return
+
+                original_images = list(product.images)
+                try:
+                    # Source CDN URLs can intermittently fail for CLIP fetch; use
+                    # already-uploaded Supabase URLs as a second-pass scoring source.
+                    product.images = list(product.supabase_images)
+                    asyncio.run(_enrich_products_only([product]))
+                except Exception as exc:
+                    logger.warning(
+                        "Supabase-image gender enrichment failed for store=%s product=%s: %s",
+                        store_id,
+                        product.product_id,
+                        exc,
+                    )
+                finally:
+                    product.images = original_images
+
             def _safe_upload_new_product_images(product) -> list[str]:
                 if not product.images:
                     return []
@@ -208,7 +268,10 @@ def run_crawl(limit: int | None) -> int:
                     return existing_supabase_images
 
             def _safe_upsert_product(product) -> None:
-                if product.images and (not product.supabase_images or not product.gender_probs_csv):
+                if product.images and (
+                    len(product.supabase_images or []) != len(product.images)
+                    or not product.gender_probs_csv
+                ):
                     logger.warning(
                         "Skipping final upsert with incomplete required fields for store=%s product=%s",
                         store_id,
@@ -299,31 +362,33 @@ def run_crawl(limit: int | None) -> int:
             finalized_ids = {p.product_id for p in processing_products}
             final_upsert_failures: list[str] = []
 
-            fallback_products = [
-                product
-                for product in preliminary_products
-                if product.product_id not in finalized_ids
-            ]
+            fallback_products = []
+            if postprocess_failed:
+                fallback_products = [
+                    product
+                    for product in preliminary_products
+                    if product.product_id not in finalized_ids
+                ]
 
-            # Restore source images first, then run a single enrichment batch.
-            for product in fallback_products:
-                product.images = original_images_by_product_id.get(product.product_id, [])
+                # Restore source images first, then run a single enrichment batch.
+                for product in fallback_products:
+                    product.images = original_images_by_product_id.get(product.product_id, [])
 
-            fallback_products_needing_enrich = [
-                product
-                for product in fallback_products
-                if product.images and not product.gender_probs_csv
-            ]
-            if fallback_products_needing_enrich:
-                try:
-                    asyncio.run(_enrich_products_only(fallback_products_needing_enrich))
-                except Exception as exc:
-                    logger.warning(
-                        "Fallback gender enrichment batch failed for %s (store_id=%s): %s",
-                        seed.store_url,
-                        store_id,
-                        exc,
-                    )
+                fallback_products_needing_enrich = [
+                    product
+                    for product in fallback_products
+                    if product.images and not product.gender_probs_csv
+                ]
+                if fallback_products_needing_enrich:
+                    try:
+                        asyncio.run(_enrich_products_only(fallback_products_needing_enrich))
+                    except Exception as exc:
+                        logger.warning(
+                            "Fallback gender enrichment batch failed for %s (store_id=%s): %s",
+                            seed.store_url,
+                            store_id,
+                            exc,
+                        )
 
             for product in preliminary_products:
                 if product.product_id in finalized_ids:
@@ -343,6 +408,8 @@ def run_crawl(limit: int | None) -> int:
                         existing_images,
                         existing_supabase_images,
                     )
+
+                _try_enrich_from_supabase_images(product)
                 if not _safe_upsert_product(product):
                     _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
                     final_upsert_failures.append(product.product_id)
@@ -364,6 +431,8 @@ def run_crawl(limit: int | None) -> int:
                         existing_supabase_images,
                     )
 
+                _try_enrich_from_supabase_images(product)
+
                 if not _safe_upsert_product(product):
                     _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
                     final_upsert_failures.append(product.product_id)
@@ -375,7 +444,11 @@ def run_crawl(limit: int | None) -> int:
             missing_required_fields = [
                 product
                 for product in preliminary_products
-                if product.images and (not product.supabase_images or not product.gender_probs_csv)
+                if product.images
+                and (
+                    len(product.supabase_images or []) != len(product.images)
+                    or not product.gender_probs_csv
+                )
             ]
             if missing_required_fields:
                 missing_gender = [product for product in missing_required_fields if not product.gender_probs_csv]
@@ -405,6 +478,8 @@ def run_crawl(limit: int | None) -> int:
                                 existing_supabase_images,
                             )
 
+                    _try_enrich_from_supabase_images(product)
+
                     existing_image_state = existing_state_by_product_id.get(product.product_id)
                     if not _safe_upsert_product(product):
                         _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
@@ -415,7 +490,11 @@ def run_crawl(limit: int | None) -> int:
             unresolved_required_fields = [
                 product.product_id
                 for product in preliminary_products
-                if product.images and (not product.supabase_images or not product.gender_probs_csv)
+                if product.images
+                and (
+                    len(product.supabase_images or []) != len(product.images)
+                    or not product.gender_probs_csv
+                )
             ]
             if unresolved_required_fields:
                 _cleanup_placeholder_rows(

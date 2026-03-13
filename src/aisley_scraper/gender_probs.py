@@ -12,6 +12,10 @@ from aisley_scraper.models import ProductRecord
 logger = logging.getLogger(__name__)
 
 
+class GenderProbComputationError(RuntimeError):
+    pass
+
+
 _EXPLICIT_GENDER_TO_CSV: dict[str, str] = {
     "male": "1.0,0,0",
     "female": "0,1.0,0",
@@ -188,7 +192,7 @@ def _score_image_bytes_with_clip(image_bytes: bytes) -> tuple[float, float, floa
 
 
 async def _score_image_url(fetcher: Fetcher, image_url: str) -> tuple[float, float, float] | None:
-    attempts = 3
+    attempts = 5
     for attempt in range(1, attempts + 1):
         try:
             content = await fetcher.get_bytes(image_url)
@@ -201,7 +205,7 @@ async def _score_image_url(fetcher: Fetcher, image_url: str) -> tuple[float, flo
                 exc,
             )
             if attempt < attempts:
-                await asyncio.sleep(0.2 * attempt)
+                await asyncio.sleep(0.3 * attempt)
                 continue
             return None
 
@@ -209,7 +213,7 @@ async def _score_image_url(fetcher: Fetcher, image_url: str) -> tuple[float, flo
         if scored is not None:
             return scored
         if attempt < attempts:
-            await asyncio.sleep(0.1 * attempt)
+            await asyncio.sleep(0.2 * attempt)
 
     logger.info("CLIP scoring produced no result for %s after %s attempts", image_url, attempts)
     return None
@@ -253,6 +257,8 @@ async def enrich_gender_probabilities_for_products(
 
     await asyncio.gather(*(_run(url) for url in unique_urls))
 
+    unresolved_products: list[str] = []
+
     for product in products_needing_clip:
         image_probs = [
             probs_by_url.get(image_url.strip())
@@ -262,6 +268,7 @@ async def enrich_gender_probabilities_for_products(
         valid_probs = [probs for probs in image_probs if probs is not None]
         if not valid_probs:
             product.gender_probs_csv = None
+            unresolved_products.append(product.product_id)
             continue
 
         count = float(len(valid_probs))
@@ -272,3 +279,9 @@ async def enrich_gender_probabilities_for_products(
         )
         normalized_avg = _normalize_probs(avg)
         product.gender_probs_csv = _probs_to_csv(*normalized_avg)
+
+    if unresolved_products:
+        raise GenderProbComputationError(
+            "Failed to compute gender_probs_csv for products with images: "
+            f"count={len(unresolved_products)} sample={unresolved_products[:10]}"
+        )

@@ -635,7 +635,7 @@ def test_run_crawl_marks_store_failed_when_final_upsert_never_succeeds(monkeypat
     assert "Crawled 0/1 stores successfully" in output
 
 
-def test_run_crawl_fallback_restored_images_get_gender_probs(monkeypatch) -> None:
+def test_run_crawl_skips_product_when_verifier_removes_all_images(monkeypatch) -> None:
     settings = Settings(
         LOG_LEVEL="INFO",
         SUPABASE_URL="https://x.supabase.co",
@@ -666,7 +666,7 @@ def test_run_crawl_fallback_restored_images_get_gender_probs(monkeypatch) -> Non
     )
 
     class _FakeRestRepo:
-        last_gender_probs: str | None = None
+        upsert_count = 0
 
         def __init__(self, _settings: Settings) -> None:
             _ = _settings
@@ -683,9 +683,8 @@ def test_run_crawl_fallback_restored_images_get_gender_probs(monkeypatch) -> Non
             return None
 
         def upsert_product(self, store_id: int, product: ProductRecord) -> None:
-            _ = store_id
-            if product.product_id == "fallback-1":
-                _FakeRestRepo.last_gender_probs = product.gender_probs_csv
+            _ = (store_id, product)
+            _FakeRestRepo.upsert_count += 1
 
     class _FakeUploader:
         def __init__(self, _settings: Settings) -> None:
@@ -704,7 +703,8 @@ def test_run_crawl_fallback_restored_images_get_gender_probs(monkeypatch) -> Non
 
     async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
         _ = (fetcher, settings)
-        products[:] = []
+        for product in products:
+            product.images = []
 
     async def _fake_enrich_gender_probabilities_for_products(
         *,
@@ -742,10 +742,10 @@ def test_run_crawl_fallback_restored_images_get_gender_probs(monkeypatch) -> Non
     exit_code = cli.run_crawl(limit=1)
 
     assert exit_code == 0
-    assert _FakeRestRepo.last_gender_probs == "0.3,0.4,0.3"
+    assert _FakeRestRepo.upsert_count == 0
 
 
-def test_run_crawl_fallback_restored_images_get_gender_probs_when_verifier_empties_images(
+def test_run_crawl_deletes_existing_product_when_verifier_empties_images(
     monkeypatch,
 ) -> None:
     settings = Settings(
@@ -778,7 +778,8 @@ def test_run_crawl_fallback_restored_images_get_gender_probs_when_verifier_empti
     )
 
     class _FakeRestRepo:
-        last_gender_probs: str | None = None
+        upsert_count = 0
+        deleted_product_ids: list[str] = []
 
         def __init__(self, _settings: Settings) -> None:
             _ = _settings
@@ -792,20 +793,28 @@ def test_run_crawl_fallback_restored_images_get_gender_probs_when_verifier_empti
 
         def get_product_image_state(self, store_id: int, product_id: str):
             _ = (store_id, product_id)
-            return None
+            return (["https://cdn.example.com/fallback2.jpg"], ["https://x.supabase.co/storage/existing.jpg"])
 
         def upsert_product(self, store_id: int, product: ProductRecord) -> None:
+            _ = (store_id, product)
+            _FakeRestRepo.upsert_count += 1
+
+        def delete_product(self, store_id: int, product_id: str) -> None:
             _ = store_id
-            if product.product_id == "fallback-2":
-                _FakeRestRepo.last_gender_probs = product.gender_probs_csv
+            _FakeRestRepo.deleted_product_ids.append(product_id)
 
     class _FakeUploader:
+        deleted_urls: list[str] = []
+
         def __init__(self, _settings: Settings) -> None:
             _ = _settings
 
         def upload_product_images(self, image_urls: list[str], store_id: int, product_id: str) -> list[str]:
             _ = (store_id, product_id)
             return [f"https://x.supabase.co/storage/{idx}.jpg" for idx, _ in enumerate(image_urls, start=1)]
+
+        def delete_images(self, urls: list[str]) -> None:
+            _FakeUploader.deleted_urls.extend(urls)
 
     class _FakeFetcher:
         def __init__(self, _settings: Settings) -> None:
@@ -856,7 +865,9 @@ def test_run_crawl_fallback_restored_images_get_gender_probs_when_verifier_empti
     exit_code = cli.run_crawl(limit=1)
 
     assert exit_code == 0
-    assert _FakeRestRepo.last_gender_probs == "0.25,0.5,0.25"
+    assert _FakeRestRepo.upsert_count == 0
+    assert _FakeRestRepo.deleted_product_ids == ["fallback-2"]
+    assert "https://x.supabase.co/storage/existing.jpg" in _FakeUploader.deleted_urls
 
 
 def test_run_crawl_repairs_transient_upload_failure_in_finalize(monkeypatch) -> None:
@@ -1241,6 +1252,7 @@ def test_run_crawl_skips_upsert_for_products_without_images(monkeypatch) -> None
 
     class _FakeRestRepo:
         upsert_count = 0
+        deleted_product_ids: list[str] = []
 
         def __init__(self, _settings: Settings) -> None:
             _ = _settings
@@ -1260,9 +1272,18 @@ def test_run_crawl_skips_upsert_for_products_without_images(monkeypatch) -> None
             _ = (store_id, product)
             _FakeRestRepo.upsert_count += 1
 
+        def delete_product(self, store_id: int, product_id: str) -> None:
+            _ = store_id
+            _FakeRestRepo.deleted_product_ids.append(product_id)
+
     class _FakeUploader:
+        deleted_urls: list[str] = []
+
         def __init__(self, _settings: Settings) -> None:
             _ = _settings
+
+        def delete_images(self, urls: list[str]) -> None:
+            _FakeUploader.deleted_urls.extend(urls)
 
     class _FakeFetcher:
         def __init__(self, _settings: Settings) -> None:
@@ -1310,3 +1331,5 @@ def test_run_crawl_skips_upsert_for_products_without_images(monkeypatch) -> None
 
     assert exit_code == 0
     assert _FakeRestRepo.upsert_count == 0
+    assert _FakeRestRepo.deleted_product_ids == ["no-img-1"]
+    assert "https://x.supabase.co/original.jpg" in _FakeUploader.deleted_urls

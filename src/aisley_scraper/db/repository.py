@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import psycopg
 
@@ -189,4 +190,60 @@ class Repository:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (store_id, product_id))
+            conn.commit()
+
+    def list_products_for_integrity_scan(self, *, limit: int, offset: int) -> list[dict[str, object]]:
+        sql = """
+        select store_id, product_id, images, supabase_images, gender_label, gender_probs_csv
+        from shopify_products
+        where images <> '[]'::jsonb
+        order by id asc
+        limit %s offset %s;
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (max(1, limit), max(0, offset)))
+                rows = cur.fetchall()
+
+        out: list[dict[str, object]] = []
+        for row in rows:
+            out.append(
+                {
+                    "store_id": row[0],
+                    "product_id": row[1],
+                    "images": list(row[2] or []),
+                    "supabase_images": list(row[3] or []),
+                    "gender_label": row[4],
+                    "gender_probs_csv": row[5],
+                }
+            )
+        return out
+
+    def patch_product_integrity_fields(
+        self,
+        *,
+        store_id: int,
+        product_id: str,
+        supabase_images: list[str],
+        gender_probs_csv: str,
+    ) -> None:
+        sql = """
+        update shopify_products
+        set supabase_images = %s,
+            gender_probs_csv = %s,
+            last_seen_at = %s
+        where store_id = %s and product_id = %s;
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (
+                        json.dumps(supabase_images),
+                        gender_probs_csv,
+                        datetime.now(UTC).isoformat(),
+                        store_id,
+                        product_id,
+                    ),
+                )
             conn.commit()
