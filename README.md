@@ -11,6 +11,7 @@ Env-driven Shopify store scraper that ingests URLs from CSV and persists store +
 	pip install -r requirements.txt
 	pip install -e .
 	pip check
+	source .venv/bin/activate
 	```
 
 	This installs image-validation dependencies used at runtime, including:
