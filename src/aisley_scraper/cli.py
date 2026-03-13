@@ -270,7 +270,7 @@ def run_crawl(
 
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is not None:
-                    _, existing_supabase_images = existing_image_state
+                    _, existing_supabase_images, _ = _split_existing_state(existing_image_state)
                     if existing_supabase_images:
                         try:
                             uploader.delete_images(existing_supabase_images)
@@ -453,7 +453,7 @@ def run_crawl(
 
             def _cleanup_new_uploads_after_upsert_failure(
                 product,
-                existing_image_state: tuple[list[str], list[str]] | None,
+                existing_image_state: tuple[list[str], list[str]] | tuple[list[str], list[str], str | None] | None,
             ) -> None:
                 current_urls = list(product.supabase_images or [])
                 if not current_urls:
@@ -462,7 +462,7 @@ def run_crawl(
                 if existing_image_state is None:
                     to_delete = current_urls
                 else:
-                    _, existing_supabase_images = existing_image_state
+                    _, existing_supabase_images, _ = _split_existing_state(existing_image_state)
                     existing_set = set(existing_supabase_images)
                     to_delete = [url for url in current_urls if url not in existing_set]
 
@@ -481,11 +481,11 @@ def run_crawl(
 
             def _delete_stale_after_success(
                 product,
-                existing_image_state: tuple[list[str], list[str]] | None,
+                existing_image_state: tuple[list[str], list[str]] | tuple[list[str], list[str], str | None] | None,
             ) -> None:
                 if existing_image_state is None:
                     return
-                _, existing_supabase_images = existing_image_state
+                _, existing_supabase_images, _ = _split_existing_state(existing_image_state)
                 if not existing_supabase_images:
                     return
                 current_set = set(product.supabase_images or [])
