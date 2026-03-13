@@ -184,7 +184,10 @@ def run_crawl(
         return 0
 
     # Persist in small batches to keep runtime memory bounded.
-    chunk_size = max(1, min(10, settings.crawl_global_concurrency))
+    chunk_size = max(
+        1,
+        min(settings.crawl_store_batch_size, settings.crawl_global_concurrency),
+    )
 
     repo = SupabaseRestRepository(settings)
 

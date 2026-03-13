@@ -202,16 +202,22 @@ class SupabaseRestRepository:
             "GET",
             "/crawl_store_runs",
             params={
-                "select": "attempt_count",
+                "select": "status,attempt_count",
                 "run_id": f"eq.{run_id}",
                 "website": f"eq.{website}",
                 "limit": "1",
             },
         ).json()
         if isinstance(current, list) and current and isinstance(current[0], dict):
+            existing_status = current[0].get("status")
             existing_attempts = current[0].get("attempt_count")
             if isinstance(existing_attempts, int):
-                attempt_count = existing_attempts + 1
+                # Count only the first processing attempt for a run/store row.
+                # Repeated terminal-state writes should be idempotent.
+                if existing_status == "pending":
+                    attempt_count = max(1, existing_attempts + 1)
+                else:
+                    attempt_count = max(1, existing_attempts)
 
         payload: dict[str, object] = {
             "status": status,

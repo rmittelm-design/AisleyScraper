@@ -77,8 +77,9 @@ Recommended preflight checks:
 
 - Ensure the storage bucket exists in Supabase and is readable if you plan to use public URLs.
 - Ensure your CSV has the expected URL column (default `store_url`) or update `INPUT_CSV_URL_COLUMN`.
-- Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_GLOBAL_QPS`) before large runs.
-- Default concurrency is conservative for long-run stability: `CRAWL_GLOBAL_CONCURRENCY=15`, `IMAGE_VALIDATION_CONCURRENCY=4`.
+- Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_STORE_BATCH_SIZE`, `CRAWL_GLOBAL_QPS`) before large runs.
+- Default concurrency is conservative for long-run stability: `CRAWL_GLOBAL_CONCURRENCY=15`, `CRAWL_STORE_BATCH_SIZE=3`, `IMAGE_VALIDATION_CONCURRENCY=4`.
+- If the OS kills the process during heavy runs, try `CRAWL_STORE_BATCH_SIZE=1`, `CRAWL_GLOBAL_CONCURRENCY=2`, and `IMAGE_VALIDATION_CONCURRENCY=1`.
 - Optional: set `CRAWL_RUN_STATE_PATH` to change where the active run id is stored (default `.aisley_active_run_id`).
 - Optional: set `CRAWL_STALL_LOG_INTERVAL_SEC` (default `60`) to control how often long-running crawl/persist heartbeat warnings are printed; set `0` to disable.
 - Optional: set `HF_TOKEN` to authenticate Hugging Face model downloads (higher limits, fewer unauthenticated warnings).
@@ -88,6 +89,31 @@ Local mode notes:
 
 - Set `PERSISTENCE_TARGET=local` to skip Supabase writes and save results to `LOCAL_OUTPUT_PATH`.
 - In local mode, scraped image URLs are preserved; Supabase image upload is not performed.
+
+## Troubleshooting
+
+### `zsh: killed aisley-scraper crawl-stores`
+
+This usually means the OS terminated the process due to memory pressure (SIGKILL), not a Python exception.
+
+1. Re-run with a low-memory profile:
+
+```bash
+CRAWL_STORE_BATCH_SIZE=1 CRAWL_GLOBAL_CONCURRENCY=2 IMAGE_VALIDATION_CONCURRENCY=1 aisley-scraper crawl-stores
+```
+
+2. If you want these defaults for all future runs, add them to `.env`:
+
+```bash
+CRAWL_STORE_BATCH_SIZE=1
+CRAWL_GLOBAL_CONCURRENCY=2
+IMAGE_VALIDATION_CONCURRENCY=1
+```
+
+3. Resume behavior:
+
+- Running `aisley-scraper crawl-stores` (without `--fresh`) resumes from pending/failed stores in the active run id.
+- Use `--fresh` only when you intentionally want to start a new run id.
 
 ## Requirements handled
 

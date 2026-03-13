@@ -29,6 +29,7 @@ class Settings(BaseSettings):
 
     crawl_max_stores_per_run: int = Field(default=1000, alias="CRAWL_MAX_STORES_PER_RUN")
     crawl_global_concurrency: int = Field(default=15, alias="CRAWL_GLOBAL_CONCURRENCY")
+    crawl_store_batch_size: int = Field(default=3, alias="CRAWL_STORE_BATCH_SIZE")
     crawl_per_domain_concurrency: int = Field(default=2, alias="CRAWL_PER_DOMAIN_CONCURRENCY")
     crawl_global_qps: int = Field(default=8, alias="CRAWL_GLOBAL_QPS")
     crawl_request_timeout_sec: int = Field(default=25, alias="CRAWL_REQUEST_TIMEOUT_SEC")
@@ -54,6 +55,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "crawl_global_concurrency",
+        "crawl_store_batch_size",
         "crawl_per_domain_concurrency",
         "crawl_global_qps",
         "image_validation_concurrency",
