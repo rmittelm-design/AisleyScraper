@@ -48,18 +48,14 @@ async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) ->
     homepage = await fetcher.get_text(base)
     store = classify_store(homepage, base, settings)
 
-    products: list[ProductRecord] = []
-    try:
-        extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
-        await verify_product_images(products=extracted, fetcher=fetcher, settings=settings)
-        await enrich_gender_probabilities_for_products(
-            products=extracted,
-            fetcher=fetcher,
-            concurrency=settings.image_validation_concurrency,
-        )
-        products = [enforce_attribute_policy(p) for p in extracted if p.images]
-    except Exception:
-        products = []
+    extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
+    await verify_product_images(products=extracted, fetcher=fetcher, settings=settings)
+    await enrich_gender_probabilities_for_products(
+        products=extracted,
+        fetcher=fetcher,
+        concurrency=settings.image_validation_concurrency,
+    )
+    products = [enforce_attribute_policy(p) for p in extracted if p.images]
 
     return ScrapeResult(store=store, products=products)
 

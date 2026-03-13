@@ -183,3 +183,31 @@ def test_scrape_store_continues_on_sparse_pages_until_empty(monkeypatch) -> None
     result = asyncio.run(orchestrator.scrape_store(seed, settings, _SparsePageFetcher(settings)))
 
     assert [p.product_id for p in result.products] == ["301", "302"]
+
+
+def test_scrape_many_stream_surfaces_postprocess_errors(monkeypatch) -> None:
+    settings = _settings()
+    seed = StoreSeed(store_url="https://example.com")
+
+    def _fake_classify_store(_homepage: str, base: str, _settings: Settings) -> StoreProfile:
+        _ = _settings
+        return StoreProfile(store_name="Example", website=base, store_type="online")
+
+    async def _failing_verify_product_images(*, products, fetcher, settings):
+        _ = (products, fetcher, settings)
+        raise RuntimeError("synthetic verification failure")
+
+    monkeypatch.setattr(orchestrator, "Fetcher", _FakeFetcher)
+    monkeypatch.setattr(orchestrator, "classify_store", _fake_classify_store)
+    monkeypatch.setattr(orchestrator, "verify_product_images", _failing_verify_product_images)
+
+    async def _collect() -> tuple[StoreSeed, ScrapeResult | Exception]:
+        async for item in orchestrator.scrape_many_stream(
+            [seed], settings, include_postprocess=True
+        ):
+            return item
+        raise RuntimeError("no scrape result emitted")
+
+    _seed, outcome = asyncio.run(_collect())
+
+    assert isinstance(outcome, Exception)

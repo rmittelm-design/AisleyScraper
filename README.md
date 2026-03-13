@@ -5,7 +5,14 @@ Env-driven Shopify store scraper that ingests URLs from CSV and persists store +
 ## Quick start
 
 1. Copy `.env.example` to `.env` and fill required values.
-2. Install dependencies.
+2. Install dependencies:
+
+	```bash
+	pip install -r requirements.txt
+	```
+
+	This installs image-validation dependencies used at runtime, including:
+	`opencv-python-headless` (`cv2`) and `google-cloud-vision`.
 3. Run `aisley-scraper ingest-stores --csv ./data/stores.csv`.
 4. Run `aisley-scraper crawl-stores`.
 
