@@ -62,6 +62,8 @@ aisley-scraper crawl-stores --fresh --limit 50
 
 Update these required values in `.env`:
 
+Note: `.env.example` is only a template. Runtime values are loaded from `.env`.
+
 - `SUPABASE_URL`: your Supabase project URL (for example `https://xxxx.supabase.co`).
 - `SUPABASE_SERVICE_ROLE_KEY`: backend service role key (used for Storage uploads).
 - `SUPABASE_STORAGE_BUCKET`: bucket name for uploaded product images.

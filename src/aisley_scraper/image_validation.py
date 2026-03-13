@@ -633,7 +633,18 @@ def _deploy_on_gcloud() -> bool:
 
 
 def _gcv_nsfw_check_enabled() -> bool:
-    return _env_bool("IMAGE_VALIDATION_USE_GCLOUD_VISION", True)
+    env_name = "IMAGE_VALIDATION_USE_GCLOUD_VISION"
+    if os.environ.get(env_name) is not None:
+        return _env_bool(env_name, True)
+
+    # Fall back to Settings so values from `.env` are respected even when they are
+    # not exported into process environment variables.
+    try:
+        from aisley_scraper.config import get_settings
+
+        return bool(get_settings().image_validation_use_gcloud_vision)
+    except Exception:
+        return True
 
 
 def _get_gcv_client():
