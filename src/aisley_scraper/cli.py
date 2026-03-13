@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from dataclasses import replace
 from urllib.parse import urlparse
 
 from aisley_scraper.config import get_settings
@@ -134,15 +133,7 @@ def run_crawl(limit: int | None) -> int:
                 if existing_image_state is None and product.unavailable:
                     continue
 
-                # Only create placeholders for brand-new products. Existing products
-                # stay untouched until final payload is ready.
-                if existing_image_state is None:
-                    placeholder = replace(product)
-                    placeholder.images = list(original_images_by_product_id[product.product_id])
-                    placeholder.supabase_images = []
-                    placeholder.gender_probs_csv = None
-                    repo.upsert_product(store_id, placeholder)
-                    placeholder_inserted_product_ids.add(product.product_id)
+                # Do not persist products until final required fields are ready.
                 preliminary_products.append(product)
 
             if not preliminary_products:

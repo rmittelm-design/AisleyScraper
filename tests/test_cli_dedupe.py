@@ -158,7 +158,7 @@ def test_run_crawl_skips_new_unavailable_products(monkeypatch) -> None:
     exit_code = cli.run_crawl(limit=None)
 
     assert exit_code == 0
-    assert _FakeRestRepo.inserted_products == ["p-2", "p-2"]
+    assert _FakeRestRepo.inserted_products == ["p-2"]
     assert _FakeUploader.uploaded_for == ["p-2"]
 
 
@@ -572,8 +572,8 @@ def test_run_crawl_marks_store_failed_when_final_upsert_never_succeeds(monkeypat
         def upsert_product(self, store_id: int, product: ProductRecord) -> None:
             _ = (store_id, product)
             _FakeRestRepo.call_count += 1
-            # Allow early upsert, fail all finalize retries.
-            if _FakeRestRepo.call_count >= 2:
+            # Fail all finalize retries.
+            if _FakeRestRepo.call_count >= 1:
                 raise RuntimeError("synthetic final upsert failure")
 
     class _FakeUploader:
@@ -1023,8 +1023,8 @@ def test_run_crawl_cleans_orphan_uploads_when_final_upsert_fails(monkeypatch) ->
         def upsert_product(self, store_id: int, product: ProductRecord) -> None:
             _ = (store_id, product)
             _FakeRestRepo.call_count += 1
-            # Early placeholder upsert succeeds, finalize upserts fail.
-            if _FakeRestRepo.call_count >= 2:
+            # Finalize upserts fail.
+            if _FakeRestRepo.call_count >= 1:
                 raise RuntimeError("synthetic finalize failure")
 
     class _FakeUploader:
@@ -1204,9 +1204,8 @@ def test_run_crawl_does_not_upsert_incomplete_finalize_rows(monkeypatch, capsys)
     output = capsys.readouterr().out
 
     assert exit_code == 0
-    # Only placeholder upsert should happen; finalize with images and missing supabase_images is blocked.
-    assert len(_FakeRestRepo.upserts) == 1
-    assert _FakeRestRepo.upserts[0][1] == 1
+    # No placeholder upsert should happen; incomplete finalize payloads are blocked.
+    assert len(_FakeRestRepo.upserts) == 0
     assert "Crawled 0/1 stores successfully" in output
 
 
