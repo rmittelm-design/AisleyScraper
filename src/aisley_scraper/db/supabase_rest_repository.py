@@ -322,6 +322,58 @@ class SupabaseRestRepository:
             gender_probs_csv = None
         return list(images or []), list(supabase_images or []), gender_probs_csv
 
+    def get_product_image_states(
+        self,
+        store_id: int,
+        product_ids: list[str],
+    ) -> dict[str, tuple[list[str], list[str], str | None]]:
+        if not product_ids:
+            return {}
+
+        # Keep URL query size bounded while reducing per-product roundtrips.
+        page_size = 200
+        out: dict[str, tuple[list[str], list[str], str | None]] = {}
+
+        for start in range(0, len(product_ids), page_size):
+            chunk = [pid for pid in product_ids[start : start + page_size] if pid]
+            if not chunk:
+                continue
+
+            encoded_ids = ",".join(f'"{pid.replace('"', '\\"')}"' for pid in chunk)
+            response = self._request(
+                "GET",
+                "/shopify_products",
+                params={
+                    "select": "product_id,images,supabase_images,gender_probs_csv",
+                    "store_id": f"eq.{store_id}",
+                    "product_id": f"in.({encoded_ids})",
+                    "limit": str(len(chunk)),
+                },
+            )
+
+            rows = response.json()
+            if not isinstance(rows, list):
+                continue
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_product_id = row.get("product_id")
+                if not isinstance(row_product_id, str) or not row_product_id:
+                    continue
+                images = row.get("images")
+                supabase_images = row.get("supabase_images")
+                gender_probs_csv = row.get("gender_probs_csv")
+                if not isinstance(gender_probs_csv, str):
+                    gender_probs_csv = None
+                out[row_product_id] = (
+                    list(images or []),
+                    list(supabase_images or []),
+                    gender_probs_csv,
+                )
+
+        return out
+
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         payload: dict[str, object] = {
             "store_id": store_id,

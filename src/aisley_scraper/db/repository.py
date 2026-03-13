@@ -168,6 +168,37 @@ class Repository:
         gender_probs_csv = row[2] if isinstance(row[2], str) else None
         return images, supabase_images, gender_probs_csv
 
+    def get_product_image_states(
+        self,
+        store_id: int,
+        product_ids: list[str],
+    ) -> dict[str, tuple[list[str], list[str], str | None]]:
+        if not product_ids:
+            return {}
+
+        sql = """
+        select product_id, images, supabase_images, gender_probs_csv
+        from shopify_products
+        where store_id = %s and product_id = any(%s);
+        """
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (store_id, product_ids))
+                rows = cur.fetchall()
+
+        out: dict[str, tuple[list[str], list[str], str | None]] = {}
+        for row in rows:
+            product_id = row[0]
+            if not isinstance(product_id, str):
+                continue
+            out[product_id] = (
+                list(row[1] or []),
+                list(row[2] or []),
+                row[3] if isinstance(row[3], str) else None,
+            )
+        return out
+
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         sql = """
                 insert into shopify_products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, gender_probs_csv, sizes, colors, brand, product_type, unavailable)

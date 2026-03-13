@@ -264,6 +264,24 @@ def run_crawl(
                             exc,
                         )
 
+            bulk_get_states = getattr(repo, "get_product_image_states", None)
+            if callable(bulk_get_states):
+                try:
+                    existing_state_by_product_id = {
+                        pid: state
+                        for pid, state in bulk_get_states(
+                            store_id,
+                            [p.product_id for p in outcome.products if p.product_id],
+                        ).items()
+                    }
+                except Exception as exc:
+                    logger.warning(
+                        "Bulk existing-state fetch failed for store=%s: %s",
+                        store_id,
+                        exc,
+                    )
+                    existing_state_by_product_id = {}
+
             def _skip_no_image_product(product) -> bool:
                 if product.images:
                     return False
@@ -310,7 +328,9 @@ def run_crawl(
                 return True
 
             for product in outcome.products:
-                existing_image_state = repo.get_product_image_state(store_id, product.product_id)
+                existing_image_state = existing_state_by_product_id.get(product.product_id)
+                if existing_image_state is None:
+                    existing_image_state = repo.get_product_image_state(store_id, product.product_id)
                 existing_state_by_product_id[product.product_id] = existing_image_state
                 original_images_by_product_id[product.product_id] = list(product.images)
 
