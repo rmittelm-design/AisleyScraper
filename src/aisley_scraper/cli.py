@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from dataclasses import replace
 from urllib.parse import urlparse
 
 from aisley_scraper.config import get_settings
@@ -109,8 +110,13 @@ def run_crawl(limit: int | None) -> int:
                 if existing_image_state is None and product.unavailable:
                     continue
 
-                # Insert early so rows become visible while validation/upload continues.
-                repo.upsert_product(store_id, product)
+                # Insert early placeholder so rows become visible without publishing
+                # source images before upload/enrichment finalize successfully.
+                placeholder = replace(product)
+                placeholder.images = []
+                placeholder.supabase_images = []
+                placeholder.gender_probs_csv = None
+                repo.upsert_product(store_id, placeholder)
                 preliminary_products.append(product)
 
             if not preliminary_products:
@@ -173,6 +179,7 @@ def run_crawl(limit: int | None) -> int:
                         existing_supabase_urls=existing_supabase_images,
                         store_id=store_id,
                         product_id=product.product_id,
+                        delete_stale=False,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -201,6 +208,57 @@ def run_crawl(limit: int | None) -> int:
                         if attempt < attempts:
                             continue
                 return False
+
+            def _cleanup_new_uploads_after_upsert_failure(
+                product,
+                existing_image_state: tuple[list[str], list[str]] | None,
+            ) -> None:
+                current_urls = list(product.supabase_images or [])
+                if not current_urls:
+                    return
+
+                if existing_image_state is None:
+                    to_delete = current_urls
+                else:
+                    _, existing_supabase_images = existing_image_state
+                    existing_set = set(existing_supabase_images)
+                    to_delete = [url for url in current_urls if url not in existing_set]
+
+                if not to_delete:
+                    return
+
+                try:
+                    uploader.delete_images(to_delete)
+                except Exception as exc:
+                    logger.warning(
+                        "Cleanup of orphan uploads failed for store=%s product=%s: %s",
+                        store_id,
+                        product.product_id,
+                        exc,
+                    )
+
+            def _delete_stale_after_success(
+                product,
+                existing_image_state: tuple[list[str], list[str]] | None,
+            ) -> None:
+                if existing_image_state is None:
+                    return
+                _, existing_supabase_images = existing_image_state
+                if not existing_supabase_images:
+                    return
+                current_set = set(product.supabase_images or [])
+                stale_urls = [url for url in existing_supabase_images if url not in current_set]
+                if not stale_urls:
+                    return
+                try:
+                    uploader.delete_images(stale_urls)
+                except Exception as exc:
+                    logger.warning(
+                        "Cleanup of stale uploads failed for store=%s product=%s: %s",
+                        store_id,
+                        product.product_id,
+                        exc,
+                    )
 
             processing_products = list(preliminary_products)
             postprocess_failed = False
@@ -259,7 +317,10 @@ def run_crawl(limit: int | None) -> int:
                         existing_supabase_images,
                     )
                 if not _safe_upsert_product(product):
+                    _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
                     final_upsert_failures.append(product.product_id)
+                else:
+                    _delete_stale_after_success(product, existing_image_state)
 
             for product in processing_products:
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
@@ -275,7 +336,10 @@ def run_crawl(limit: int | None) -> int:
                     )
 
                 if not _safe_upsert_product(product):
+                    _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
                     final_upsert_failures.append(product.product_id)
+                else:
+                    _delete_stale_after_success(product, existing_image_state)
 
             # One more repair pass for products that still have source images but are missing
             # uploaded image URLs and/or gender probabilities.
@@ -310,8 +374,12 @@ def run_crawl(limit: int | None) -> int:
                                 existing_supabase_images,
                             )
 
+                    existing_image_state = existing_state_by_product_id.get(product.product_id)
                     if not _safe_upsert_product(product):
+                        _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
                         final_upsert_failures.append(product.product_id)
+                    else:
+                        _delete_stale_after_success(product, existing_image_state)
 
             unresolved_required_fields = [
                 product.product_id

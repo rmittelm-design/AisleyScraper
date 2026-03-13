@@ -119,6 +119,8 @@ class StorageUploader:
         existing_supabase_urls: list[str],
         store_id: int,
         product_id: str,
+        *,
+        delete_stale: bool = True,
     ) -> list[str]:
         # Keep a queue so duplicate source URLs can safely reuse matching existing files.
         existing_by_source: dict[str, list[str]] = defaultdict(list)
@@ -150,7 +152,7 @@ class StorageUploader:
         reused_set = set(reused_supabase_urls)
         final_set = reused_set | set(uploaded_by_source.values())
         stale_urls = [url for url in existing_supabase_urls if url not in final_set]
-        if stale_urls:
+        if delete_stale and stale_urls:
             self.delete_images(stale_urls)
 
         return [url for url in result if url is not None]
