@@ -115,9 +115,13 @@ class Repository:
             raise RuntimeError("failed to upsert store")
         return int(row[0])
 
-    def get_product_image_state(self, store_id: int, product_id: str) -> tuple[list[str], list[str]] | None:
+    def get_product_image_state(
+        self,
+        store_id: int,
+        product_id: str,
+    ) -> tuple[list[str], list[str], str | None] | None:
         sql = """
-        select images, supabase_images
+        select images, supabase_images, gender_probs_csv
         from shopify_products
         where store_id = %s and product_id = %s;
         """
@@ -129,7 +133,8 @@ class Repository:
             return None
         images = list(row[0] or [])
         supabase_images = list(row[1] or [])
-        return images, supabase_images
+        gender_probs_csv = row[2] if isinstance(row[2], str) else None
+        return images, supabase_images, gender_probs_csv
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         sql = """

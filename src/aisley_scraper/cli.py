@@ -13,7 +13,10 @@ from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.orchestrator import scrape_many, scrape_many_stream
 from aisley_scraper.crawl.image_verifier import verify_product_images
 from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
-from aisley_scraper.gender_probs import enrich_gender_probabilities_for_products
+from aisley_scraper.gender_probs import (
+    enrich_gender_probabilities_for_products,
+    one_hot_gender_probs_csv,
+)
 from aisley_scraper.ingest.csv_loader import load_store_seeds
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import ScrapeResult, StoreSeed
@@ -228,10 +231,22 @@ def run_crawl(
                 return False
 
             store_id = repo.upsert_store(outcome.store)
-            existing_state_by_product_id: dict[str, tuple[list[str], list[str]] | None] = {}
+            existing_state_by_product_id: dict[
+                str,
+                tuple[list[str], list[str]] | tuple[list[str], list[str], str | None] | None,
+            ] = {}
             preliminary_products: list = []
             original_images_by_product_id: dict[str, list[str]] = {}
             placeholder_inserted_product_ids: set[str] = set()
+
+            def _split_existing_state(
+                state: tuple[list[str], list[str]] | tuple[list[str], list[str], str | None] | None,
+            ) -> tuple[list[str], list[str], str | None]:
+                if state is None:
+                    return [], [], None
+                if len(state) >= 3:
+                    return list(state[0] or []), list(state[1] or []), state[2]
+                return list(state[0] or []), list(state[1] or []), None
 
             def _cleanup_placeholder_rows(product_ids: list[str]) -> None:
                 delete_product = getattr(repo, "delete_product", None)
@@ -298,6 +313,15 @@ def run_crawl(
                 existing_image_state = repo.get_product_image_state(store_id, product.product_id)
                 existing_state_by_product_id[product.product_id] = existing_image_state
                 original_images_by_product_id[product.product_id] = list(product.images)
+
+                explicit_gender_probs = one_hot_gender_probs_csv(product.gender_label)
+                if explicit_gender_probs is not None:
+                    product.gender_probs_csv = explicit_gender_probs
+                elif existing_image_state is not None:
+                    _, _, existing_gender_probs = _split_existing_state(existing_image_state)
+                    if existing_gender_probs:
+                        product.gender_probs_csv = existing_gender_probs
+
                 if existing_image_state is None and product.unavailable:
                     continue
 
@@ -478,10 +502,35 @@ def run_crawl(
                         exc,
                     )
 
-            processing_products = list(preliminary_products)
+            def _normalize_source_urls(urls: list[str]) -> list[str]:
+                return [url.strip() for url in urls if url and url.strip()]
+
+            def _needs_postprocess(product) -> bool:
+                existing_image_state = existing_state_by_product_id.get(product.product_id)
+                if existing_image_state is None:
+                    return True
+
+                existing_images, existing_supabase_images, existing_gender_probs = _split_existing_state(
+                    existing_image_state
+                )
+                if len(existing_images) != len(existing_supabase_images):
+                    return True
+
+                current_images = _normalize_source_urls(product.images)
+                stored_images = _normalize_source_urls(existing_images)
+                if current_images != stored_images:
+                    return True
+
+                # Recompute only when existing score is missing.
+                return not bool(existing_gender_probs or product.gender_probs_csv)
+
+            processing_products = [
+                product for product in preliminary_products if _needs_postprocess(product)
+            ]
             postprocess_failed = False
             try:
-                asyncio.run(_postprocess_products(processing_products))
+                if processing_products:
+                    asyncio.run(_postprocess_products(processing_products))
                 processing_products = [enforce_attribute_policy(p) for p in processing_products if p.images]
             except Exception as exc:
                 # Do not leave early-upserted rows incomplete when postprocess fails.
@@ -532,7 +581,9 @@ def run_crawl(
                     else:
                         product.supabase_images = []
                 else:
-                    existing_images, existing_supabase_images = existing_image_state
+                    existing_images, existing_supabase_images, _ = _split_existing_state(
+                        existing_image_state
+                    )
                     product.supabase_images = _safe_sync_existing_product_images(
                         product,
                         existing_images,
@@ -554,7 +605,9 @@ def run_crawl(
                     if product.images:
                         product.supabase_images = _safe_upload_new_product_images(product)
                 else:
-                    existing_images, existing_supabase_images = existing_image_state
+                    existing_images, existing_supabase_images, _ = _split_existing_state(
+                        existing_image_state
+                    )
                     product.supabase_images = _safe_sync_existing_product_images(
                         product,
                         existing_images,
@@ -601,7 +654,9 @@ def run_crawl(
                         if existing_image_state is None:
                             product.supabase_images = _safe_upload_new_product_images(product)
                         else:
-                            existing_images, existing_supabase_images = existing_image_state
+                            existing_images, existing_supabase_images, _ = _split_existing_state(
+                                existing_image_state
+                            )
                             product.supabase_images = _safe_sync_existing_product_images(
                                 product,
                                 existing_images,

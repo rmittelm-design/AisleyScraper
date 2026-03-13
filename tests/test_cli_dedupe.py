@@ -793,7 +793,7 @@ def test_run_crawl_deletes_existing_product_when_verifier_empties_images(
 
         def get_product_image_state(self, store_id: int, product_id: str):
             _ = (store_id, product_id)
-            return (["https://cdn.example.com/fallback2.jpg"], ["https://x.supabase.co/storage/existing.jpg"])
+            return (["https://cdn.example.com/old-fallback2.jpg"], ["https://x.supabase.co/storage/existing.jpg"])
 
         def upsert_product(self, store_id: int, product: ProductRecord) -> None:
             _ = (store_id, product)

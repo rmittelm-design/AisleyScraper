@@ -292,12 +292,16 @@ class SupabaseRestRepository:
             raise RuntimeError("failed to upsert store")
         return int(row["id"])
 
-    def get_product_image_state(self, store_id: int, product_id: str) -> tuple[list[str], list[str]] | None:
+    def get_product_image_state(
+        self,
+        store_id: int,
+        product_id: str,
+    ) -> tuple[list[str], list[str], str | None] | None:
         response = self._request(
             "GET",
             "/shopify_products",
             params={
-                "select": "images,supabase_images",
+                "select": "images,supabase_images,gender_probs_csv",
                 "store_id": f"eq.{store_id}",
                 "product_id": f"eq.{product_id}",
                 "limit": "1",
@@ -313,7 +317,10 @@ class SupabaseRestRepository:
 
         images = row.get("images")
         supabase_images = row.get("supabase_images")
-        return list(images or []), list(supabase_images or [])
+        gender_probs_csv = row.get("gender_probs_csv")
+        if not isinstance(gender_probs_csv, str):
+            gender_probs_csv = None
+        return list(images or []), list(supabase_images or []), gender_probs_csv
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         payload: dict[str, object] = {
