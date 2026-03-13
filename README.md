@@ -9,6 +9,8 @@ Env-driven Shopify store scraper that ingests URLs from CSV and persists store +
 
 	```bash
 	pip install -r requirements.txt
+	pip install -e .
+	pip check
 	```
 
 	This installs image-validation dependencies used at runtime, including:
