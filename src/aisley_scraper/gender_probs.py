@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
 import io
 import logging
 import threading
@@ -173,7 +174,15 @@ def _score_image_bytes_with_clip(image_bytes: bytes) -> tuple[float, float, floa
     try:
         from PIL import Image
 
-        pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Palette images with Transparency expressed in bytes should be converted to RGBA images",
+            )
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            if pil_image.mode == "P" and "transparency" in getattr(pil_image, "info", {}):
+                pil_image = pil_image.convert("RGBA")
+            pil_image = pil_image.convert("RGB")
         image_tensor = clip_model.preprocess(pil_image).unsqueeze(0).to(clip_model.device)
 
         with clip_model.torch.inference_mode():

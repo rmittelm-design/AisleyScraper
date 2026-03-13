@@ -135,9 +135,15 @@ def _open_pil_image(data: bytes):
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=r"Invalid profile .*")
             warnings.filterwarnings("ignore", message=r".*iCCP.*")
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Palette images with Transparency expressed in bytes should be converted to RGBA images",
+            )
             img = Image.open(io.BytesIO(data))
             opened_format = (getattr(img, "format", None) or "").upper().strip()
             img = ImageOps.exif_transpose(img)
+            if img.mode == "P" and "transparency" in getattr(img, "info", {}):
+                img = img.convert("RGBA")
             img = img.convert("RGB")
 
         try:
