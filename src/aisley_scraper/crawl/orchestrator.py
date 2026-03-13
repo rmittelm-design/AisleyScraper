@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 from aisley_scraper.config import Settings
@@ -11,6 +12,9 @@ from aisley_scraper.gender_probs import enrich_gender_probabilities_for_products
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreSeed
 from aisley_scraper.normalize.products import enforce_attribute_policy
+
+
+logger = logging.getLogger(__name__)
 
 
 async def _fetch_all_products(
@@ -100,11 +104,37 @@ async def scrape_many_stream(
                 return seed, exc
 
     tasks = [asyncio.create_task(_run(seed)) for seed in seeds]
+    task_to_seed = {task: seed for task, seed in zip(tasks, seeds)}
+    total_tasks = len(tasks)
+    completed_tasks = 0
+    stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
     try:
-        for task in asyncio.as_completed(tasks):
-            yield await task
+        pending: set[asyncio.Task[tuple[StoreSeed, ScrapeResult | Exception]]] = set(tasks)
+        while pending:
+            if stall_interval > 0:
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=stall_interval,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    sample_pending = [task_to_seed[t].store_url for t in list(pending)[:3]]
+                    logger.warning(
+                        "Crawl still in progress: completed=%s/%s pending=%s sample_pending=%s",
+                        completed_tasks,
+                        total_tasks,
+                        len(pending),
+                        sample_pending,
+                    )
+                    continue
+            else:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+            for task in done:
+                completed_tasks += 1
+                yield await task
     finally:
-        for task in tasks:
+        for task in list(pending if "pending" in locals() else tasks):
             if not task.done():
                 task.cancel()
         await fetcher.close()

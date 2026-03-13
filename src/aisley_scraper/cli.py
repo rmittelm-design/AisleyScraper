@@ -664,10 +664,30 @@ def run_crawl(
         async def _persist_batch_stream(batch: list[StoreSeed]) -> tuple[int, int]:
             processed_in_batch = 0
             success_in_batch = 0
+            stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
 
             async for seed, outcome in scrape_many_stream(batch, settings, include_postprocess=False):
                 processed_in_batch += 1
-                persisted_ok = await asyncio.to_thread(_persist_store_result, seed, outcome)
+                persist_task = asyncio.create_task(asyncio.to_thread(_persist_store_result, seed, outcome))
+                while True:
+                    try:
+                        if stall_interval > 0:
+                            persisted_ok = await asyncio.wait_for(
+                                asyncio.shield(persist_task),
+                                timeout=stall_interval,
+                            )
+                        else:
+                            persisted_ok = await persist_task
+                        break
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Store persist still running: store=%s processed_in_batch=%s/%s overall=%s/%s",
+                            seed.store_url,
+                            processed_in_batch,
+                            len(batch),
+                            processed_count + processed_in_batch,
+                            len(seeds),
+                        )
 
                 mark_status = getattr(repo, "mark_run_store_status", None)
                 if callable(mark_status):

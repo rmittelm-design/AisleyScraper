@@ -80,6 +80,8 @@ Recommended preflight checks:
 - Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_GLOBAL_QPS`) before large runs.
 - Default concurrency is conservative for long-run stability: `CRAWL_GLOBAL_CONCURRENCY=15`, `IMAGE_VALIDATION_CONCURRENCY=4`.
 - Optional: set `CRAWL_RUN_STATE_PATH` to change where the active run id is stored (default `.aisley_active_run_id`).
+- Optional: set `CRAWL_STALL_LOG_INTERVAL_SEC` (default `60`) to control how often long-running crawl/persist heartbeat warnings are printed; set `0` to disable.
+- Optional: set `HF_TOKEN` to authenticate Hugging Face model downloads (higher limits, fewer unauthenticated warnings).
 - Writes use Supabase REST (`/rest/v1`) with `SUPABASE_SERVICE_ROLE_KEY`.
 
 Local mode notes:

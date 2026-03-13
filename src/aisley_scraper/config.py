@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     crawl_backoff_max_ms: int = Field(default=8000, alias="CRAWL_BACKOFF_MAX_MS")
     crawl_jitter_ms: int = Field(default=250, alias="CRAWL_JITTER_MS")
     crawl_respect_robots: bool = Field(default=True, alias="CRAWL_RESPECT_ROBOTS")
+    crawl_stall_log_interval_sec: int = Field(default=60, alias="CRAWL_STALL_LOG_INTERVAL_SEC")
 
     shopify_products_page_limit: int = Field(default=250, alias="SHOPIFY_PRODUCTS_PAGE_LIMIT")
     shopify_products_max_pages: int = Field(default=100, alias="SHOPIFY_PRODUCTS_MAX_PAGES")
@@ -45,6 +46,7 @@ class Settings(BaseSettings):
     image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
     image_validation_concurrency: int = Field(default=4, alias="IMAGE_VALIDATION_CONCURRENCY")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
+    hf_token: str = Field(default="", alias="HF_TOKEN")
 
     crawl_run_state_path: str = Field(default=".aisley_active_run_id", alias="CRAWL_RUN_STATE_PATH")
 
@@ -65,6 +67,13 @@ class Settings(BaseSettings):
     @field_validator("image_validation_max_retries")
     @classmethod
     def non_negative_int(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must be >= 0")
+        return value
+
+    @field_validator("crawl_stall_log_interval_sec")
+    @classmethod
+    def non_negative_stall_interval(cls, value: int) -> int:
         if value < 0:
             raise ValueError("must be >= 0")
         return value

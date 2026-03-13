@@ -7,6 +7,7 @@ import threading
 from dataclasses import dataclass
 
 from aisley_scraper.crawl.fetcher import Fetcher
+from aisley_scraper.hf_auth import ensure_hf_token_from_settings
 from aisley_scraper.models import ProductRecord
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ def _normalize_probs(probs: tuple[float, float, float]) -> tuple[float, float, f
 
 
 def _init_clip_model() -> _ClipGenderModel:
+    ensure_hf_token_from_settings()
     import open_clip  # type: ignore[import-untyped]
     import torch  # type: ignore[import-untyped]
 

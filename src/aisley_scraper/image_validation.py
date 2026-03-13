@@ -9,6 +9,8 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from aisley_scraper.hf_auth import ensure_hf_token_from_settings
+
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 REQUIRED_MIN_WIDTH = 800
 REQUIRED_MIN_HEIGHT = 800
@@ -318,6 +320,7 @@ def _get_clip():
     with _CLIP_LOCK:
         if _CLIP_MODEL is not None:
             return _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_TOKENIZER
+        ensure_hf_token_from_settings()
         try:
             import open_clip
             import torch
