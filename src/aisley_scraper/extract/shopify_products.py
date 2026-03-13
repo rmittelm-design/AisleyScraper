@@ -189,16 +189,6 @@ def _extract_explicit_sku(prod: dict[str, Any]) -> str | None:
     return None
 
 
-def _extract_item_uuid(prod: dict[str, Any]) -> str | None:
-    for key in ("item_uuid", "uuid"):
-        value = prod.get(key)
-        if isinstance(value, str):
-            stripped = value.strip()
-            if stripped:
-                return stripped
-    return None
-
-
 def _variant_availability_signal(variant: dict[str, Any]) -> bool | None:
     explicit = _to_bool(variant.get("available"))
     if explicit is not None:
@@ -304,7 +294,6 @@ def extract_products_from_products_json(
                 product_handle=prod.get("handle"),
                 item_name=prod.get("title") or "",
                 description=prod.get("body_html"),
-                item_uuid=_extract_item_uuid(prod),
                 sku=_extract_explicit_sku(prod),
                 updated_at=str(prod.get("updated_at")) if prod.get("updated_at") is not None else None,
                 price_cents=_extract_explicit_price_cents(prod),

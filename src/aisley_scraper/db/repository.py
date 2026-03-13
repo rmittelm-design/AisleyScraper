@@ -170,11 +170,10 @@ class Repository:
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         sql = """
-                insert into shopify_products (store_id, product_id, item_uuid, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, gender_probs_csv, sizes, colors, brand, product_type, unavailable)
-            values (%s, %s, coalesce(%s::uuid, gen_random_uuid()), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                insert into shopify_products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, gender_probs_csv, sizes, colors, brand, product_type, unavailable)
+            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         on conflict (store_id, product_id) do update
-                set item_uuid = coalesce(shopify_products.item_uuid, excluded.item_uuid),
-                    product_handle = case when shopify_products.product_handle is distinct from excluded.product_handle then excluded.product_handle else shopify_products.product_handle end,
+                set product_handle = case when shopify_products.product_handle is distinct from excluded.product_handle then excluded.product_handle else shopify_products.product_handle end,
                             product_url = case when shopify_products.product_url is distinct from excluded.product_url then excluded.product_url else shopify_products.product_url end,
                             item_name = case when shopify_products.item_name is distinct from excluded.item_name then excluded.item_name else shopify_products.item_name end,
                             description = case when shopify_products.description is distinct from excluded.description then excluded.description else shopify_products.description end,
@@ -200,7 +199,6 @@ class Repository:
                     (
                         store_id,
                         product.product_id,
-                        product.item_uuid,
                         product.product_handle,
                         product.product_url,
                         product.item_name,

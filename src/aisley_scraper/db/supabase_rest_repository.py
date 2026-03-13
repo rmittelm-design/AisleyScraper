@@ -346,9 +346,6 @@ class SupabaseRestRepository:
             "last_seen_at": self._utc_now_iso(),
         }
 
-        if product.item_uuid is not None:
-            payload["item_uuid"] = product.item_uuid
-
         self._request(
             "POST",
             "/shopify_products",
