@@ -245,6 +245,22 @@ def _extract_product_url(prod: dict[str, Any], base_url: str | None) -> str | No
     return None
 
 
+def _build_policy_raw_hint(prod: dict[str, Any]) -> dict[str, Any]:
+    # Keep only lightweight fields needed by attribute policy checks.
+    option_names: list[str] = []
+    for option in prod.get("options", []):
+        if not isinstance(option, dict):
+            continue
+        name = option.get("name")
+        if isinstance(name, str) and name.strip():
+            option_names.append(name.strip().lower())
+
+    return {
+        "keys": [str(key).lower() for key in prod.keys()],
+        "option_names": option_names,
+    }
+
+
 def extract_products_from_products_json(
     payload: dict[str, Any],
     settings: Settings,
@@ -305,7 +321,7 @@ def extract_products_from_products_json(
                 product_type=product_type,
                 product_url=_extract_product_url(prod, base_url),
                 unavailable=unavailable,
-                raw=prod,
+                raw=_build_policy_raw_hint(prod),
             )
         )
 

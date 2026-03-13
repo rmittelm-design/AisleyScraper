@@ -41,6 +41,9 @@ create table if not exists public.shopify_products (
 );
 
 create index if not exists idx_shopify_products_store_id on public.shopify_products(store_id);
+create index if not exists idx_shopify_products_item_uuid on public.shopify_products(item_uuid);
+create index if not exists idx_shopify_products_item_uuid_unavailable on public.shopify_products(item_uuid, unavailable);
+
 
 create table if not exists public.crawl_store_runs (
   id bigserial primary key,

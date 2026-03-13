@@ -43,6 +43,10 @@ class Settings(BaseSettings):
 
     shopify_products_page_limit: int = Field(default=250, alias="SHOPIFY_PRODUCTS_PAGE_LIMIT")
     shopify_products_max_pages: int = Field(default=100, alias="SHOPIFY_PRODUCTS_MAX_PAGES")
+    shopify_products_max_items_per_store: int = Field(
+        default=0,
+        alias="SHOPIFY_PRODUCTS_MAX_ITEMS_PER_STORE",
+    )
 
     image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
     image_validation_concurrency: int = Field(default=4, alias="IMAGE_VALIDATION_CONCURRENCY")
@@ -76,6 +80,13 @@ class Settings(BaseSettings):
     @field_validator("crawl_stall_log_interval_sec")
     @classmethod
     def non_negative_stall_interval(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("must be >= 0")
+        return value
+
+    @field_validator("shopify_products_max_items_per_store")
+    @classmethod
+    def non_negative_item_cap(cls, value: int) -> int:
         if value < 0:
             raise ValueError("must be >= 0")
         return value

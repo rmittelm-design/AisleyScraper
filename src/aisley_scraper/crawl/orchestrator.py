@@ -25,6 +25,7 @@ async def _fetch_all_products(
 ) -> list[ProductRecord]:
     page_limit = max(1, settings.shopify_products_page_limit)
     max_pages = max(1, settings.shopify_products_max_pages)
+    max_items_per_store = max(0, settings.shopify_products_max_items_per_store)
 
     all_products: list[ProductRecord] = []
     seen_product_ids: set[str] = set()
@@ -39,6 +40,15 @@ async def _fetch_all_products(
                 continue
             seen_product_ids.add(product.product_id)
             all_products.append(product)
+
+            if max_items_per_store > 0 and len(all_products) >= max_items_per_store:
+                logger.warning(
+                    "Reached per-store product cap for %s: collected=%s cap=%s",
+                    base,
+                    len(all_products),
+                    max_items_per_store,
+                )
+                return all_products
 
         products_raw = payload.get("products", []) if isinstance(payload, dict) else []
         if not isinstance(products_raw, list) or not products_raw:
