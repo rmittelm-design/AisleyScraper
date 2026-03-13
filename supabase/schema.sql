@@ -1,3 +1,5 @@
+create extension if not exists pgcrypto;
+
 create table if not exists public.shopify_stores (
   id bigserial primary key,
   website text unique not null,
@@ -15,6 +17,7 @@ create table if not exists public.shopify_products (
   id bigserial primary key,
   store_id bigint not null references public.shopify_stores(id) on delete cascade,
   product_id text not null,
+  item_uuid uuid not null default gen_random_uuid(),
   product_handle text,
   product_url text,
   item_name text not null,

@@ -20,6 +20,8 @@ class Repository:
 
     def ensure_schema(self) -> None:
         ddl = """
+                create extension if not exists pgcrypto;
+
         create table if not exists shopify_stores (
           id bigserial primary key,
           website text unique not null,
@@ -37,6 +39,7 @@ class Repository:
           id bigserial primary key,
           store_id bigint not null references shopify_stores(id) on delete cascade,
           product_id text not null,
+                                        item_uuid uuid not null default gen_random_uuid(),
           product_handle text,
           product_url text,
           item_name text not null,
@@ -70,6 +73,35 @@ class Repository:
                 alter table shopify_products add column if not exists unavailable boolean not null default false;
                 alter table shopify_products add column if not exists scraped boolean not null default true;
                 alter table shopify_products drop column if exists position;
+
+                do $$
+                declare
+                    item_uuid_udt text;
+                begin
+                    select c.udt_name
+                    into item_uuid_udt
+                    from information_schema.columns as c
+                    where c.table_schema = current_schema()
+                        and c.table_name = 'shopify_products'
+                        and c.column_name = 'item_uuid';
+
+                    if item_uuid_udt is null then
+                        alter table shopify_products add column item_uuid uuid;
+                    elsif item_uuid_udt <> 'uuid' then
+                        update shopify_products
+                        set item_uuid = gen_random_uuid()::text
+                        where item_uuid is null
+                            or item_uuid !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
+
+                        alter table shopify_products
+                            alter column item_uuid type uuid
+                            using item_uuid::uuid;
+                    end if;
+
+                    alter table shopify_products alter column item_uuid set default gen_random_uuid();
+                    update shopify_products set item_uuid = gen_random_uuid() where item_uuid is null;
+                    alter table shopify_products alter column item_uuid set not null;
+                end $$;
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -138,10 +170,11 @@ class Repository:
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
         sql = """
-                        insert into shopify_products (store_id, product_id, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, gender_probs_csv, sizes, colors, brand, product_type, unavailable)
-            values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                insert into shopify_products (store_id, product_id, item_uuid, product_handle, product_url, item_name, description, sku, updated_at, price_cents, images, supabase_images, gender_label, gender_probs_csv, sizes, colors, brand, product_type, unavailable)
+            values (%s, %s, coalesce(%s::uuid, gen_random_uuid()), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         on conflict (store_id, product_id) do update
-                    set product_handle = case when shopify_products.product_handle is distinct from excluded.product_handle then excluded.product_handle else shopify_products.product_handle end,
+                set item_uuid = coalesce(shopify_products.item_uuid, excluded.item_uuid),
+                    product_handle = case when shopify_products.product_handle is distinct from excluded.product_handle then excluded.product_handle else shopify_products.product_handle end,
                             product_url = case when shopify_products.product_url is distinct from excluded.product_url then excluded.product_url else shopify_products.product_url end,
                             item_name = case when shopify_products.item_name is distinct from excluded.item_name then excluded.item_name else shopify_products.item_name end,
                             description = case when shopify_products.description is distinct from excluded.description then excluded.description else shopify_products.description end,
@@ -167,6 +200,7 @@ class Repository:
                     (
                         store_id,
                         product.product_id,
+                        product.item_uuid,
                         product.product_handle,
                         product.product_url,
                         product.item_name,

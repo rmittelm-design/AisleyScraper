@@ -27,6 +27,7 @@ class ProductRecord:
     item_name: str
     description: str | None
     images: list[str]
+    item_uuid: str | None = None
     sku: str | None = None
     updated_at: str | None = None
     price_cents: int | None = None
