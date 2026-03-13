@@ -180,3 +180,13 @@ class Repository:
                     ),
                 )
             conn.commit()
+
+    def delete_product(self, store_id: int, product_id: str) -> None:
+        sql = """
+        delete from shopify_products
+        where store_id = %s and product_id = %s;
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (store_id, product_id))
+            conn.commit()

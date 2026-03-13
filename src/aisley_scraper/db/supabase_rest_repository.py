@@ -155,3 +155,14 @@ class SupabaseRestRepository:
             json_body=payload,
             headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
         )
+
+    def delete_product(self, store_id: int, product_id: str) -> None:
+        self._request(
+            "DELETE",
+            "/shopify_products",
+            params={
+                "store_id": f"eq.{store_id}",
+                "product_id": f"eq.{product_id}",
+            },
+            headers={"Prefer": "return=minimal"},
+        )

@@ -102,6 +102,30 @@ def run_crawl(limit: int | None) -> int:
             existing_state_by_product_id: dict[str, tuple[list[str], list[str]] | None] = {}
             preliminary_products: list = []
             original_images_by_product_id: dict[str, list[str]] = {}
+            placeholder_inserted_product_ids: set[str] = set()
+
+            def _cleanup_placeholder_rows(product_ids: list[str]) -> None:
+                delete_product = getattr(repo, "delete_product", None)
+                if not callable(delete_product):
+                    return
+
+                for product_id in product_ids:
+                    try:
+                        delete_product(store_id, product_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Placeholder cleanup failed for store=%s product=%s: %s",
+                            store_id,
+                            product_id,
+                            exc,
+                        )
+
+            def _skip_no_image_product(product) -> bool:
+                if product.images:
+                    return False
+                if product.product_id in placeholder_inserted_product_ids:
+                    _cleanup_placeholder_rows([product.product_id])
+                return True
 
             for product in outcome.products:
                 existing_image_state = repo.get_product_image_state(store_id, product.product_id)
@@ -110,13 +134,15 @@ def run_crawl(limit: int | None) -> int:
                 if existing_image_state is None and product.unavailable:
                     continue
 
-                # Insert early placeholder so rows become visible without publishing
-                # source images before upload/enrichment finalize successfully.
-                placeholder = replace(product)
-                placeholder.images = []
-                placeholder.supabase_images = []
-                placeholder.gender_probs_csv = None
-                repo.upsert_product(store_id, placeholder)
+                # Only create placeholders for brand-new products. Existing products
+                # stay untouched until final payload is ready.
+                if existing_image_state is None:
+                    placeholder = replace(product)
+                    placeholder.images = list(original_images_by_product_id[product.product_id])
+                    placeholder.supabase_images = []
+                    placeholder.gender_probs_csv = None
+                    repo.upsert_product(store_id, placeholder)
+                    placeholder_inserted_product_ids.add(product.product_id)
                 preliminary_products.append(product)
 
             if not preliminary_products:
@@ -191,6 +217,14 @@ def run_crawl(limit: int | None) -> int:
                     return existing_supabase_images
 
             def _safe_upsert_product(product) -> None:
+                if product.images and (not product.supabase_images or not product.gender_probs_csv):
+                    logger.warning(
+                        "Skipping final upsert with incomplete required fields for store=%s product=%s",
+                        store_id,
+                        product.product_id,
+                    )
+                    return False
+
                 attempts = 3
                 for attempt in range(1, attempts + 1):
                     try:
@@ -303,6 +337,8 @@ def run_crawl(limit: int | None) -> int:
             for product in preliminary_products:
                 if product.product_id in finalized_ids:
                     continue
+                if _skip_no_image_product(product):
+                    continue
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is None:
                     if product.images:
@@ -323,6 +359,8 @@ def run_crawl(limit: int | None) -> int:
                     _delete_stale_after_success(product, existing_image_state)
 
             for product in processing_products:
+                if _skip_no_image_product(product):
+                    continue
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
                 if existing_image_state is None:
                     if product.images:
@@ -362,6 +400,8 @@ def run_crawl(limit: int | None) -> int:
                         )
 
                 for product in missing_required_fields:
+                    if _skip_no_image_product(product):
+                        continue
                     if not product.supabase_images:
                         existing_image_state = existing_state_by_product_id.get(product.product_id)
                         if existing_image_state is None:
@@ -387,6 +427,13 @@ def run_crawl(limit: int | None) -> int:
                 if product.images and (not product.supabase_images or not product.gender_probs_csv)
             ]
             if unresolved_required_fields:
+                _cleanup_placeholder_rows(
+                    [
+                        product_id
+                        for product_id in unresolved_required_fields
+                        if product_id in placeholder_inserted_product_ids
+                    ]
+                )
                 logger.error(
                     "Store finalize unresolved required fields for %s (store_id=%s), products=%s",
                     seed.store_url,
@@ -396,6 +443,13 @@ def run_crawl(limit: int | None) -> int:
                 return False
 
             if final_upsert_failures:
+                _cleanup_placeholder_rows(
+                    [
+                        product_id
+                        for product_id in final_upsert_failures
+                        if product_id in placeholder_inserted_product_ids
+                    ]
+                )
                 logger.error(
                     "Store finalize incomplete for %s (store_id=%s), failed final upserts=%s",
                     seed.store_url,
