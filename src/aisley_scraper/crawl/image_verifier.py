@@ -36,11 +36,12 @@ async def _verify_single_image_url(
             return True
         except (httpx.HTTPError, ImageValidationFailure, TimeoutError) as exc:
             if attempt >= attempts:
-                logger.info("Image validation rejected %s: %s", image_url, exc)
+                # Expected for many catalog images (e.g., low resolution); keep details at DEBUG.
+                logger.debug("Image validation rejected %s: %s", image_url, exc)
                 return False
             await asyncio.sleep(0.25 * attempt)
         except Exception as exc:
-            logger.info("Image validation failed unexpectedly for %s: %s", image_url, exc)
+            logger.warning("Image validation failed unexpectedly for %s: %s", image_url, exc)
             return False
     return False
 
@@ -75,6 +76,14 @@ async def verify_product_images(
             )
 
     await asyncio.gather(*(_run(url) for url in unique_urls))
+
+    rejected_count = sum(1 for ok in verdicts.values() if not ok)
+    if rejected_count:
+        logger.info(
+            "Image validation rejected %s/%s candidate image URLs in this batch",
+            rejected_count,
+            len(verdicts),
+        )
 
     for product in products:
         product.images = [url for url in product.images if verdicts.get(url.strip(), False)]

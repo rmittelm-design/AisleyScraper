@@ -11,9 +11,22 @@ from typing import Any, Optional
 
 from aisley_scraper.hf_auth import ensure_hf_token_from_settings
 
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return default
+    return value
+
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-REQUIRED_MIN_WIDTH = 800
-REQUIRED_MIN_HEIGHT = 800
+REQUIRED_MIN_WIDTH = _env_int("IMAGE_MIN_WIDTH", 800)
+REQUIRED_MIN_HEIGHT = _env_int("IMAGE_MIN_HEIGHT", 800)
 REQUIRED_MAX_WIDTH = 12000
 REQUIRED_MAX_HEIGHT = 12000
 MIN_ASPECT_RATIO = 0.5
