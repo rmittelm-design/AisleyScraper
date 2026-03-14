@@ -82,6 +82,10 @@ def _setup_logging(level: str) -> None:
     console_handler.setFormatter(fmt)
     root.addHandler(console_handler)
 
+    # Keep third-party HTTP client chatter out of the rotating file logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 def _get_store_urls_from_repo(repo: SupabaseRestRepository) -> list[str]:
     list_all = getattr(repo, "list_all_store_websites", None)
