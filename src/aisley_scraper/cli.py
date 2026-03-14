@@ -351,6 +351,11 @@ def run_crawl(
             if not preliminary_products:
                 return True
 
+            chunk_size = max(1, int(settings.postprocess_product_chunk_size))
+
+            def _chunk_products(products: list) -> list[list]:
+                return [products[i : i + chunk_size] for i in range(0, len(products), chunk_size)]
+
             async def _postprocess_products(products: list) -> None:
                 postprocess_fetcher = Fetcher(settings)
                 try:
@@ -550,8 +555,13 @@ def run_crawl(
             postprocess_failed = False
             try:
                 if processing_products:
-                    asyncio.run(_postprocess_products(processing_products))
-                processing_products = [enforce_attribute_policy(p) for p in processing_products if p.images]
+                    processed: list = []
+                    for chunk in _chunk_products(processing_products):
+                        asyncio.run(_postprocess_products(chunk))
+                        processed.extend(enforce_attribute_policy(p) for p in chunk if p.images)
+                    processing_products = processed
+                else:
+                    processing_products = []
             except Exception as exc:
                 # Do not leave early-upserted rows incomplete when postprocess fails.
                 logger.warning("Postprocess failed for %s: %s", seed.store_url, exc)
@@ -579,15 +589,16 @@ def run_crawl(
                     if product.images and not product.gender_probs_csv
                 ]
                 if fallback_products_needing_enrich:
-                    try:
-                        asyncio.run(_enrich_products_only(fallback_products_needing_enrich))
-                    except Exception as exc:
-                        logger.warning(
-                            "Fallback gender enrichment batch failed for %s (store_id=%s): %s",
-                            seed.store_url,
-                            store_id,
-                            exc,
-                        )
+                    for chunk in _chunk_products(fallback_products_needing_enrich):
+                        try:
+                            asyncio.run(_enrich_products_only(chunk))
+                        except Exception as exc:
+                            logger.warning(
+                                "Fallback gender enrichment batch failed for %s (store_id=%s): %s",
+                                seed.store_url,
+                                store_id,
+                                exc,
+                            )
 
             for product in preliminary_products:
                 if product.product_id in finalized_ids:
@@ -656,15 +667,16 @@ def run_crawl(
             if missing_required_fields:
                 missing_gender = [product for product in missing_required_fields if not product.gender_probs_csv]
                 if missing_gender:
-                    try:
-                        asyncio.run(_enrich_products_only(missing_gender))
-                    except Exception as exc:
-                        logger.warning(
-                            "Repair enrichment batch failed for %s (store_id=%s): %s",
-                            seed.store_url,
-                            store_id,
-                            exc,
-                        )
+                    for chunk in _chunk_products(missing_gender):
+                        try:
+                            asyncio.run(_enrich_products_only(chunk))
+                        except Exception as exc:
+                            logger.warning(
+                                "Repair enrichment batch failed for %s (store_id=%s): %s",
+                                seed.store_url,
+                                store_id,
+                                exc,
+                            )
 
                 for product in missing_required_fields:
                     if _skip_no_image_product(product):

@@ -80,6 +80,7 @@ Recommended preflight checks:
 - Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_STORE_BATCH_SIZE`, `CRAWL_GLOBAL_QPS`) before large runs.
 - Default concurrency is conservative for long-run stability: `CRAWL_GLOBAL_CONCURRENCY=15`, `CRAWL_STORE_BATCH_SIZE=3`, `IMAGE_VALIDATION_CONCURRENCY=4`.
 - If the OS kills the process during heavy runs, try `CRAWL_STORE_BATCH_SIZE=1`, `CRAWL_GLOBAL_CONCURRENCY=2`, and `IMAGE_VALIDATION_CONCURRENCY=1`.
+- For very large catalogs, lower `POSTPROCESS_PRODUCT_CHUNK_SIZE` (default `200`) to bound peak memory during image verification and gender enrichment batches.
 - Optional: set `CRAWL_RUN_STATE_PATH` to change where the active run id is stored (default `.aisley_active_run_id`).
 - Optional: set `CRAWL_STALL_LOG_INTERVAL_SEC` (default `60`) to control how often long-running crawl/persist heartbeat warnings are printed; set `0` to disable.
 - Optional: set `HF_TOKEN` to authenticate Hugging Face model downloads (higher limits, fewer unauthenticated warnings).

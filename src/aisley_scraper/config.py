@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
     image_validation_concurrency: int = Field(default=4, alias="IMAGE_VALIDATION_CONCURRENCY")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
+    postprocess_product_chunk_size: int = Field(
+        default=200,
+        alias="POSTPROCESS_PRODUCT_CHUNK_SIZE",
+    )
     hf_token: str = Field(default="", alias="HF_TOKEN")
 
     crawl_run_state_path: str = Field(default=".aisley_active_run_id", alias="CRAWL_RUN_STATE_PATH")
@@ -75,6 +79,13 @@ class Settings(BaseSettings):
     def non_negative_int(cls, value: int) -> int:
         if value < 0:
             raise ValueError("must be >= 0")
+        return value
+
+    @field_validator("postprocess_product_chunk_size")
+    @classmethod
+    def positive_chunk_size(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("must be > 0")
         return value
 
     @field_validator("crawl_stall_log_interval_sec")
