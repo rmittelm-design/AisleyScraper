@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -853,6 +854,8 @@ def run_crawl(
                                 if not persisted_ok:
                                     error_message = "store_persist_failed"
                                     break
+                                # Reduce retained objects between streamed pages on large stores.
+                                gc.collect()
                         except Exception as exc:
                             persisted_ok = False
                             error_message = str(exc)
