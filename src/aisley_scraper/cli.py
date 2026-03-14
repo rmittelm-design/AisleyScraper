@@ -13,6 +13,8 @@ from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.orchestrator import scrape_many, scrape_many_stream
 from aisley_scraper.crawl.image_verifier import verify_product_images
 from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
+from aisley_scraper.extract.shopify_products import extract_products_from_products_json
+from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.gender_probs import (
     enrich_gender_probabilities_for_products,
     one_hot_gender_probs_csv,
@@ -755,6 +757,124 @@ def run_crawl(
             processed_in_batch = 0
             success_in_batch = 0
             stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
+
+            async def _iter_page_outcomes(seed: StoreSeed, fetcher: Fetcher):
+                base = seed.store_url.rstrip("/")
+                homepage = await fetcher.get_text(base)
+                store = classify_store(homepage, base, settings)
+
+                page_limit = max(1, settings.shopify_products_page_limit)
+                max_pages = max(1, settings.shopify_products_max_pages)
+                max_items_per_store = max(0, settings.shopify_products_max_items_per_store)
+
+                seen_product_ids: set[str] = set()
+                yielded_any = False
+
+                for page in range(1, max_pages + 1):
+                    products_url = f"{base}/products.json?limit={page_limit}&page={page}"
+                    payload = await fetcher.get_json(products_url)
+                    extracted = extract_products_from_products_json(payload, settings, base_url=base)
+
+                    page_products = []
+                    for product in extracted:
+                        if product.product_id in seen_product_ids:
+                            continue
+                        seen_product_ids.add(product.product_id)
+                        if product.images:
+                            page_products.append(enforce_attribute_policy(product))
+
+                        if max_items_per_store > 0 and len(seen_product_ids) >= max_items_per_store:
+                            logger.warning(
+                                "Reached per-store product cap for %s: collected=%s cap=%s",
+                                base,
+                                len(seen_product_ids),
+                                max_items_per_store,
+                            )
+                            break
+
+                    if page_products:
+                        yielded_any = True
+                        yield ScrapeResult(store=store, products=page_products)
+
+                    if max_items_per_store > 0 and len(seen_product_ids) >= max_items_per_store:
+                        break
+
+                    products_raw = payload.get("products", []) if isinstance(payload, dict) else []
+                    if not isinstance(products_raw, list) or not products_raw:
+                        break
+
+                if not yielded_any:
+                    # Persist store row even when no products are present.
+                    yield ScrapeResult(store=store, products=[])
+
+            use_streaming_mode = (
+                settings.store_page_streaming_enabled
+                and getattr(scrape_many_stream, "__module__", "")
+                == "aisley_scraper.crawl.orchestrator"
+            )
+
+            if use_streaming_mode:
+                fetcher = Fetcher(settings)
+                try:
+                    for seed in batch:
+                        processed_in_batch += 1
+                        persisted_ok = True
+                        error_message = "store_persist_failed"
+
+                        try:
+                            async for outcome in _iter_page_outcomes(seed, fetcher):
+                                persist_task = asyncio.create_task(
+                                    asyncio.to_thread(_persist_store_result, seed, outcome)
+                                )
+                                while True:
+                                    try:
+                                        if stall_interval > 0:
+                                            persisted_ok = await asyncio.wait_for(
+                                                asyncio.shield(persist_task),
+                                                timeout=stall_interval,
+                                            )
+                                        else:
+                                            persisted_ok = await persist_task
+                                        break
+                                    except asyncio.TimeoutError:
+                                        logger.warning(
+                                            "Store persist still running: store=%s processed_in_batch=%s/%s overall=%s/%s",
+                                            seed.store_url,
+                                            processed_in_batch,
+                                            len(batch),
+                                            processed_count + processed_in_batch,
+                                            len(seeds),
+                                        )
+
+                                if not persisted_ok:
+                                    error_message = "store_persist_failed"
+                                    break
+                        except Exception as exc:
+                            persisted_ok = False
+                            error_message = str(exc)
+
+                        mark_status = getattr(repo, "mark_run_store_status", None)
+                        if callable(mark_status):
+                            if persisted_ok:
+                                mark_status(
+                                    run_id=resolved_run_id,
+                                    website=seed.store_url,
+                                    status="completed",
+                                )
+                            else:
+                                mark_status(
+                                    run_id=resolved_run_id,
+                                    website=seed.store_url,
+                                    status="failed",
+                                    error_message=error_message,
+                                )
+
+                        if persisted_ok:
+                            success_in_batch += 1
+
+                    return processed_in_batch, success_in_batch
+                finally:
+                    await fetcher.close()
 
             async for seed, outcome in scrape_many_stream(batch, settings, include_postprocess=False):
                 processed_in_batch += 1

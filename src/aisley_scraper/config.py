@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     crawl_jitter_ms: int = Field(default=250, alias="CRAWL_JITTER_MS")
     crawl_respect_robots: bool = Field(default=True, alias="CRAWL_RESPECT_ROBOTS")
     crawl_stall_log_interval_sec: int = Field(default=60, alias="CRAWL_STALL_LOG_INTERVAL_SEC")
+    store_page_streaming_enabled: bool = Field(default=False, alias="STORE_PAGE_STREAMING_ENABLED")
 
     shopify_products_page_limit: int = Field(default=250, alias="SHOPIFY_PRODUCTS_PAGE_LIMIT")
     shopify_products_max_pages: int = Field(default=100, alias="SHOPIFY_PRODUCTS_MAX_PAGES")
