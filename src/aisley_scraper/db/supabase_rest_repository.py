@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import logging
 import time
 
 import httpx
 
 from aisley_scraper.config import Settings
 from aisley_scraper.models import ProductRecord, StoreProfile
+
+
+logger = logging.getLogger(__name__)
 
 
 class SupabaseRestRepository:
@@ -456,3 +460,333 @@ class SupabaseRestRepository:
             },
             headers={"Prefer": "return=minimal"},
         )
+
+    # ── Staging helpers (two-phase pipeline) ─────────────────────────────────
+
+    def upsert_staged_store(self, run_id: str, store: StoreProfile) -> None:
+        payload: dict[str, object] = {
+            "run_id": run_id,
+            "website": store.website,
+            "store_name": store.store_name,
+            "store_type": store.store_type,
+            "instagram_handle": store.instagram_handle,
+            "address": store.address,
+            "raw": {
+                "website": store.website,
+                "store_name": store.store_name,
+                "store_type": store.store_type,
+                "instagram_handle": store.instagram_handle,
+                "address": store.address,
+            },
+            "scraped_at": self._utc_now_iso(),
+        }
+        self._request(
+            "POST",
+            "/shopify_stores_staging",
+            params={"on_conflict": "run_id,website"},
+            json_body=payload,
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+
+    def upsert_staged_products(
+        self, run_id: str, website: str, products: list[ProductRecord]
+    ) -> None:
+        if not products:
+            return
+        now = self._utc_now_iso()
+        page_size = 500
+        for start in range(0, len(products), page_size):
+            chunk = products[start : start + page_size]
+            payload = [
+                {
+                    "run_id": run_id,
+                    "website": website,
+                    "product_id": p.product_id,
+                    "product_handle": p.product_handle,
+                    "product_url": p.product_url,
+                    "item_name": p.item_name,
+                    "description": p.description,
+                    "sku": p.sku,
+                    "updated_at": p.updated_at,
+                    "price_cents": p.price_cents,
+                    "images": p.images,
+                    "gender_label": p.gender_label,
+                    "sizes": p.sizes,
+                    "colors": p.colors,
+                    "brand": p.brand,
+                    "product_type": p.product_type,
+                    "unavailable": p.unavailable,
+                    "scraped_at": now,
+                }
+                for p in chunk
+            ]
+            self._request(
+                "POST",
+                "/shopify_products_staging",
+                params={"on_conflict": "run_id,website,product_id"},
+                json_body=payload,
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
+
+    def get_staged_store(self, run_id: str, website: str) -> StoreProfile | None:
+        response = self._request(
+            "GET",
+            "/shopify_stores_staging",
+            params={
+                "select": "store_name,store_type,instagram_handle,address",
+                "run_id": f"eq.{run_id}",
+                "website": f"eq.{website}",
+                "limit": "1",
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            return None
+        row = rows[0]
+        return StoreProfile(
+            website=website,
+            store_name=row.get("store_name", ""),
+            store_type=row.get("store_type", "online"),
+            instagram_handle=row.get("instagram_handle"),
+            address=row.get("address"),
+        )
+
+    def list_all_staged_run_websites(self, *, run_id: str) -> list[str]:
+        websites: list[str] = []
+        offset = 0
+        page_size = 1000
+
+        while True:
+            response = self._request(
+                "GET",
+                "/shopify_stores_staging",
+                params={
+                    "select": "website",
+                    "run_id": f"eq.{run_id}",
+                    "order": "id.asc",
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                },
+            )
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                break
+
+            batch: list[str] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                website = row.get("website")
+                if isinstance(website, str) and website:
+                    batch.append(website)
+
+            if not batch:
+                break
+
+            websites.extend(batch)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
+        return websites
+
+    def get_staged_products(self, run_id: str, website: str) -> list[ProductRecord]:
+        out: list[ProductRecord] = []
+        offset = 0
+        page_size = 500
+        while True:
+            response = self._request(
+                "GET",
+                "/shopify_products_staging",
+                params={
+                    "select": (
+                        "product_id,product_handle,product_url,item_name,description,"
+                        "sku,updated_at,price_cents,images,gender_label,"
+                        "sizes,colors,brand,product_type,unavailable"
+                    ),
+                    "run_id": f"eq.{run_id}",
+                    "website": f"eq.{website}",
+                    "order": "id.asc",
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                },
+            )
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                break
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                out.append(
+                    ProductRecord(
+                        product_id=row["product_id"],
+                        product_handle=row.get("product_handle"),
+                        product_url=row.get("product_url"),
+                        item_name=row.get("item_name", ""),
+                        description=row.get("description"),
+                        sku=row.get("sku"),
+                        updated_at=row.get("updated_at"),
+                        price_cents=row.get("price_cents"),
+                        images=list(row.get("images") or []),
+                        gender_label=row.get("gender_label"),
+                        sizes=list(row.get("sizes") or []),
+                        colors=list(row.get("colors") or []),
+                        brand=row.get("brand"),
+                        product_type=row.get("product_type"),
+                        unavailable=bool(row.get("unavailable", False)),
+                    )
+                )
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        return out
+
+    def delete_staged_run_website(self, run_id: str, website: str) -> None:
+        self._request(
+            "DELETE",
+            "/shopify_products_staging",
+            params={"run_id": f"eq.{run_id}", "website": f"eq.{website}"},
+            headers={"Prefer": "return=minimal"},
+        )
+        self._request(
+            "DELETE",
+            "/shopify_stores_staging",
+            params={"run_id": f"eq.{run_id}", "website": f"eq.{website}"},
+            headers={"Prefer": "return=minimal"},
+        )
+
+    def purge_run(self, run_id: str) -> None:
+        """Delete all staging rows and crawl_store_runs rows for a given run ID."""
+        for table in ("shopify_products_staging", "shopify_stores_staging", "crawl_store_runs"):
+            try:
+                self._delete_rows_for_run_in_chunks(table, run_id)
+            except Exception as exc:
+                logger.warning(
+                    "Fresh cleanup: failed to delete table=%s run_id=%s: %s",
+                    table,
+                    run_id,
+                    exc,
+                )
+
+    def purge_other_runs(self, keep_run_id: str) -> None:
+        """Delete temporary rows for all run IDs except keep_run_id."""
+        # Only scan the small tables to discover run_ids — shopify_products_staging can
+        # have hundreds of thousands of rows and scanning it just to find run_ids is
+        # unnecessary because every run that wrote products also wrote to the other two.
+        run_ids: set[str] = set()
+        for table in ("shopify_stores_staging", "crawl_store_runs"):
+            try:
+                run_ids.update(self._list_run_ids(table))
+            except Exception as exc:
+                logger.warning(
+                    "Fresh cleanup: failed to list run_ids from %s: %s",
+                    table,
+                    exc,
+                )
+
+        run_ids_to_purge = sorted(run_id for run_id in run_ids if run_id != keep_run_id)
+        if run_ids_to_purge:
+            logger.warning(
+                "Fresh cleanup: purging historical run_ids count=%s (keeping run_id=%s)",
+                len(run_ids_to_purge),
+                keep_run_id,
+            )
+        else:
+            logger.warning("Fresh cleanup: no historical run_ids to purge")
+
+        for index, run_id in enumerate(run_ids_to_purge, start=1):
+            logger.warning(
+                "Fresh cleanup progress: purging run_id %s/%s (%s)",
+                index,
+                len(run_ids_to_purge),
+                run_id,
+            )
+            try:
+                self.purge_run(run_id)
+            except Exception as exc:
+                logger.warning(
+                    "Fresh cleanup: failed to purge run_id=%s: %s",
+                    run_id,
+                    exc,
+                )
+
+    def _list_run_ids(self, table: str) -> set[str]:
+        out: set[str] = set()
+        offset = 0
+        page_size = 1000
+
+        while True:
+            response = self._request(
+                "GET",
+                f"/{table}",
+                params={
+                    "select": "run_id",
+                    "order": "run_id.asc",
+                    "limit": str(page_size),
+                    "offset": str(offset),
+                },
+            )
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                break
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                run_id = row.get("run_id")
+                if isinstance(run_id, str) and run_id:
+                    out.add(run_id)
+
+            if len(rows) < page_size:
+                break
+            offset += page_size
+
+        return out
+
+    def _delete_rows_for_run_in_chunks(self, table: str, run_id: str, *, batch_size: int = 200) -> None:
+        """Delete rows for one run in bounded chunks to avoid large DELETE failures."""
+        deleted_total = 0
+        batch_count = 0
+        while True:
+            response = self._request(
+                "GET",
+                f"/{table}",
+                params={
+                    "select": "id",
+                    "run_id": f"eq.{run_id}",
+                    "order": "id.asc",
+                    "limit": str(max(1, batch_size)),
+                },
+            )
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                return
+
+            row_ids: list[int] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_id = row.get("id")
+                if isinstance(row_id, int):
+                    row_ids.append(row_id)
+
+            if not row_ids:
+                return
+
+            id_filter = ",".join(str(row_id) for row_id in row_ids)
+            self._request(
+                "DELETE",
+                f"/{table}",
+                params={"id": f"in.({id_filter})"},
+                headers={"Prefer": "return=minimal"},
+            )
+            batch_count += 1
+            deleted_total += len(row_ids)
+            if batch_count % 25 == 0:
+                logger.warning(
+                    "Fresh cleanup progress: table=%s run_id=%s deleted=%s batches=%s",
+                    table,
+                    run_id,
+                    deleted_total,
+                    batch_count,
+                )

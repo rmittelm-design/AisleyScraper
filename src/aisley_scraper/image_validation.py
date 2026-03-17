@@ -25,8 +25,8 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return value
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-REQUIRED_MIN_WIDTH = _env_int("IMAGE_MIN_WIDTH", 800)
-REQUIRED_MIN_HEIGHT = _env_int("IMAGE_MIN_HEIGHT", 800)
+REQUIRED_MIN_WIDTH = 650
+REQUIRED_MIN_HEIGHT = 800
 REQUIRED_MAX_WIDTH = 12000
 REQUIRED_MAX_HEIGHT = 12000
 MIN_ASPECT_RATIO = 0.5
@@ -581,6 +581,8 @@ def validate_and_normalize_upload(
     *,
     content: bytes,
     filename: str,
+    min_width: int = REQUIRED_MIN_WIDTH,
+    min_height: int = REQUIRED_MIN_HEIGHT,
 ) -> dict[str, Any]:
     """Validate an uploaded image and optionally normalize (e.g., HEIC -> JPG).
 
@@ -654,15 +656,15 @@ def validate_and_normalize_upload(
         timings["redecode_s"] = time.perf_counter() - t0
 
     w, h = int(getattr(pil_img, "width", 0)), int(getattr(pil_img, "height", 0))
-    if w < REQUIRED_MIN_WIDTH or h < REQUIRED_MIN_HEIGHT:
+    if w < min_width or h < min_height:
         raise ImageValidationFailure(
             code="resolution_too_low",
-            message="Image resolution is too low. Minimum is 800x800 pixels.",
+            message=f"Image resolution is too low. Minimum is {min_width}x{min_height} pixels.",
             details={
                 "width": w,
                 "height": h,
-                "min_width": REQUIRED_MIN_WIDTH,
-                "min_height": REQUIRED_MIN_HEIGHT,
+                "min_width": min_width,
+                "min_height": min_height,
             },
         )
     if w > REQUIRED_MAX_WIDTH or h > REQUIRED_MAX_HEIGHT:
@@ -764,4 +766,50 @@ def validate_and_normalize_upload(
         "product": product,
         "nsfw": nsfw,
         "timings": timings,
+    }
+
+
+def validate_product_photo_only(
+    *,
+    content: bytes,
+    filename: str,
+    min_product_prob: float = MIN_PRODUCT_PROB,
+) -> dict[str, Any]:
+    """Validate only whether an image appears to be a product photo.
+
+    This is intentionally lighter than full image validation and is meant for
+    phase-2 first-image gating.
+    """
+    if not content:
+        raise ImageValidationFailure(code="empty_file", message="Upload is empty.")
+
+    if len(content) > MAX_IMAGE_BYTES:
+        raise ImageValidationFailure(
+            code="file_too_large",
+            message="Image must be smaller than 10MB.",
+            details={"max_bytes": MAX_IMAGE_BYTES, "actual_bytes": len(content)},
+        )
+
+    safe_name = _safe_basename(filename)
+    _ = safe_name
+    pil_img = _open_pil_image(content)
+    product = product_probability_clip(pil_img)
+    product_prob = float(product.get("product_prob", 0.0))
+    threshold = float(min_product_prob)
+    if product_prob < threshold:
+        raise ImageValidationFailure(
+            code="not_a_product_photo",
+            message="Image does not look like a product photo.",
+            details={
+                "product_prob": product_prob,
+                "min_product_prob": threshold,
+                "best_prompt": product.get("best_prompt"),
+                "probs": product.get("probs"),
+            },
+        )
+
+    return {
+        "ok": True,
+        "product": product,
+        "min_product_prob": threshold,
     }

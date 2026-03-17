@@ -11,7 +11,7 @@ from aisley_scraper.extract.shopify_products import extract_products_from_produc
 from aisley_scraper.gender_probs import enrich_gender_probabilities_for_products
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreSeed
-from aisley_scraper.normalize.products import enforce_attribute_policy
+from aisley_scraper.normalize.products import normalize_product
 
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) ->
         fetcher=fetcher,
         concurrency=settings.image_validation_concurrency,
     )
-    products = [enforce_attribute_policy(p) for p in extracted if p.images]
+    products = [normalized for p in extracted if p.images if (normalized := normalize_product(p)) is not None]
 
     return ScrapeResult(store=store, products=products)
 
@@ -108,7 +108,7 @@ async def scrape_many_stream(
                 store = classify_store(homepage, base, settings)
 
                 extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
-                products = [enforce_attribute_policy(p) for p in extracted if p.images]
+                products = [normalized for p in extracted if p.images if (normalized := normalize_product(p)) is not None]
                 return seed, ScrapeResult(store=store, products=products)
             except Exception as exc:
                 return seed, exc

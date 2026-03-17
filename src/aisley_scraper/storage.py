@@ -89,6 +89,53 @@ class StorageUploader:
             raise last_exc
         raise RuntimeError("image upload failed without explicit exception")
 
+    def upload_image_from_content(
+        self,
+        *,
+        image_url: str,
+        image_content: bytes,
+        store_id: int,
+        product_id: str,
+        index: int,
+    ) -> str:
+        timeout = httpx.Timeout(30.0)
+        headers = {
+            "Authorization": f"Bearer {self._settings.supabase_service_role_key}",
+            "apikey": self._settings.supabase_service_role_key,
+        }
+
+        content_type, _ = mimetypes.guess_type(image_url)
+        upload_content_type = content_type or "application/octet-stream"
+        ext = self._extension_from_url_or_content_type(image_url, upload_content_type)
+        object_path = self._object_path(store_id, product_id, index, ext)
+
+        upload_url = (
+            f"{self._settings.supabase_url.rstrip('/')}/storage/v1/object/"
+            f"{self._settings.supabase_storage_bucket}/{object_path}"
+        )
+        upload_headers = {
+            **headers,
+            "Content-Type": upload_content_type,
+            "x-upsert": "true",
+        }
+
+        attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+                    upload_resp = client.post(upload_url, headers=upload_headers, content=image_content)
+                    upload_resp.raise_for_status()
+                return self._public_url(object_path)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    time.sleep(0.3 * attempt)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("image upload failed without explicit exception")
+
     def delete_images(self, public_urls: list[str]) -> None:
         object_paths = [
             path
@@ -162,3 +209,82 @@ class StorageUploader:
         for idx, image_url in enumerate(image_urls, start=1):
             uploaded.append(self.upload_image_from_url(image_url, store_id, product_id, idx))
         return uploaded
+
+    def upload_product_images_from_cache(
+        self,
+        image_urls: list[str],
+        store_id: int,
+        product_id: str,
+        image_bytes_by_url: dict[str, bytes],
+    ) -> list[str]:
+        uploaded: list[str] = []
+        for idx, image_url in enumerate(image_urls, start=1):
+            cached = image_bytes_by_url.get(image_url) or image_bytes_by_url.get(image_url.strip())
+            if cached is None:
+                uploaded.append(self.upload_image_from_url(image_url, store_id, product_id, idx))
+                continue
+            uploaded.append(
+                self.upload_image_from_content(
+                    image_url=image_url,
+                    image_content=cached,
+                    store_id=store_id,
+                    product_id=product_id,
+                    index=idx,
+                )
+            )
+        return uploaded
+
+    def sync_product_images_from_cache(
+        self,
+        *,
+        current_source_urls: list[str],
+        existing_source_urls: list[str],
+        existing_supabase_urls: list[str],
+        store_id: int,
+        product_id: str,
+        image_bytes_by_url: dict[str, bytes],
+        delete_stale: bool = True,
+    ) -> list[str]:
+        existing_by_source: dict[str, list[str]] = defaultdict(list)
+        for source_url, supabase_url in zip(existing_source_urls, existing_supabase_urls):
+            existing_by_source[source_url].append(supabase_url)
+
+        result: list[str | None] = [None] * len(current_source_urls)
+        reused_supabase_urls: list[str] = []
+        pending_uploads: list[tuple[int, str, int]] = []
+
+        for output_idx, source_url in enumerate(current_source_urls):
+            reusable = existing_by_source.get(source_url)
+            if reusable:
+                reused_url = reusable.pop(0)
+                result[output_idx] = reused_url
+                reused_supabase_urls.append(reused_url)
+                continue
+            pending_uploads.append((output_idx, source_url, output_idx + 1))
+
+        uploaded_by_source: dict[str, str] = {}
+        for output_idx, source_url, image_index in pending_uploads:
+            if source_url in uploaded_by_source:
+                result[output_idx] = uploaded_by_source[source_url]
+                continue
+            cached = image_bytes_by_url.get(source_url) or image_bytes_by_url.get(source_url.strip())
+            if cached is None:
+                uploaded_url = self.upload_image_from_url(source_url, store_id, product_id, image_index)
+            else:
+                uploaded_url = self.upload_image_from_content(
+                    image_url=source_url,
+                    image_content=cached,
+                    store_id=store_id,
+                    product_id=product_id,
+                    index=image_index,
+                )
+            uploaded_by_source[source_url] = uploaded_url
+            result[output_idx] = uploaded_url
+
+        reused_set = set(reused_supabase_urls)
+        final_set = reused_set | set(uploaded_by_source.values())
+        stale_urls = [url for url in existing_supabase_urls if url not in final_set]
+        if delete_stale and stale_urls:
+            self.delete_images(stale_urls)
+
+        return [url for url in result if url is not None]

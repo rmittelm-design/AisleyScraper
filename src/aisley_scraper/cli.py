@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import gc
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+import sys
 from uuid import uuid4
 from urllib.parse import urlparse
 
 from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.orchestrator import scrape_many, scrape_many_stream
-from aisley_scraper.crawl.image_verifier import verify_product_images
+from aisley_scraper.crawl.image_verifier import (
+    verify_first_image_product_validation,
+    verify_product_images,
+)
 from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
+from aisley_scraper.diagnostics import diagnose_staged_runs
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.gender_probs import (
@@ -22,8 +28,8 @@ from aisley_scraper.gender_probs import (
 )
 from aisley_scraper.ingest.csv_loader import load_store_seeds
 from aisley_scraper.local_output import write_local_results
-from aisley_scraper.models import ScrapeResult, StoreSeed
-from aisley_scraper.normalize.products import enforce_attribute_policy
+from aisley_scraper.models import ProductRecord, ScrapeResult, StoreSeed
+from aisley_scraper.normalize.products import enforce_attribute_policy, normalize_product
 from aisley_scraper.storage import StorageUploader
 from aisley_scraper.storage_integrity import (
     delete_orphan_storage_objects,
@@ -32,6 +38,35 @@ from aisley_scraper.storage_integrity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class _DiskSafeRotatingFileHandler(RotatingFileHandler):
+    """File handler that auto-disables itself when the disk is full."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._disabled_for_disk_full = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._disabled_for_disk_full:
+            return
+        try:
+            super().emit(record)
+        except OSError as exc:
+            if getattr(exc, "errno", None) != errno.ENOSPC:
+                raise
+            self._disabled_for_disk_full = True
+            try:
+                self.acquire()
+                if self.stream is not None:
+                    self.stream.close()
+                    self.stream = None
+            finally:
+                self.release()
+            print(
+                "WARNING: Disk full; disabling .aisley_scraper.log file logging for this run.",
+                file=sys.stderr,
+            )
 
 
 def _dedupe_seeds_by_domain(seeds: list[StoreSeed]) -> list[StoreSeed]:
@@ -46,6 +81,58 @@ def _dedupe_seeds_by_domain(seeds: list[StoreSeed]) -> list[StoreSeed]:
     return deduped
 
 
+def _chunk_products_for_phase2(
+    products: list[ProductRecord],
+    *,
+    max_products: int,
+    max_unique_image_urls: int,
+    max_images_per_product_for_budget: int | None = None,
+) -> list[list[ProductRecord]]:
+    if not products:
+        return []
+
+    capped_max_products = max(1, int(max_products))
+    capped_max_unique_image_urls = max(1, int(max_unique_image_urls))
+    capped_max_images_per_product = (
+        max(1, int(max_images_per_product_for_budget))
+        if max_images_per_product_for_budget is not None
+        else None
+    )
+
+    chunks: list[list[ProductRecord]] = []
+    current_chunk: list[ProductRecord] = []
+    current_urls: set[str] = set()
+
+    for product in products:
+        source_images = (
+            product.images[:capped_max_images_per_product]
+            if capped_max_images_per_product is not None
+            else product.images
+        )
+        product_urls = {
+            image_url.strip()
+            for image_url in source_images
+            if image_url and image_url.strip()
+        }
+        next_urls = current_urls | product_urls
+        would_exceed_product_cap = len(current_chunk) >= capped_max_products
+        would_exceed_url_cap = bool(current_chunk) and len(next_urls) > capped_max_unique_image_urls
+
+        if would_exceed_product_cap or would_exceed_url_cap:
+            chunks.append(current_chunk)
+            current_chunk = [product]
+            current_urls = set(product_urls)
+            continue
+
+        current_chunk.append(product)
+        current_urls = next_urls
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aisley-scraper")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -53,10 +140,30 @@ def _build_parser() -> argparse.ArgumentParser:
     ingest = sub.add_parser("ingest-stores")
     ingest.add_argument("--csv", required=False)
 
+    sub.add_parser("diagnose-staged-runs")
+
+    cleanup = sub.add_parser("cleanup-runs", help="Delete all temporary staging rows except the active run")
+    cleanup.add_argument("--run-id", required=False, help="Active run ID to keep (default: read from state file)")
+
     crawl = sub.add_parser("crawl-stores")
     crawl.add_argument("--limit", type=int, default=None)
     crawl.add_argument("--run-id", required=False)
     crawl.add_argument("--fresh", action="store_true")
+    crawl.add_argument(
+        "--skip-image-upload",
+        action="store_true",
+        help="Skip uploading product images to Supabase Storage",
+    )
+    crawl.add_argument(
+        "--phase",
+        choices=["1", "2", "both"],
+        default="both",
+        help=(
+            "1=scrape to staging only; "
+            "2=enrich staged data and write to production; "
+            "both=standard single-phase run (default)"
+        ),
+    )
 
     return parser
 
@@ -68,7 +175,7 @@ def _setup_logging(level: str) -> None:
 
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    file_handler = RotatingFileHandler(
+    file_handler = _DiskSafeRotatingFileHandler(
         ".aisley_scraper.log",
         maxBytes=10_000_000,
         backupCount=3,
@@ -88,6 +195,30 @@ def _setup_logging(level: str) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _clear_fetcher_disk_cache(settings) -> tuple[int, Path | None]:
+    if not getattr(settings, "fetcher_disk_cache_enabled", False):
+        return 0, None
+
+    cache_dir = Path(settings.fetcher_disk_cache_dir)
+    if not cache_dir.exists():
+        return 0, cache_dir
+
+    removed = 0
+    for pattern in ("*.tmp",):
+        for file_path in cache_dir.glob(pattern):
+            try:
+                file_path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                logger.warning("Failed to remove stale fetcher disk cache file %s: %s", file_path, exc)
+
+    if removed:
+        logger.info("Cleared stale fetcher disk cache temp files=%s dir=%s", removed, cache_dir)
+    return removed, cache_dir
+
+
 def _get_store_urls_from_repo(repo: SupabaseRestRepository) -> list[str]:
     list_all = getattr(repo, "list_all_store_websites", None)
     if callable(list_all):
@@ -95,13 +226,36 @@ def _get_store_urls_from_repo(repo: SupabaseRestRepository) -> list[str]:
     return []
 
 
-def _resolve_run_id(state_path: str, run_id: str | None, fresh: bool) -> str:
+def _resolve_run_id(state_path: str, run_id: str | None, fresh: bool) -> tuple[str, str | None]:
+    """Return (new_run_id, old_run_id_to_purge). old_run_id_to_purge is set only on --fresh."""
     state_file = Path(state_path)
 
     if fresh:
+        old_run_id: str | None = None
+        if state_file.exists():
+            persisted = state_file.read_text(encoding="utf-8").strip()
+            if persisted:
+                old_run_id = persisted
         resolved = run_id or str(uuid4())
         state_file.write_text(resolved, encoding="utf-8")
-        return resolved
+        return resolved, old_run_id
+
+    if run_id:
+        state_file.write_text(run_id, encoding="utf-8")
+        return run_id, None
+
+    if state_file.exists():
+        persisted = state_file.read_text(encoding="utf-8").strip()
+        if persisted:
+            return persisted, None
+
+    resolved = str(uuid4())
+    state_file.write_text(resolved, encoding="utf-8")
+    return resolved, None
+
+
+def _resolve_existing_run_id(state_path: str, run_id: str | None) -> str:
+    state_file = Path(state_path)
 
     if run_id:
         state_file.write_text(run_id, encoding="utf-8")
@@ -112,9 +266,9 @@ def _resolve_run_id(state_path: str, run_id: str | None, fresh: bool) -> str:
         if persisted:
             return persisted
 
-    resolved = str(uuid4())
-    state_file.write_text(resolved, encoding="utf-8")
-    return resolved
+    raise RuntimeError(
+        "Phase 2 requires an existing run ID. Pass --run-id or ensure .aisley_active_run_id exists."
+    )
 
 
 def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
@@ -168,15 +322,21 @@ def run_ingest(csv_path: str | None) -> int:
     return 0
 
 
+def run_diagnose_staged_runs() -> int:
+    diagnose_staged_runs()
+    return 0
+
+
 def run_crawl(
     limit: int | None,
     run_id: str | None = None,
     fresh: bool = False,
-    *,
-    enforce_preflight: bool = False,
+    phase: str = "both",
+    skip_image_upload: bool = False,
 ) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
+    allow_null_gender_probs = settings.phase2_first_image_product_validation_only
 
     if settings.persistence_target == "local":
         seeds = load_store_seeds(settings.input_csv_path, settings)
@@ -199,33 +359,67 @@ def run_crawl(
         min(settings.crawl_store_batch_size, settings.crawl_global_concurrency),
     )
 
+    cleared_disk_cache_files, disk_cache_dir = _clear_fetcher_disk_cache(settings)
+
     repo = SupabaseRestRepository(settings)
+    upload_images = not skip_image_upload
 
     try:
         repo.ensure_schema()
-        if enforce_preflight:
+        if upload_images:
+            print("Preflight: checking for orphaned storage objects...")
             _run_orphan_preflight(settings)
-
-        all_seeds = _build_db_first_seeds(settings, repo)
-        all_seeds = _dedupe_seeds_by_domain(all_seeds)
-        if limit is not None:
-            all_seeds = all_seeds[:limit]
+            print("Preflight: storage orphan check passed.")
         else:
-            all_seeds = all_seeds[: settings.crawl_max_stores_per_run]
+            print("Preflight: skipped (--skip-image-upload)")
 
-        resolved_run_id = _resolve_run_id(settings.crawl_run_state_path, run_id, fresh)
-        init_run = getattr(repo, "initialize_crawl_run", None)
-        if callable(init_run):
-            init_run(run_id=resolved_run_id, websites=[seed.store_url for seed in all_seeds])
-
-        list_pending = getattr(repo, "list_all_run_store_websites", None)
-        if callable(list_pending):
-            eligible_urls = set(
-                list_pending(run_id=resolved_run_id, statuses=["pending", "failed"])
-            )
-            seeds = [seed for seed in all_seeds if seed.store_url in eligible_urls]
+        if phase == "2":
+            resolved_run_id = _resolve_existing_run_id(settings.crawl_run_state_path, run_id)
+            all_seeds: list[StoreSeed] = []
+            seeds: list[StoreSeed] = []
         else:
-            seeds = all_seeds
+            all_seeds = _build_db_first_seeds(settings, repo)
+            all_seeds = _dedupe_seeds_by_domain(all_seeds)
+            if limit is not None:
+                all_seeds = all_seeds[:limit]
+            else:
+                all_seeds = all_seeds[: settings.crawl_max_stores_per_run]
+
+            resolved_run_id, old_run_id = _resolve_run_id(settings.crawl_run_state_path, run_id, fresh)
+            if old_run_id and old_run_id != resolved_run_id:
+                purge_run = getattr(repo, "purge_run", None)
+                if callable(purge_run):
+                    try:
+                        purge_run(old_run_id)
+                        logger.info("Purged previous run staging data run_id=%s", old_run_id)
+                    except Exception as exc:
+                        logger.warning("Failed to purge previous run run_id=%s: %s", old_run_id, exc)
+            if fresh:
+                purge_other_runs = getattr(repo, "purge_other_runs", None)
+                if callable(purge_other_runs):
+                    try:
+                        purge_other_runs(resolved_run_id)
+                        logger.info(
+                            "Purged historical temporary rows excluding run_id=%s",
+                            resolved_run_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to purge historical temporary rows excluding run_id=%s: %s",
+                            resolved_run_id,
+                            exc,
+                        )
+            init_run = getattr(repo, "initialize_crawl_run", None)
+            if callable(init_run):
+                init_run(run_id=resolved_run_id, websites=[seed.store_url for seed in all_seeds])
+            list_pending = getattr(repo, "list_all_run_store_websites", None)
+            if callable(list_pending):
+                eligible_urls = set(
+                    list_pending(run_id=resolved_run_id, statuses=["pending", "failed"])
+                )
+                seeds = [seed for seed in all_seeds if seed.store_url in eligible_urls]
+            else:
+                seeds = all_seeds
 
         uploader = StorageUploader(settings)
 
@@ -359,6 +553,7 @@ def run_crawl(
                 return True
 
             chunk_size = max(1, int(settings.postprocess_product_chunk_size))
+            image_bytes_by_url: dict[str, bytes] = {}
 
             def _chunk_products(products: list) -> list[list]:
                 return [products[i : i + chunk_size] for i in range(0, len(products), chunk_size)]
@@ -371,23 +566,67 @@ def run_crawl(
                         fetcher=postprocess_fetcher,
                         settings=settings,
                     )
-                    await enrich_gender_probabilities_for_products(
-                        products=products,
-                        fetcher=postprocess_fetcher,
-                        concurrency=settings.image_validation_concurrency,
+                    # Image cap for validation/scoring: keep all but validate only first N.
+                    max_images_for_validation = max(
+                        1, settings.phase2_max_images_per_product
                     )
+                    original_images_map: dict[str, list[str]] = {}
+                    for product in products:
+                        if product.images:
+                            original_images_map[product.product_id] = list(product.images)
+                            product.images = product.images[:max_images_for_validation]
+                    try:
+                        await enrich_gender_probabilities_for_products(
+                            products=products,
+                            fetcher=postprocess_fetcher,
+                            concurrency=settings.image_validation_concurrency,
+                        )
+                    finally:
+                        # Restore all original images after scoring.
+                        for product in products:
+                            if product.product_id in original_images_map:
+                                product.images = original_images_map[product.product_id]
+                    for product in products:
+                        for image_url in product.images:
+                            normalized_url = image_url.strip()
+                            if not normalized_url:
+                                continue
+                            cached = postprocess_fetcher.get_cached_bytes(normalized_url)
+                            if cached is not None:
+                                image_bytes_by_url[normalized_url] = cached
                 finally:
+                    clear_cached_bytes = getattr(postprocess_fetcher, "clear_cached_bytes", None)
+                    if callable(clear_cached_bytes):
+                        clear_cached_bytes()
                     await postprocess_fetcher.close()
 
             async def _enrich_products_only(products: list) -> None:
                 enrich_fetcher = Fetcher(settings)
                 try:
-                    await enrich_gender_probabilities_for_products(
-                        products=products,
-                        fetcher=enrich_fetcher,
-                        concurrency=settings.image_validation_concurrency,
+                    # Image cap for validation/scoring: keep all but validate only first N.
+                    max_images_for_validation = max(
+                        1, settings.phase2_max_images_per_product
                     )
+                    original_images_map: dict[str, list[str]] = {}
+                    for product in products:
+                        if product.images:
+                            original_images_map[product.product_id] = list(product.images)
+                            product.images = product.images[:max_images_for_validation]
+                    try:
+                        await enrich_gender_probabilities_for_products(
+                            products=products,
+                            fetcher=enrich_fetcher,
+                            concurrency=settings.image_validation_concurrency,
+                        )
+                    finally:
+                        # Restore all original images after scoring.
+                        for product in products:
+                            if product.product_id in original_images_map:
+                                product.images = original_images_map[product.product_id]
                 finally:
+                    clear_cached_bytes = getattr(enrich_fetcher, "clear_cached_bytes", None)
+                    if callable(clear_cached_bytes):
+                        clear_cached_bytes()
                     await enrich_fetcher.close()
 
             def _try_enrich_from_supabase_images(product) -> None:
@@ -413,9 +652,24 @@ def run_crawl(
                     product.images = original_images
 
             def _safe_upload_new_product_images(product) -> list[str]:
+                if not upload_images:
+                    return list(product.supabase_images or [])
                 if not product.images:
                     return []
                 try:
+                    upload_from_cache = getattr(uploader, "upload_product_images_from_cache", None)
+                    cached_for_product = {
+                        image_url.strip(): image_bytes_by_url[image_url.strip()]
+                        for image_url in product.images
+                        if image_url and image_url.strip() and image_url.strip() in image_bytes_by_url
+                    }
+                    if callable(upload_from_cache) and cached_for_product:
+                        return upload_from_cache(
+                            product.images,
+                            store_id,
+                            product.product_id,
+                            cached_for_product,
+                        )
                     return uploader.upload_product_images(
                         product.images,
                         store_id=store_id,
@@ -435,7 +689,25 @@ def run_crawl(
                 existing_images: list[str],
                 existing_supabase_images: list[str],
             ) -> list[str]:
+                if not upload_images:
+                    return list(existing_supabase_images)
                 try:
+                    sync_from_cache = getattr(uploader, "sync_product_images_from_cache", None)
+                    cached_for_product = {
+                        image_url.strip(): image_bytes_by_url[image_url.strip()]
+                        for image_url in product.images
+                        if image_url and image_url.strip() and image_url.strip() in image_bytes_by_url
+                    }
+                    if callable(sync_from_cache) and cached_for_product:
+                        return sync_from_cache(
+                            current_source_urls=product.images,
+                            existing_source_urls=existing_images,
+                            existing_supabase_urls=existing_supabase_images,
+                            store_id=store_id,
+                            product_id=product.product_id,
+                            image_bytes_by_url=cached_for_product,
+                            delete_stale=False,
+                        )
                     return uploader.sync_product_images(
                         current_source_urls=product.images,
                         existing_source_urls=existing_images,
@@ -454,10 +726,10 @@ def run_crawl(
                     return existing_supabase_images
 
             def _safe_upsert_product(product) -> None:
-                if product.images and (
+                images_incomplete = upload_images and (
                     len(product.supabase_images or []) != len(product.images)
-                    or not product.gender_probs_csv
-                ):
+                )
+                if product.images and (images_incomplete or not product.gender_probs_csv):
                     logger.warning(
                         "Skipping final upsert with incomplete required fields for store=%s product=%s",
                         store_id,
@@ -565,7 +837,12 @@ def run_crawl(
                     processed: list = []
                     for chunk in _chunk_products(processing_products):
                         asyncio.run(_postprocess_products(chunk))
-                        processed.extend(enforce_attribute_policy(p) for p in chunk if p.images)
+                        processed.extend(
+                            normalized
+                            for p in chunk
+                            if p.images
+                            if (normalized := normalize_product(p)) is not None
+                        )
                     processing_products = processed
                 else:
                     processing_products = []
@@ -613,6 +890,14 @@ def run_crawl(
                 if _skip_no_image_product(product):
                     continue
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
+                # Skip products that are fully populated with no image changes.
+                if not _needs_postprocess(product) and existing_image_state is not None:
+                    _, existing_supabase_images, existing_gender_probs = _split_existing_state(
+                        existing_image_state
+                    )
+                    if existing_supabase_images and existing_gender_probs:
+                        continue
+
                 if existing_image_state is None:
                     if product.images:
                         product.supabase_images = _safe_upload_new_product_images(product)
@@ -667,7 +952,7 @@ def run_crawl(
                 for product in preliminary_products
                 if product.images
                 and (
-                    len(product.supabase_images or []) != len(product.images)
+                    (upload_images and len(product.supabase_images or []) != len(product.images))
                     or not product.gender_probs_csv
                 )
             ]
@@ -716,7 +1001,7 @@ def run_crawl(
                 for product in preliminary_products
                 if product.images
                 and (
-                    len(product.supabase_images or []) != len(product.images)
+                    (upload_images and len(product.supabase_images or []) != len(product.images))
                     or not product.gender_probs_csv
                 )
             ]
@@ -758,6 +1043,667 @@ def run_crawl(
 
             return True
 
+        def _persist_to_staging(seed: StoreSeed, outcome: ScrapeResult | Exception) -> bool:
+            """Phase 1: write raw scrape output to staging tables (sync, for thread use)."""
+            if isinstance(outcome, Exception):
+                print(f"FAIL {seed.store_url}: {outcome}")
+                return False
+            try:
+                repo.upsert_staged_store(resolved_run_id, outcome.store)
+                repo.upsert_staged_products(resolved_run_id, seed.store_url, outcome.products)
+                return True
+            except Exception as exc:
+                logger.warning("Staging persist failed for %s: %s", seed.store_url, exc)
+                return False
+
+        def _run_phase1() -> int:
+            """
+            Phase 1 pipeline — one event loop, one Fetcher, full concurrency.
+
+            scrape_many_stream already handles crawl_global_concurrency via its
+            semaphore and yields results as each store completes. Staging writes
+            (2 REST calls, ~100ms) run in asyncio.to_thread so they don't block
+            the event loop while other stores continue fetching in the background.
+            """
+
+            async def _run_async() -> int:
+                stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
+                success = 0
+                done = 0
+
+                # scrape_many_stream with include_postprocess=False: pure JSON fetch,
+                # no image validation, no CLIP.  Semaphore concurrency is
+                # crawl_global_concurrency; results stream out as stores complete.
+                async for seed, outcome in scrape_many_stream(
+                    seeds, settings, include_postprocess=False
+                ):
+                    done += 1
+
+                    # Run the 2-REST-call staging write in a thread so the event
+                    # loop stays free for the ongoing concurrent fetches.
+                    write_task = asyncio.create_task(
+                        asyncio.to_thread(_persist_to_staging, seed, outcome)
+                    )
+                    while True:
+                        try:
+                            if stall_interval > 0:
+                                ok = await asyncio.wait_for(
+                                    asyncio.shield(write_task), timeout=float(stall_interval)
+                                )
+                            else:
+                                ok = await write_task
+                            break
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Phase 1 staging write still running: store=%s",
+                                seed.store_url,
+                            )
+
+                    mark_status = getattr(repo, "mark_run_store_status", None)
+                    if callable(mark_status):
+                        if ok:
+                            mark_status(
+                                run_id=resolved_run_id,
+                                website=seed.store_url,
+                                status="scraped",
+                            )
+                        else:
+                            error_msg = (
+                                str(outcome) if isinstance(outcome, Exception)
+                                else "staging_write_failed"
+                            )
+                            mark_status(
+                                run_id=resolved_run_id,
+                                website=seed.store_url,
+                                status="failed",
+                                error_message=error_msg,
+                            )
+
+                    if ok:
+                        success += 1
+                    print(f"Phase 1 progress: {done}/{len(seeds)}")
+
+                return success
+
+            return asyncio.run(_run_async())
+
+        def _run_phase2() -> int:
+            """
+            Bounded three-stage pipeline — processes staged stores in chunks.
+
+            Stage 1: Load staged data, upsert stores, and fetch existing product states
+                     in parallel (bounded by crawl_global_concurrency).
+            Stage 2: Image validation + CLIP scoring for products in the current
+                     chunk of stores.
+            Stage 3: Storage uploads + DB upserts for the current chunk concurrently
+                     (bounded by image_validation_concurrency for upload operations).
+            """
+
+            async def _run_async() -> int:
+                fetcher = Fetcher(settings)
+                try:
+                    io_sem = asyncio.Semaphore(settings.crawl_global_concurrency)
+                    upload_sem = asyncio.Semaphore(settings.phase2_upload_concurrency)
+                    stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
+                    progress_lock = asyncio.Lock()
+                    completed_count = 0
+                    phase2_store_batch_size = max(
+                        1,
+                        min(settings.crawl_store_batch_size, settings.crawl_global_concurrency),
+                    )
+                    phase2_product_chunk_size = max(1, settings.postprocess_product_chunk_size)
+                    phase2_unique_url_budget = max(
+                        1,
+                        min(
+                            settings.phase2_max_unique_image_urls_per_chunk,
+                            max(1, settings.fetcher_byte_cache_max_mb),
+                        ),
+                    )
+
+                    def _norm(urls: list[str]) -> list[str]:
+                        return [u.strip() for u in (urls or []) if u.strip()]
+
+                    # ── Stage 1: load staged data + upsert stores in parallel ─────
+                    async def _load_one(website: str):
+                        async with io_sem:
+                            staged_store = await asyncio.to_thread(
+                                repo.get_staged_store, resolved_run_id, website
+                            )
+                            if staged_store is None:
+                                raise RuntimeError("staging store row missing")
+                            staged_products = await asyncio.to_thread(
+                                repo.get_staged_products, resolved_run_id, website
+                            )
+                            store_id = await asyncio.to_thread(repo.upsert_store, staged_store)
+                            product_ids = [p.product_id for p in staged_products if p.product_id]
+                            existing_states: dict = {}
+                            if product_ids:
+                                existing_states = await asyncio.to_thread(
+                                    repo.get_product_image_states, store_id, product_ids
+                                )
+                            return store_id, staged_products, existing_states
+
+                    # ── Stage 2: per-chunk image validation + CLIP scoring ─────────
+                    def _needs_enrichment(product: ProductRecord, existing_states: dict) -> bool:
+                        """True when image validation and/or CLIP scoring must run."""
+                        if not product.images:
+                            return False
+                        existing = existing_states.get(product.product_id)
+                        if existing is None:
+                            return True
+                        existing_imgs, existing_supa, existing_probs = existing
+                        # Previous upload was incomplete: re-process.
+                        if len(existing_imgs) != len(existing_supa):
+                            return True
+                        if _norm(product.images) != _norm(existing_imgs):
+                            return True
+                        if allow_null_gender_probs:
+                            return False
+                        return not bool(existing_probs or product.gender_probs_csv)
+
+                    # ── Stage 3: storage uploads + DB upserts ─────────────────────
+                    async def _finalize_product(
+                        product: ProductRecord, store_id: int, existing_states: dict
+                    ) -> bool:
+                        existing = existing_states.get(product.product_id)
+
+                        # New products with no valid images or marked unavailable: skip.
+                        if existing is None and (not product.images or product.unavailable):
+                            return True
+                        # Products whose images were all rejected by validation: skip upsert.
+                        if not product.images:
+                            return True
+
+                        existing_imgs = list(existing[0]) if existing else []
+                        existing_supa = list(existing[1]) if existing else []
+                        images_unchanged = bool(
+                            existing
+                            and _norm(product.images) == _norm(existing_imgs)
+                            and len(existing_supa) == len(product.images)
+                        )
+
+                        if not upload_images:
+                            # Preserve existing storage URLs when uploads are disabled.
+                            product.supabase_images = existing_supa if existing else []
+                        elif existing is None:
+                            # Ensure every image URL that needs uploading has its bytes
+                            # loaded through the shared Fetcher (hits cache for URLs already
+                            # processed in stage 2; fetches unconditionally otherwise).
+                            image_bytes_by_url = {
+                                image_url: cached
+                                for image_url in _norm(product.images)
+                                if (cached := fetcher.get_cached_bytes(image_url)) is not None
+                            }
+                            async with upload_sem:
+                                try:
+                                    product.supabase_images = await asyncio.to_thread(
+                                        uploader.upload_product_images_from_cache,
+                                        product.images,
+                                        store_id,
+                                        product.product_id,
+                                        image_bytes_by_url,
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Upload failed store_id=%s product=%s: %s",
+                                        store_id, product.product_id, exc,
+                                    )
+                                    return False
+                        elif images_unchanged:
+                            # Images and upload count match: reuse existing Supabase URLs.
+                            product.supabase_images = existing_supa
+                        else:
+                            for image_url in _norm(product.images):
+                                if fetcher.get_cached_bytes(image_url) is None:
+                                    try:
+                                        await fetcher.get_bytes(image_url)
+                                    except Exception as exc:
+                                        logger.warning(
+                                            "Pre-upload fetch failed store_id=%s url=%s: %s",
+                                            store_id, image_url, exc,
+                                        )
+
+                            image_bytes_by_url = {
+                                image_url: cached
+                                for image_url in _norm(product.images)
+                                if (cached := fetcher.get_cached_bytes(image_url)) is not None
+                            }
+                            async with upload_sem:
+                                try:
+                                    product.supabase_images = await asyncio.to_thread(
+                                        uploader.sync_product_images_from_cache,
+                                        current_source_urls=product.images,
+                                        existing_source_urls=existing_imgs,
+                                        existing_supabase_urls=existing_supa,
+                                        store_id=store_id,
+                                        product_id=product.product_id,
+                                        image_bytes_by_url=image_bytes_by_url,
+                                        delete_stale=False,
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "Image sync failed store_id=%s product=%s: %s",
+                                        store_id, product.product_id, exc,
+                                    )
+                                    product.supabase_images = existing_supa or []
+
+                        # Supabase-image fallback gender scoring.
+                        if (
+                            not allow_null_gender_probs
+                            and not product.gender_probs_csv
+                            and product.supabase_images
+                        ):
+                            orig = list(product.images)
+                            product.images = list(product.supabase_images)
+                            # Image cap for validation/scoring: keep all but validate only first N.
+                            max_images_for_validation = max(
+                                1, settings.phase2_max_images_per_product
+                            )
+                            product.images = product.images[:max_images_for_validation]
+                            try:
+                                await enrich_gender_probabilities_for_products(
+                                    [product], fetcher=fetcher, concurrency=1
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Supabase-fallback scoring failed store_id=%s product=%s: %s",
+                                    store_id, product.product_id, exc,
+                                )
+                            finally:
+                                product.images = orig
+
+                        images_incomplete = upload_images and (
+                            len(product.supabase_images) != len(product.images)
+                        )
+                        missing_gender_probs = (not allow_null_gender_probs) and (not product.gender_probs_csv)
+                        if images_incomplete or missing_gender_probs:
+                            logger.warning(
+                                "Skipping upsert: incomplete required fields store_id=%s product=%s",
+                                store_id, product.product_id,
+                            )
+                            return False
+
+                        if allow_null_gender_probs:
+                            product.gender_probs_csv = None
+
+                        try:
+                            await asyncio.to_thread(repo.upsert_product, store_id, product)
+                            return True
+                        except Exception as exc:
+                            logger.warning(
+                                "Upsert failed store_id=%s product=%s: %s",
+                                store_id, product.product_id, exc,
+                            )
+                            return False
+
+                    async def _finalize_store(website: str, store_map: dict[str, tuple]) -> bool:
+                        store_id, staged_products, existing_states = store_map[website]
+
+                        results = await asyncio.gather(
+                            *[_finalize_product(p, store_id, existing_states) for p in staged_products],
+                            return_exceptions=True,
+                        )
+
+                        failure_count = sum(
+                            1 for r in results if isinstance(r, Exception) or r is False
+                        )
+                        if failure_count:
+                            logger.error(
+                                "Phase 2: %s/%s products failed for %s — staging preserved for retry",
+                                failure_count, len(staged_products), website,
+                            )
+                            return False
+
+                        await asyncio.to_thread(
+                            repo.delete_staged_run_website, resolved_run_id, website
+                        )
+                        await asyncio.to_thread(
+                            repo.mark_run_store_status,
+                            run_id=resolved_run_id, website=website, status="completed",
+                        )
+
+                        nonlocal completed_count
+                        async with progress_lock:
+                            completed_count += 1
+                            pct = (completed_count / len(scraped_websites)) * 100.0
+                            print(
+                                f"Phase 2 progress: {completed_count}/{len(scraped_websites)} "
+                                f"({pct:.1f}%)"
+                            )
+
+                        return True
+
+                    p2_success = 0
+                    total_websites = len(scraped_websites)
+                    for batch_index, batch_start in enumerate(
+                        range(0, total_websites, phase2_store_batch_size),
+                        start=1,
+                    ):
+                        website_batch = scraped_websites[batch_start: batch_start + phase2_store_batch_size]
+                        logger.info(
+                            "Phase 2: processing batch %s (%s stores)",
+                            batch_index,
+                            len(website_batch),
+                        )
+
+                        load_task = asyncio.gather(
+                            *[_load_one(w) for w in website_batch],
+                            return_exceptions=True,
+                        )
+                        while True:
+                            try:
+                                if stall_interval > 0:
+                                    load_outcomes = await asyncio.wait_for(
+                                        asyncio.shield(load_task),
+                                        timeout=float(stall_interval),
+                                    )
+                                else:
+                                    load_outcomes = await load_task
+                                break
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "Phase 2 stage 1 still running (batch=%s stores=%s)",
+                                    batch_index,
+                                    len(website_batch),
+                                )
+
+                        store_map: dict[str, tuple] = {}  # website -> (store_id, products, existing_states)
+                        failed_load: list[str] = []
+                        for website, outcome in zip(website_batch, load_outcomes):
+                            if isinstance(outcome, Exception):
+                                logger.error("Phase 2 stage 1 failed for %s: %s", website, outcome)
+                                failed_load.append(website)
+                                continue
+                            store_id, staged_products, existing_states = outcome
+                            # Apply one-hot gender overrides and inherit existing scores before Stage 2.
+                            for product in staged_products:
+                                if allow_null_gender_probs:
+                                    product.gender_probs_csv = None
+                                else:
+                                    explicit = one_hot_gender_probs_csv(product.gender_label)
+                                    if explicit is not None:
+                                        product.gender_probs_csv = explicit
+                                    elif not product.gender_probs_csv:
+                                        state = existing_states.get(product.product_id)
+                                        if state is not None and state[2]:
+                                            product.gender_probs_csv = state[2]
+                            store_map[website] = (store_id, staged_products, existing_states)
+
+                        to_enrich: list[ProductRecord] = [
+                            p
+                            for _w, (_, prods, states) in store_map.items()
+                            for p in prods
+                            if _needs_enrichment(p, states)
+                        ]
+
+                        # Capture all candidate image URLs before stage 2 filters
+                        # out rejected images so we can clear every fetched URL from
+                        # the byte cache at the end of this batch, not just the
+                        # survivors.  Avoids accumulation of rejected bytes.
+                        batch_prefetch_urls: set[str] = {
+                            image_url.strip()
+                            for p in to_enrich
+                            for image_url in p.images
+                            if image_url and image_url.strip()
+                        }
+
+                        if to_enrich:
+                            product_chunks = _chunk_products_for_phase2(
+                                to_enrich,
+                                max_products=phase2_product_chunk_size,
+                                max_unique_image_urls=phase2_unique_url_budget,
+                                max_images_per_product_for_budget=settings.phase2_max_images_per_product,
+                            )
+                            total_product_chunks = len(product_chunks)
+                            logger.info(
+                                "Phase 2 stage 2: validating images for %s products across %s stores in %s chunks (max_products=%s max_unique_urls=%s max_images_per_product=%s)",
+                                len(to_enrich),
+                                len(store_map),
+                                total_product_chunks,
+                                phase2_product_chunk_size,
+                                phase2_unique_url_budget,
+                                settings.phase2_max_images_per_product,
+                            )
+                            for chunk_index, product_chunk in enumerate(product_chunks, start=1):
+                                chunk_pct = (chunk_index / total_product_chunks) * 100.0
+                                logger.info(
+                                    "Phase 2 stage 2: validating chunk %s/%s (%s products)",
+                                    chunk_index,
+                                    total_product_chunks,
+                                    len(product_chunk),
+                                )
+                                print(
+                                    f"Phase 2 validation chunk: {chunk_index}/{total_product_chunks} "
+                                    f"({chunk_pct:.1f}%) products={len(product_chunk)}"
+                                )
+
+                                # ── Image cap for validation/scoring: keep all but validate only first N ──
+                                max_images_for_validation = max(
+                                    1, settings.phase2_max_images_per_product
+                                )
+                                original_images_map: dict[str, list[str]] = {}
+                                for product in product_chunk:
+                                    if product.images:
+                                        original_images_map[product.product_id] = list(product.images)
+                                        product.images = product.images[:max_images_for_validation]
+
+                                if stall_interval > 0:
+                                    if settings.phase2_first_image_product_validation_only:
+                                        vtask = asyncio.create_task(
+                                            verify_first_image_product_validation(
+                                                products=product_chunk,
+                                                fetcher=fetcher,
+                                                settings=settings,
+                                            )
+                                        )
+                                    else:
+                                        vtask = asyncio.create_task(
+                                            verify_product_images(
+                                                products=product_chunk,
+                                                fetcher=fetcher,
+                                                settings=settings,
+                                            )
+                                        )
+                                    while True:
+                                        try:
+                                            await asyncio.wait_for(
+                                                asyncio.shield(vtask),
+                                                timeout=float(stall_interval),
+                                            )
+                                            break
+                                        except asyncio.TimeoutError:
+                                            logger.warning(
+                                                "Phase 2 image validation still running "
+                                                "(chunk=%s/%s products=%s)",
+                                                chunk_index,
+                                                total_product_chunks,
+                                                len(product_chunk),
+                                            )
+                                else:
+                                    if settings.phase2_first_image_product_validation_only:
+                                        await verify_first_image_product_validation(
+                                            products=product_chunk,
+                                            fetcher=fetcher,
+                                            settings=settings,
+                                        )
+                                    else:
+                                        await verify_product_images(
+                                            products=product_chunk,
+                                            fetcher=fetcher,
+                                            settings=settings,
+                                        )
+
+                                to_score = [p for p in product_chunk if p.images and not p.gender_probs_csv]
+                                if to_score and not allow_null_gender_probs:
+                                    logger.info(
+                                        "Phase 2 stage 2: CLIP scoring chunk %s/%s (%s products)",
+                                        chunk_index,
+                                        total_product_chunks,
+                                        len(to_score),
+                                    )
+                                    print(
+                                        f"Phase 2 scoring chunk: {chunk_index}/{total_product_chunks} "
+                                        f"products={len(to_score)}"
+                                    )
+                                    if stall_interval > 0:
+                                        stask = asyncio.create_task(
+                                            enrich_gender_probabilities_for_products(
+                                                products=to_score,
+                                                fetcher=fetcher,
+                                                concurrency=settings.image_validation_concurrency,
+                                            )
+                                        )
+                                        while True:
+                                            try:
+                                                await asyncio.wait_for(
+                                                    asyncio.shield(stask),
+                                                    timeout=float(stall_interval),
+                                                )
+                                                break
+                                            except asyncio.TimeoutError:
+                                                still_pending = sum(
+                                                    1 for p in to_score if not p.gender_probs_csv
+                                                )
+                                                logger.warning(
+                                                    "Phase 2 CLIP scoring still running "
+                                                    "(chunk=%s/%s): %s/%s products pending",
+                                                    chunk_index,
+                                                    total_product_chunks,
+                                                    still_pending,
+                                                    len(to_score),
+                                                )
+                                    else:
+                                        await enrich_gender_probabilities_for_products(
+                                            products=to_score,
+                                            fetcher=fetcher,
+                                            concurrency=settings.image_validation_concurrency,
+                                        )
+                                elif to_score:
+                                    for product in to_score:
+                                        product.gender_probs_csv = None
+
+                                # ── Restore all original images after validation/scoring ──
+                                for product in product_chunk:
+                                    if product.product_id in original_images_map:
+                                        product.images = original_images_map[product.product_id]
+
+                        finalize_task = asyncio.gather(
+                            *[_finalize_store(w, store_map) for w in store_map],
+                            return_exceptions=True,
+                        )
+                        while True:
+                            try:
+                                if stall_interval > 0:
+                                    finalize_outcomes = await asyncio.wait_for(
+                                        asyncio.shield(finalize_task),
+                                        timeout=float(stall_interval),
+                                    )
+                                else:
+                                    finalize_outcomes = await finalize_task
+                                break
+                            except asyncio.TimeoutError:
+                                logger.warning(
+                                    "Phase 2 stage 3 still running (batch=%s stores=%s)",
+                                    batch_index,
+                                    len(store_map),
+                                )
+
+                        for website, outcome in zip(store_map, finalize_outcomes):
+                            if isinstance(outcome, Exception) or outcome is False:
+                                try:
+                                    repo.mark_run_store_status(
+                                        run_id=resolved_run_id,
+                                        website=website,
+                                        status="failed",
+                                        error_message=(
+                                            str(outcome)[:2000]
+                                            if isinstance(outcome, Exception)
+                                            else "phase2_finalize_failed"
+                                        ),
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                p2_success += 1
+
+                        for website in failed_load:
+                            try:
+                                repo.mark_run_store_status(
+                                    run_id=resolved_run_id,
+                                    website=website,
+                                    status="failed",
+                                    error_message="staging_load_failed",
+                                )
+                            except Exception:
+                                pass
+
+                        # Also include any URLs fetched during stage 3 pre-upload
+                        # (for products whose images didn't go through stage 2).
+                        batch_prefetch_urls.update(
+                            image_url.strip()
+                            for _, products, _ in store_map.values()
+                            for product in products
+                            for image_url in product.images
+                            if image_url and image_url.strip()
+                        )
+                        if batch_prefetch_urls:
+                            fetcher.clear_cached_bytes(list(batch_prefetch_urls), clear_disk_cache=False)
+
+                        # Release product-heavy structures before loading the next chunk.
+                        store_map.clear()
+                        load_outcomes.clear()
+                        to_enrich.clear()
+                        failed_load.clear()
+                        gc.collect()
+
+                    return p2_success
+                finally:
+                    await fetcher.close()
+
+            list_staged = getattr(repo, "list_all_staged_run_websites", None)
+            if callable(list_staged):
+                scraped_websites = list_staged(run_id=resolved_run_id)
+            else:
+                # Backward-compatible fallback for older repository implementations.
+                scraped_websites = repo.list_all_run_store_websites(
+                    run_id=resolved_run_id, statuses=["scraped"]
+                )
+
+            if not scraped_websites:
+                logger.info("Phase 2: no staged websites found for run_id=%s", resolved_run_id)
+                pending_count = 0
+                failed_count = 0
+                scraped_count = 0
+                completed_count = 0
+                count_status = getattr(repo, "count_run_store_status", None)
+                if callable(count_status):
+                    pending_count = count_status(run_id=resolved_run_id, status="pending")
+                    failed_count = count_status(run_id=resolved_run_id, status="failed")
+                    scraped_count = count_status(run_id=resolved_run_id, status="scraped")
+                    completed_count = count_status(run_id=resolved_run_id, status="completed")
+                print(
+                    "Phase 2: no staged websites to process "
+                    f"(run_id={resolved_run_id}, crawl_store_runs pending={pending_count}, "
+                    f"scraped={scraped_count}, failed={failed_count}, completed={completed_count})."
+                )
+                if pending_count > 0 and scraped_count == 0 and failed_count == 0 and completed_count == 0:
+                    print(
+                        "Phase 2 warning: this run looks like a fresh or phase-1-not-started run, not a resumable staged run. "
+                        "Use --run-id with the actual staged run ID or run scripts/diagnose_staged_runs.py."
+                    )
+                return 0
+
+            logger.info("Phase 2: enriching %s staged websites", len(scraped_websites))
+            print(
+                f"Phase 2: enriching {len(scraped_websites)} staged websites "
+                f"(run_id={resolved_run_id})..."
+            )
+            p2_success = asyncio.run(_run_async())
+            print(
+                f"Phase 2 complete: {p2_success}/{len(scraped_websites)} stores enriched successfully"
+            )
+            return p2_success
+
         async def _persist_batch_stream(batch: list[StoreSeed]) -> tuple[int, int]:
             processed_in_batch = 0
             success_in_batch = 0
@@ -786,7 +1732,9 @@ def run_crawl(
                             continue
                         seen_product_ids.add(product.product_id)
                         if product.images:
-                            page_products.append(enforce_attribute_policy(product))
+                            normalized = normalize_product(product)
+                            if normalized is not None:
+                                page_products.append(normalized)
 
                         if max_items_per_store > 0 and len(seen_product_ids) >= max_items_per_store:
                             logger.warning(
@@ -928,28 +1876,80 @@ def run_crawl(
 
             return processed_in_batch, success_in_batch
 
-        for start in range(0, len(seeds), chunk_size):
-            batch = seeds[start : start + chunk_size]
-            processed_in_batch, success_in_batch = asyncio.run(_persist_batch_stream(batch))
-            processed_count += processed_in_batch
-            success_count += success_in_batch
+        if phase == "1":
+            if disk_cache_dir is not None:
+                print(
+                    "Phase 1 startup: fetcher disk cache preserved "
+                    f"files={cleared_disk_cache_files} dir={disk_cache_dir}"
+                )
+            success_count = _run_phase1()
+            print(f"Phase 1 complete: {success_count}/{len(seeds)} stores staged successfully")
+        elif phase == "2":
+            if disk_cache_dir is not None:
+                print(
+                    "Phase 2 startup: fetcher disk cache preserved "
+                    f"files={cleared_disk_cache_files} dir={disk_cache_dir}"
+                )
+            _run_phase2()
+        else:
+            # --phase both: existing single-phase pipeline unchanged.
+            for start in range(0, len(seeds), chunk_size):
+                batch = seeds[start : start + chunk_size]
+                processed_in_batch, success_in_batch = asyncio.run(
+                    _persist_batch_stream(batch)
+                )
+                processed_count += processed_in_batch
+                success_count += success_in_batch
 
-            print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
+                print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
 
-        print(f"Crawled {success_count}/{len(seeds)} stores successfully")
+            print(f"Crawled {success_count}/{len(seeds)} stores successfully")
 
         count_status = getattr(repo, "count_run_store_status", None)
         if callable(count_status):
-            pending = count_status(run_id=resolved_run_id, status="pending")
-            failed = count_status(run_id=resolved_run_id, status="failed")
-            if pending == 0 and failed == 0:
-                state_file = Path(settings.crawl_run_state_path)
-                if state_file.exists():
-                    state_file.unlink()
+            if phase == "1":
+                # Keep the run state file; Phase 2 needs it to find staged data.
+                scraped = count_status(run_id=resolved_run_id, status="scraped")
+                logger.info(
+                    "Phase 1 complete: scraped=%s stores staged for Phase 2 (run_id=%s)",
+                    scraped,
+                    resolved_run_id,
+                )
+            else:
+                pending = count_status(run_id=resolved_run_id, status="pending")
+                scraped = count_status(run_id=resolved_run_id, status="scraped")
+                failed = count_status(run_id=resolved_run_id, status="failed")
+                if pending == 0 and scraped == 0 and failed == 0:
+                    state_file = Path(settings.crawl_run_state_path)
+                    if state_file.exists():
+                        state_file.unlink()
 
         return 0
     finally:
         pass
+
+
+def run_cleanup_runs(run_id: str | None = None) -> int:
+    settings = get_settings()
+    _setup_logging(settings.log_level)
+    repo = SupabaseRestRepository(settings)
+
+    keep_run_id = run_id
+    if not keep_run_id:
+        state_file = Path(settings.crawl_run_state_path)
+        if state_file.exists():
+            keep_run_id = state_file.read_text(encoding="utf-8").strip() or None
+
+    if not keep_run_id:
+        print("No active run ID found. Pass --run-id or ensure .aisley_active_run_id exists.")
+        return 1
+
+    print(f"Cleaning all temporary tables excluding run_id={keep_run_id} ...")
+    purge_other_runs = getattr(repo, "purge_other_runs", None)
+    if callable(purge_other_runs):
+        purge_other_runs(keep_run_id)
+    print("Cleanup complete.")
+    return 0
 
 
 def main() -> int:
@@ -958,12 +1958,17 @@ def main() -> int:
 
     if args.command == "ingest-stores":
         return run_ingest(args.csv)
+    if args.command == "diagnose-staged-runs":
+        return run_diagnose_staged_runs()
+    if args.command == "cleanup-runs":
+        return run_cleanup_runs(getattr(args, "run_id", None))
     if args.command == "crawl-stores":
         return run_crawl(
             args.limit,
             run_id=args.run_id,
             fresh=args.fresh,
-            enforce_preflight=True,
+            phase=args.phase,
+            skip_image_upload=args.skip_image_upload,
         )
 
     return 1

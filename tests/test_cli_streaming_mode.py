@@ -153,6 +153,7 @@ def test_run_crawl_streaming_mode_persists_page_by_page_without_orchestrator_fet
     _FakeRestRepo.inserted_product_ids = []
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "_build_db_first_seeds", lambda _settings, _repo: [seed])
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)

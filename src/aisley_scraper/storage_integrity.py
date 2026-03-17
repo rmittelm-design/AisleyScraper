@@ -1,11 +1,64 @@
 from __future__ import annotations
 
 from collections import deque
+import logging
+import time
 
 import httpx
 
 from aisley_scraper.config import Settings
 from aisley_scraper.storage import StorageUploader
+
+
+logger = logging.getLogger(__name__)
+
+
+def _request_with_retries(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    attempts: int = 4,
+    **kwargs,
+) -> httpx.Response:
+    retry_statuses = {408, 425, 429, 500, 502, 503, 504}
+
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            response = client.request(method, url, **kwargs)
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status not in retry_statuses or attempt >= attempts:
+                raise
+            logger.warning(
+                "Storage integrity request retrying after HTTP %s (%s/%s): %s",
+                status,
+                attempt,
+                attempts,
+                url,
+            )
+        except httpx.RequestError:
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "Storage integrity request retrying after network error (%s/%s): %s",
+                attempt,
+                attempts,
+                url,
+            )
+
+        time.sleep(0.5 * attempt)
+
+    raise RuntimeError("storage integrity request failed without explicit exception")
+
+
+def _response_text(response: httpx.Response) -> str:
+    text = response.text.strip()
+    if len(text) > 500:
+        return text[:497] + "..."
+    return text
 
 
 def iter_linked_object_paths(base: str, headers: dict[str, str], public_prefix: str) -> set[str]:
@@ -15,7 +68,9 @@ def iter_linked_object_paths(base: str, headers: dict[str, str], public_prefix: 
 
     with httpx.Client(timeout=60.0) as client:
         while True:
-            resp = client.get(
+            resp = _request_with_retries(
+                client,
+                "GET",
                 f"{base}/shopify_products",
                 params={
                     "select": "supabase_images",
@@ -24,7 +79,6 @@ def iter_linked_object_paths(base: str, headers: dict[str, str], public_prefix: 
                 },
                 headers=headers,
             )
-            resp.raise_for_status()
             rows = resp.json()
             if not isinstance(rows, list) or not rows:
                 break
@@ -59,16 +113,29 @@ def list_all_storage_objects(base_url: str, bucket: str, headers: dict[str, str]
             page_size = 1000
 
             while True:
-                resp = client.post(
-                    f"{base_url}/storage/v1/object/list/{bucket}",
-                    json={
-                        "prefix": prefix,
-                        "limit": page_size,
-                        "offset": offset,
-                    },
-                    headers=headers,
-                )
-                resp.raise_for_status()
+                try:
+                    resp = _request_with_retries(
+                        client,
+                        "POST",
+                        f"{base_url}/storage/v1/object/list/{bucket}",
+                        json={
+                            "prefix": prefix,
+                            "limit": page_size,
+                            "offset": offset,
+                        },
+                        headers=headers,
+                    )
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 400:
+                        logger.warning(
+                            "Skipping storage prefix after 400 from Supabase list API: bucket=%s prefix=%s offset=%s body=%s",
+                            bucket,
+                            prefix,
+                            offset,
+                            _response_text(exc.response),
+                        )
+                        break
+                    raise
                 items = resp.json()
                 if not isinstance(items, list) or not items:
                     break

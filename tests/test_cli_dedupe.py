@@ -143,6 +143,7 @@ def test_run_crawl_skips_new_unavailable_products(monkeypatch) -> None:
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -160,6 +161,135 @@ def test_run_crawl_skips_new_unavailable_products(monkeypatch) -> None:
     assert exit_code == 0
     assert _FakeRestRepo.inserted_products == ["p-2"]
     assert _FakeUploader.uploaded_for == ["p-2"]
+
+
+def test_run_crawl_skip_image_upload_flag_bypasses_storage_uploads(monkeypatch) -> None:
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+    )
+
+    seed = StoreSeed(store_url="https://example.com")
+    outcome = ScrapeResult(
+        store=StoreProfile(
+            store_name="Example",
+            website="https://example.com",
+            store_type="online",
+        ),
+        products=[
+            ProductRecord(
+                product_id="p-3",
+                product_handle="p-3",
+                item_name="Available Item",
+                description=None,
+                images=["https://cdn.example.com/3.jpg"],
+                unavailable=False,
+            ),
+        ],
+    )
+
+    class _FakeRestRepo:
+        inserted_products: list[ProductRecord] = []
+
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def ensure_schema(self) -> None:
+            return None
+
+        def upsert_store(self, store: StoreProfile) -> int:
+            _ = store
+            return 1
+
+        def get_product_image_state(self, store_id: int, product_id: str):
+            _ = (store_id, product_id)
+            return None
+
+        def upsert_product(self, store_id: int, product: ProductRecord) -> None:
+            _ = store_id
+            self.inserted_products.append(product)
+
+    class _FailUploader:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def upload_product_images(self, image_urls: list[str], store_id: int, product_id: str) -> list[str]:
+            _ = (image_urls, store_id, product_id)
+            raise AssertionError("upload_product_images should not be called when skip_image_upload=True")
+
+        def sync_product_images(
+            self,
+            current_source_urls: list[str],
+            existing_source_urls: list[str],
+            existing_supabase_urls: list[str],
+            store_id: int,
+            product_id: str,
+        ) -> list[str]:
+            _ = (
+                current_source_urls,
+                existing_source_urls,
+                existing_supabase_urls,
+                store_id,
+                product_id,
+            )
+            raise AssertionError("sync_product_images should not be called when skip_image_upload=True")
+
+    class _FakeFetcher:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        async def close(self) -> None:
+            return None
+
+    async def _fake_enrich_gender_probabilities_for_products(
+        *,
+        products: list[ProductRecord],
+        fetcher: object,
+        concurrency: int,
+    ) -> None:
+        _ = (fetcher, concurrency)
+        for product in products:
+            if not product.gender_probs_csv:
+                product.gender_probs_csv = "0.2,0.5,0.3"
+
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+        _ = (products, fetcher, settings)
+        return None
+
+    async def _fake_scrape_many_stream(
+        seeds: list[StoreSeed],
+        _settings: Settings,
+        *,
+        include_postprocess: bool = True,
+    ):
+        _ = (seeds, _settings, include_postprocess)
+        yield (seed, outcome)
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+    monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
+    monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
+    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FailUploader)
+    monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
+    monkeypatch.setattr(cli, "verify_product_images", _fake_verify_product_images)
+    monkeypatch.setattr(
+        cli,
+        "enrich_gender_probabilities_for_products",
+        _fake_enrich_gender_probabilities_for_products,
+    )
+
+    exit_code = cli.run_crawl(limit=None, skip_image_upload=True)
+
+    assert exit_code == 0
+    assert len(_FakeRestRepo.inserted_products) == 1
+    assert _FakeRestRepo.inserted_products[0].product_id == "p-3"
+    assert _FakeRestRepo.inserted_products[0].supabase_images == []
 
 
 def test_run_crawl_falls_back_to_rest_without_db_credentials(monkeypatch) -> None:
@@ -239,6 +369,7 @@ def test_run_crawl_falls_back_to_rest_without_db_credentials(monkeypatch) -> Non
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -361,6 +492,7 @@ def test_run_crawl_backfills_missing_gender_probs_for_existing_product(monkeypat
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -502,6 +634,7 @@ def test_run_crawl_recovers_after_transient_enrich_failure_for_existing_product(
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -615,6 +748,7 @@ def test_run_crawl_marks_store_failed_when_final_upsert_never_succeeds(monkeypat
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -727,6 +861,7 @@ def test_run_crawl_skips_product_when_verifier_removes_all_images(monkeypatch) -
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -850,6 +985,7 @@ def test_run_crawl_deletes_existing_product_when_verifier_empties_images(
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -966,6 +1102,7 @@ def test_run_crawl_repairs_transient_upload_failure_in_finalize(monkeypatch) -> 
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -1082,6 +1219,7 @@ def test_run_crawl_cleans_orphan_uploads_when_final_upsert_fails(monkeypatch) ->
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -1199,6 +1337,7 @@ def test_run_crawl_does_not_upsert_incomplete_finalize_rows(monkeypatch, capsys)
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -1315,6 +1454,7 @@ def test_run_crawl_skips_upsert_for_products_without_images(monkeypatch) -> None
         yield (seed, outcome)
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
@@ -1333,6 +1473,129 @@ def test_run_crawl_skips_upsert_for_products_without_images(monkeypatch) -> None
     assert _FakeRestRepo.upsert_count == 0
     assert _FakeRestRepo.deleted_product_ids == ["no-img-1"]
     assert "https://x.supabase.co/original.jpg" in _FakeUploader.deleted_urls
+
+
+def test_run_crawl_clears_single_phase_fetcher_cache_after_use(monkeypatch) -> None:
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+    )
+
+    seed = StoreSeed(store_url="https://example.com")
+    outcome = ScrapeResult(
+        store=StoreProfile(
+            store_name="Example",
+            website="https://example.com",
+            store_type="online",
+        ),
+        products=[
+            ProductRecord(
+                product_id="cache-1",
+                product_handle="cache-1",
+                item_name="Cache Product",
+                description=None,
+                images=["https://cdn.example.com/cache-1.jpg"],
+                unavailable=False,
+            )
+        ],
+    )
+
+    class _FakeRestRepo:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def ensure_schema(self) -> None:
+            return None
+
+        def upsert_store(self, store: StoreProfile) -> int:
+            _ = store
+            return 1
+
+        def get_product_image_state(self, store_id: int, product_id: str):
+            _ = (store_id, product_id)
+            return None
+
+        def upsert_product(self, store_id: int, product: ProductRecord) -> None:
+            _ = (store_id, product)
+            return None
+
+    class _FakeUploader:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def upload_product_images_from_cache(
+            self,
+            image_urls: list[str],
+            store_id: int,
+            product_id: str,
+            image_bytes_by_url: dict[str, bytes],
+        ) -> list[str]:
+            _ = (image_urls, store_id, product_id, image_bytes_by_url)
+            return [f"https://x.supabase.co/storage/v1/object/public/product-images/{product_id}.jpg"]
+
+    class _FakeFetcher:
+        clear_calls = 0
+
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def get_cached_bytes(self, url: str) -> bytes | None:
+            _ = url
+            return b"cached-image-bytes"
+
+        def clear_cached_bytes(self, urls: list[str] | None = None) -> None:
+            _ = urls
+            type(self).clear_calls += 1
+
+        async def close(self) -> None:
+            return None
+
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+        _ = (products, fetcher, settings)
+        return None
+
+    async def _fake_enrich_gender_probabilities_for_products(
+        *,
+        products: list[ProductRecord],
+        fetcher: object,
+        concurrency: int,
+    ) -> None:
+        _ = (fetcher, concurrency)
+        for product in products:
+            product.gender_probs_csv = "0.2,0.6,0.2"
+
+    async def _fake_scrape_many_stream(
+        seeds: list[StoreSeed],
+        _settings: Settings,
+        *,
+        include_postprocess: bool = True,
+    ):
+        _ = (seeds, _settings, include_postprocess)
+        yield (seed, outcome)
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+    monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [seed])
+    monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
+    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
+    monkeypatch.setattr(cli, "verify_product_images", _fake_verify_product_images)
+    monkeypatch.setattr(
+        cli,
+        "enrich_gender_probabilities_for_products",
+        _fake_enrich_gender_probabilities_for_products,
+    )
+
+    exit_code = cli.run_crawl(limit=1)
+
+    assert exit_code == 0
+    assert _FakeFetcher.clear_calls >= 1
 
 
 def test_run_crawl_db_first_resume_processes_pending_only(monkeypatch) -> None:
@@ -1428,11 +1691,12 @@ def test_run_crawl_db_first_resume_processes_pending_only(monkeypatch) -> None:
             )
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: csv_seeds)
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
-    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: "run-1")
+    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: ("run-1", None))
 
     exit_code = cli.run_crawl(limit=None)
 
@@ -1491,13 +1755,199 @@ def test_run_crawl_enforce_preflight_executes_orphan_gate(monkeypatch) -> None:
         preflight_calls += 1
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "load_store_seeds", lambda path, _settings: [])
     monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
-    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: "run-2")
+    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: ("run-2", None))
     monkeypatch.setattr(cli, "_run_orphan_preflight", _fake_preflight)
 
-    exit_code = cli.run_crawl(limit=None, enforce_preflight=True)
+    exit_code = cli.run_crawl(limit=None)
 
     assert exit_code == 0
     assert preflight_calls == 1
+
+
+def test_run_crawl_phase2_does_not_initialize_new_run(monkeypatch, tmp_path) -> None:
+    state_path = tmp_path / ".aisley_active_run_id"
+    state_path.write_text("run-restore", encoding="utf-8")
+
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        CRAWL_RUN_STATE_PATH=str(state_path),
+    )
+
+    class _FakeRepo:
+        initialize_called = False
+
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def ensure_schema(self) -> None:
+            return None
+
+        def initialize_crawl_run(self, *, run_id: str, websites: list[str]) -> None:
+            _ = (run_id, websites)
+            _FakeRepo.initialize_called = True
+
+        def list_all_staged_run_websites(self, *, run_id: str) -> list[str]:
+            assert run_id == "run-restore"
+            return []
+
+        def count_run_store_status(self, *, run_id: str, status: str) -> int:
+            _ = (run_id, status)
+            return 0
+
+    class _FakeUploader:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+
+    exit_code = cli.run_crawl(limit=None, phase="2")
+
+    assert exit_code == 0
+    assert _FakeRepo.initialize_called is False
+
+
+def test_chunk_products_for_phase2_allows_more_than_ten_products_when_url_budget_allows() -> None:
+    products = [
+        ProductRecord(
+            product_id=f"product-{index}",
+            product_handle=f"product-{index}",
+            item_name=f"Product {index}",
+            description=None,
+            images=[
+                f"https://cdn.example.com/{index}-1.jpg",
+                f"https://cdn.example.com/{index}-2.jpg",
+            ],
+        )
+        for index in range(12)
+    ]
+
+    chunks = cli._chunk_products_for_phase2(
+        products,
+        max_products=50,
+        max_unique_image_urls=40,
+    )
+
+    assert [len(chunk) for chunk in chunks] == [12]
+
+
+def test_chunk_products_for_phase2_respects_unique_url_budget() -> None:
+    products = [
+        ProductRecord(
+            product_id=f"product-{index}",
+            product_handle=f"product-{index}",
+            item_name=f"Product {index}",
+            description=None,
+            images=[
+                f"https://cdn.example.com/{index}-1.jpg",
+                f"https://cdn.example.com/{index}-2.jpg",
+                f"https://cdn.example.com/{index}-3.jpg",
+                f"https://cdn.example.com/{index}-4.jpg",
+                f"https://cdn.example.com/{index}-5.jpg",
+            ],
+        )
+        for index in range(12)
+    ]
+
+    chunks = cli._chunk_products_for_phase2(
+        products,
+        max_products=50,
+        max_unique_image_urls=20,
+    )
+
+    assert [len(chunk) for chunk in chunks] == [4, 4, 4]
+
+
+def test_chunk_products_for_phase2_applies_per_product_image_cap_to_budget() -> None:
+    products = [
+        ProductRecord(
+            product_id=f"product-{index}",
+            product_handle=f"product-{index}",
+            item_name=f"Product {index}",
+            description=None,
+            images=[
+                f"https://cdn.example.com/{index}-1.jpg",
+                f"https://cdn.example.com/{index}-2.jpg",
+                f"https://cdn.example.com/{index}-3.jpg",
+                f"https://cdn.example.com/{index}-4.jpg",
+                f"https://cdn.example.com/{index}-5.jpg",
+                f"https://cdn.example.com/{index}-6.jpg",
+            ],
+        )
+        for index in range(12)
+    ]
+
+    chunks = cli._chunk_products_for_phase2(
+        products,
+        max_products=50,
+        max_unique_image_urls=20,
+        max_images_per_product_for_budget=5,
+    )
+
+    assert [len(chunk) for chunk in chunks] == [4, 4, 4]
+
+
+def test_run_crawl_phase2_warns_for_pending_only_run(monkeypatch, tmp_path, capsys) -> None:
+    state_path = tmp_path / ".aisley_active_run_id"
+    state_path.write_text("run-pending-only", encoding="utf-8")
+
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        CRAWL_RUN_STATE_PATH=str(state_path),
+    )
+
+    class _FakeRepo:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+        def ensure_schema(self) -> None:
+            return None
+
+        def list_all_staged_run_websites(self, *, run_id: str) -> list[str]:
+            assert run_id == "run-pending-only"
+            return []
+
+        def count_run_store_status(self, *, run_id: str, status: str) -> int:
+            assert run_id == "run-pending-only"
+            return {
+                "pending": 12,
+                "scraped": 0,
+                "failed": 0,
+                "completed": 0,
+            }[status]
+
+    class _FakeUploader:
+        def __init__(self, _settings: Settings) -> None:
+            _ = _settings
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+
+    exit_code = cli.run_crawl(limit=None, phase="2")
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "pending=12" in captured.out
+    assert "Phase 2 warning: this run looks like a fresh or phase-1-not-started run" in captured.out

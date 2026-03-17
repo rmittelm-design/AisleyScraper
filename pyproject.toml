@@ -5,6 +5,7 @@ description = "Shopify store intelligence scraper"
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.26,<0.29",
+  "h2>=4.1.0",
   "beautifulsoup4>=4.12.0",
   "pydantic>=2.8.0",
   "pydantic-settings>=2.4.0",
