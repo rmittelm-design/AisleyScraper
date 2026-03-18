@@ -32,7 +32,7 @@ Restart behavior for `crawl-stores`:
 - Use `--run-id <id>` to explicitly resume a specific run.
 - For two-phase resume, `--phase 2` now requires an existing staged run id and will not create a new run implicitly.
 
-Before every crawl run (Supabase mode), orphaned storage objects are checked and auto-cleaned; crawl starts only when no orphans remain.
+Orphaned-storage preflight is currently disabled.
 
 ## Crawl Run Modes
 
@@ -74,9 +74,9 @@ aisley-scraper crawl-stores --skip-image-upload
 
 ## Two-Phase Pipeline (`--phase`)
 
-By default (`--phase both`) the scraper fetches, enriches (image validation + CLIP gender scoring), uploads to storage, and writes to `shopify_stores` / `shopify_products` all in one pass per store.
+By default (`--phase both`) the scraper fetches, enriches (image validation + CLIP gender scoring), and writes to `shopify_stores` / `shopify_products` all in one pass per store.
 
-Use `--skip-image-upload` with `--phase both` or `--phase 2` to bypass image uploads and image sync entirely while still writing product rows.
+Image uploads are currently disabled in runtime configuration, so `--skip-image-upload` is effectively a no-op at the moment.
 
 The `--phase` flag splits this into two independent stages, which lets Phase 1 run at much higher concurrency (no image downloads or CLIP scoring) and keeps `shopify_stores` / `shopify_products` consistent — partial results are never visible to readers until a store is fully enriched.
 
@@ -97,7 +97,7 @@ CRAWL_STORE_BATCH_SIZE=10
 
 ### Phase 2 — enrich and persist
 
-Reads each staged store from the staging tables, runs image validation, CLIP gender scoring, uploads images to Supabase Storage, then writes the fully enriched rows to `shopify_stores` and `shopify_products`. Staging rows are deleted after each successful store. The run id is read automatically from `.aisley_active_run_id` (written by Phase 1), or you can pass `--run-id` explicitly.
+Reads each staged store from the staging tables, runs image validation and CLIP gender scoring (unless fast validation mode is enabled), then writes the enriched rows to `shopify_stores` and `shopify_products`. Staging rows are deleted after each successful store. The run id is read automatically from `.aisley_active_run_id` (written by Phase 1), or you can pass `--run-id` explicitly.
 
 ```bash
 aisley-scraper crawl-stores --phase 2
@@ -115,7 +115,7 @@ Find resumable staged run ids:
 aisley-scraper diagnose-staged-runs
 ```
 
-Before Phase 2 starts, the scraper verifies that no orphaned scraped images remain in storage. Phase 2 progress output includes both fraction and percent complete.
+Phase 2 progress output includes both fraction and percent complete.
 
 If Phase 2 prints a message like `no staged websites to process` together with `pending > 0` and `scraped=0`, that run id is not a resumable staged run. In that case, use `aisley-scraper diagnose-staged-runs` and restart Phase 2 with the correct `--run-id`.
 
@@ -145,10 +145,10 @@ Relevant env settings:
 
 ```
 PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true
-PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD=0.65   # drop products below this product-photo probability
+PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD=0.90   # stricter: drop products below this product-photo probability
 ```
 
-`PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD` must be a float in `[0, 1]`. Higher values are stricter (more products dropped). Start with `0.5` and increase if non-product images are passing through.
+`PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD` must be a float in `[0, 1]`. Higher values are stricter (more products dropped). For this project's current tuning, `0.90` is recommended.
 
 Gender scoring can be backfilled later by re-running Phase 2 with `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=false`.
 
@@ -232,7 +232,7 @@ Recommended preflight checks:
 - Optional: set `FETCHER_BYTE_CACHE_MAX_MB` to cap the in-memory portion of the fetch cache. Default is `256`.
 - Optional: set `PHASE2_UPLOAD_CONCURRENCY` to control Stage 3 upload/sync parallelism in `--phase 2`. Default is `8`.
 - Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true` to skip full image quality checks and gender scoring in Phase 2, checking only whether the first product image looks like a product photo. Products are persisted with `gender_probs_csv = NULL`. Default is `false`.
-- Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD` to control the minimum CLIP product-photo probability required when `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true`. Products below this threshold are dropped. Must be in `[0, 1]`. Default is `0.5`.
+- Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD` to control the minimum CLIP product-photo probability required when `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true`. Products below this threshold are dropped. Must be in `[0, 1]`. Default is `0.5` (current recommended runtime value: `0.90`).
 - Optional: set `HF_TOKEN` to authenticate Hugging Face model downloads (higher limits, fewer unauthenticated warnings).
 - Writes use Supabase REST (`/rest/v1`) with `SUPABASE_SERVICE_ROLE_KEY`.
 
@@ -368,5 +368,5 @@ aisley-scraper crawl-stores --phase 2 --run-id <run-id>
 - Store profile extraction: store name, website, instagram (online), or address (offline).
 - Product extraction: item name, description, `sku`, `price_cents` (integer), `updated_at`, images, sizes/colors/brand only when explicitly present and associated with product image context.
 - Product extraction also includes `gender_label` (`male` / `female` / `unisex`) only when explicitly present in scraped product data.
-- Image persistence: scraped source image URLs are kept in `products.images`, and uploaded Supabase public URLs are stored in `products.supabase_images`.
+- Image persistence: scraped source image URLs are kept in `products.images`. `products.supabase_images` is currently not populated because Phase 2 uploads are disabled.
 - Supabase persistence with idempotent upserts.

@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>README</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    html { -webkit-text-size-adjust: 100%; }
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+</head>
+<body>
+<h1 id="aisley-scraper">Aisley Scraper</h1>
+<p>Env-driven Shopify store scraper that ingests URLs from CSV and
+persists store + product data to Supabase Postgres.</p>
+<h2 id="quick-start">Quick start</h2>
+<ol type="1">
+<li><p>Copy <code>.env.example</code> to <code>.env</code> and fill
+required values.</p></li>
+<li><p>Install dependencies:</p>
+<div class="sourceCode" id="cb1"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install <span class="at">-r</span> requirements.txt</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install <span class="at">-e</span> .</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> check</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="bu">source</span> .venv/bin/activate</span></code></pre></div>
+<p>This installs image-validation dependencies used at runtime,
+including: <code>opencv-python-headless</code> (<code>cv2</code>) and
+<code>google-cloud-vision</code>.</p></li>
+<li><p>Run
+<code>aisley-scraper ingest-stores --csv ./data/stores.csv</code>.</p></li>
+<li><p>Run <code>aisley-scraper crawl-stores</code>.</p></li>
+</ol>
+<p>If you are upgrading an existing deployment, apply migrations in
+order before crawling:</p>
+<ul>
+<li><code>supabase/migrations/20260313120000_add_crawl_store_runs.sql</code></li>
+<li><code>supabase/migrations/20260314000000_add_staging_tables.sql</code></li>
+</ul>
+<p>Restart behavior for <code>crawl-stores</code>:</p>
+<ul>
+<li>Crawl source is DB-first: existing <code>shopify_stores</code> are
+processed first, then unseen CSV stores are appended.</li>
+<li>A run id is persisted in <code>.aisley_active_run_id</code> by
+default, so restarts resume from pending/failed stores in the same
+run.</li>
+<li>Use <code>--fresh</code> to start a new run id.</li>
+<li>Use <code>--run-id &lt;id&gt;</code> to explicitly resume a specific
+run.</li>
+<li>For two-phase resume, <code>--phase 2</code> now requires an
+existing staged run id and will not create a new run implicitly.</li>
+</ul>
+<p>Orphaned-storage preflight is currently disabled.</p>
+<h2 id="crawl-run-modes">Crawl Run Modes</h2>
+<p>Start a new crawl run id:</p>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--fresh</span></span></code></pre></div>
+<p>Resume from the active run id stored at
+<code>CRAWL_RUN_STATE_PATH</code> (default
+<code>.aisley_active_run_id</code>):</p>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores</span></code></pre></div>
+<p>Resume a specific run id explicitly:</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--run-id</span> <span class="op">&lt;</span>run-id<span class="op">&gt;</span></span></code></pre></div>
+<p>List resumable staged runs:</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> diagnose-staged-runs</span></code></pre></div>
+<p>Limit stores in a run (useful for canary runs):</p>
+<div class="sourceCode" id="cb6"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--fresh</span> <span class="at">--limit</span> 50</span></code></pre></div>
+<p>Run crawl and persist products without uploading images to Supabase
+Storage:</p>
+<div class="sourceCode" id="cb7"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--skip-image-upload</span></span></code></pre></div>
+<h2 id="two-phase-pipeline---phase">Two-Phase Pipeline
+(<code>--phase</code>)</h2>
+<p>By default (<code>--phase both</code>) the scraper fetches, enriches
+(image validation + CLIP gender scoring), and writes to
+<code>shopify_stores</code> / <code>shopify_products</code> all in one
+pass per store.</p>
+<p>Image uploads are currently disabled in runtime configuration, so
+<code>--skip-image-upload</code> is effectively a no-op at the
+moment.</p>
+<p>The <code>--phase</code> flag splits this into two independent
+stages, which lets Phase 1 run at much higher concurrency (no image
+downloads or CLIP scoring) and keeps <code>shopify_stores</code> /
+<code>shopify_products</code> consistent — partial results are never
+visible to readers until a store is fully enriched.</p>
+<h3 id="phase-1-scrape-to-staging">Phase 1 — scrape to staging</h3>
+<p>Fetches product JSON from all stores and writes raw data to
+intermediate tables (<code>shopify_stores_staging</code>,
+<code>shopify_products_staging</code>). No images are uploaded, no CLIP
+scoring is performed, and <code>shopify_stores</code> /
+<code>shopify_products</code> are not touched. Each store is marked
+<code>scraped</code> in <code>crawl_store_runs</code> when done.</p>
+<div class="sourceCode" id="cb8"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--phase</span> 1 <span class="at">--fresh</span></span></code></pre></div>
+<p>Safe to run at high concurrency since it only makes lightweight JSON
+requests:</p>
+<pre><code>CRAWL_GLOBAL_CONCURRENCY=20
+CRAWL_STORE_BATCH_SIZE=10</code></pre>
+<h3 id="phase-2-enrich-and-persist">Phase 2 — enrich and persist</h3>
+<p>Reads each staged store from the staging tables, runs image
+validation and CLIP gender scoring (unless fast validation mode is
+enabled), then writes the enriched rows to <code>shopify_stores</code>
+and <code>shopify_products</code>. Staging rows are deleted after each
+successful store. The run id is read automatically from
+<code>.aisley_active_run_id</code> (written by Phase 1), or you can pass
+<code>--run-id</code> explicitly.</p>
+<div class="sourceCode" id="cb10"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--phase</span> 2</span></code></pre></div>
+<p>Resume a specific staged run explicitly:</p>
+<div class="sourceCode" id="cb11"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--phase</span> 2 <span class="at">--run-id</span> <span class="op">&lt;</span>run-id<span class="op">&gt;</span></span></code></pre></div>
+<p>Find resumable staged run ids:</p>
+<div class="sourceCode" id="cb12"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> diagnose-staged-runs</span></code></pre></div>
+<p>Phase 2 progress output includes both fraction and percent
+complete.</p>
+<p>If Phase 2 prints a message like
+<code>no staged websites to process</code> together with
+<code>pending &gt; 0</code> and <code>scraped=0</code>, that run id is
+not a resumable staged run. In that case, use
+<code>aisley-scraper diagnose-staged-runs</code> and restart Phase 2
+with the correct <code>--run-id</code>.</p>
+<p>Tune enrichment concurrency independently of the crawl:</p>
+<pre><code>IMAGE_VALIDATION_CONCURRENCY=6
+PHASE2_UPLOAD_CONCURRENCY=8
+POSTPROCESS_PRODUCT_CHUNK_SIZE=150</code></pre>
+<h4
+id="fast-validation-mode-phase2_first_image_product_validation_only">Fast
+validation mode
+(<code>PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY</code>)</h4>
+<p>By default Phase 2 runs full image validation (size, quality,
+sharpness, CLIP product check) on all images per product, then computes
+CLIP gender probabilities (<code>gender_probs_csv</code>). This can be
+slow under unstable CDN conditions.</p>
+<p>Set <code>PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true</code> to
+enable a lightweight alternative:</p>
+<ul>
+<li>Only the <strong>first image</strong> per product is fetched and
+checked.</li>
+<li>The check is a single CLIP product-photo classifier against a
+configurable threshold
+(<code>PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD</code>, default
+<code>0.5</code>).</li>
+<li>Products whose first image is clearly not a product photo (below
+threshold) are dropped; products with transient fetch/timeout failures
+are preserved.</li>
+<li>Full image quality checks (blur, brightness, sharpness) and size
+checks are <strong>skipped</strong>.</li>
+<li><strong>CLIP gender scoring is skipped entirely.</strong> Products
+are persisted to <code>shopify_products</code> with
+<code>gender_probs_csv = NULL</code>.</li>
+</ul>
+<p>This mode is useful for a fast initial ingestion pass when gender
+scoring is not yet required.</p>
+<p>Relevant env settings:</p>
+<pre><code>PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true
+PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD=0.90   # stricter: drop products below this product-photo probability</code></pre>
+<p><code>PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD</code> must be a
+float in <code>[0, 1]</code>. Higher values are stricter (more products
+dropped). For this project’s current tuning, <code>0.90</code> is
+recommended.</p>
+<p>Gender scoring can be backfilled later by re-running Phase 2 with
+<code>PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=false</code>.</p>
+<h4 id="standalone-filter-for-existing-shopify_products-rows">Standalone
+filter for existing shopify_products rows</h4>
+<p>To apply the same first-image product-photo gate to rows already in
+<code>shopify_products</code> (outside scraping), run:</p>
+<div class="sourceCode" id="cb15"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb15-1"><a href="#cb15-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> filter-shopify-products</span></code></pre></div>
+<p>This command:</p>
+<ul>
+<li>Scans existing <code>shopify_products</code> rows with at least one
+image.</li>
+<li>Validates only the first image using the same product-photo
+classifier.</li>
+<li>Uses <code>PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD</code> as the
+drop threshold.</li>
+<li>Deletes rows whose first-image product probability is below
+threshold.</li>
+<li>Preserves rows on transient fetch/timeout failures.</li>
+</ul>
+<p>Useful flags:</p>
+<div class="sourceCode" id="cb16"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> filter-shopify-products <span class="at">--dry-run</span> <span class="at">--limit</span> 1000 <span class="at">--batch-size</span> 200</span></code></pre></div>
+<p>Disk-backed image cache for Phase 2:</p>
+<pre><code>FETCHER_DISK_CACHE_ENABLED=true
+FETCHER_DISK_CACHE_DIR=.aisley_image_cache
+FETCHER_DISK_CACHE_MAX_MB=2048
+FETCHER_BYTE_CACHE_MAX_MB=256</code></pre>
+<ul>
+<li><code>FETCHER_DISK_CACHE_DIR</code> is defined in <a
+href="src/aisley_scraper/config.py">src/aisley_scraper/config.py</a>
+with default value <code>.aisley_image_cache</code>.</li>
+<li>Phase 2 uses this directory as a temporary on-disk cache for fetched
+image bytes so reuse does not require keeping all bytes in RAM.</li>
+<li><code>FETCHER_DISK_CACHE_MAX_MB</code> sets a hard cap for the
+on-disk cache; oldest cached files are evicted once the directory
+exceeds this size.</li>
+<li>Old cache files from prior runs are cleared automatically at crawl
+startup, and current-run cache files are deleted during normal batch
+cleanup.</li>
+</ul>
+<h3 id="skip-upsert-optimisation">Skip-upsert optimisation</h3>
+<p>Both <code>--phase both</code> and <code>--phase 2</code> skip the DB
+upsert for products whose images and gender scores have not changed
+since the last run — only metadata fields (price, availability, etc.)
+require a write when images are unchanged. This significantly reduces
+Supabase write traffic on re-crawls of large catalogs.</p>
+<h3 id="staging-tables">Staging tables</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Table</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>shopify_stores_staging</code></td>
+<td>Raw store profile per <code>(run_id, website)</code></td>
+</tr>
+<tr>
+<td><code>shopify_products_staging</code></td>
+<td>Raw product rows per <code>(run_id, website, product_id)</code> — no
+<code>supabase_images</code> or <code>gender_probs_csv</code></td>
+</tr>
+</tbody>
+</table>
+<p>Staging rows are automatically removed after a successful Phase 2
+persist, so they never accumulate across runs.</p>
+<h2 id="before-running">Before Running</h2>
+<p>Update these required values in <code>.env</code>:</p>
+<p>Note: <code>.env.example</code> is only a template. Runtime values
+are loaded from <code>.env</code>.</p>
+<ul>
+<li><code>SUPABASE_URL</code>: your Supabase project URL (for example
+<code>https://xxxx.supabase.co</code>).</li>
+<li><code>SUPABASE_SERVICE_ROLE_KEY</code>: backend service role key
+(used for Storage uploads).</li>
+<li><code>SUPABASE_STORAGE_BUCKET</code>: bucket name for uploaded
+product images.</li>
+<li><code>SUPABASE_STORAGE_PATH</code>: folder prefix inside the bucket
+(for example <code>aisley</code>).</li>
+<li><code>PERSISTENCE_TARGET</code>: <code>supabase</code> (default) or
+<code>local</code>.</li>
+<li><code>LOCAL_OUTPUT_PATH</code>: local JSON output path used when
+<code>PERSISTENCE_TARGET=local</code>.</li>
+<li><code>INPUT_CSV_PATH</code>: path to your input CSV file.</li>
+<li><code>USER_AGENT</code> (optional): crawler user agent with contact
+info. Defaults to blank if unset.</li>
+</ul>
+<p>Recommended preflight checks:</p>
+<ul>
+<li>Ensure the storage bucket exists in Supabase and is readable if you
+plan to use public URLs.</li>
+<li>Ensure your CSV has the expected URL column (default
+<code>store_url</code>) or update
+<code>INPUT_CSV_URL_COLUMN</code>.</li>
+<li>Optionally tune crawl parameters
+(<code>CRAWL_GLOBAL_CONCURRENCY</code>,
+<code>CRAWL_STORE_BATCH_SIZE</code>, <code>CRAWL_GLOBAL_QPS</code>)
+before large runs.</li>
+<li>Default concurrency is conservative for long-run stability:
+<code>CRAWL_GLOBAL_CONCURRENCY=15</code>,
+<code>CRAWL_STORE_BATCH_SIZE=3</code>,
+<code>IMAGE_VALIDATION_CONCURRENCY=4</code>.</li>
+<li>If the OS kills the process during heavy runs, try
+<code>CRAWL_STORE_BATCH_SIZE=1</code>,
+<code>CRAWL_GLOBAL_CONCURRENCY=2</code>, and
+<code>IMAGE_VALIDATION_CONCURRENCY=1</code>.</li>
+<li>For very large catalogs, lower
+<code>POSTPROCESS_PRODUCT_CHUNK_SIZE</code> (default <code>200</code>)
+to bound peak memory during image verification and gender enrichment
+batches.</li>
+<li>Optional: set <code>CRAWL_RUN_STATE_PATH</code> to change where the
+active run id is stored (default
+<code>.aisley_active_run_id</code>).</li>
+<li>Optional: set <code>CRAWL_STALL_LOG_INTERVAL_SEC</code> (default
+<code>60</code>) to control how often long-running crawl/persist
+heartbeat warnings are printed; set <code>0</code> to disable.</li>
+<li>Optional: set <code>FETCHER_DISK_CACHE_ENABLED</code> to enable or
+disable the temporary on-disk image cache used during validation/upload
+reuse. Default is <code>true</code>.</li>
+<li>Optional: set <code>FETCHER_DISK_CACHE_DIR</code> to change where
+temporary cached image files are written. Default is
+<code>.aisley_image_cache</code>.</li>
+<li>Optional: set <code>FETCHER_DISK_CACHE_MAX_MB</code> to cap total
+on-disk cached image bytes before oldest files are evicted. Default is
+<code>2048</code>.</li>
+<li>Optional: set <code>FETCHER_BYTE_CACHE_MAX_MB</code> to cap the
+in-memory portion of the fetch cache. Default is <code>256</code>.</li>
+<li>Optional: set <code>PHASE2_UPLOAD_CONCURRENCY</code> to control
+Stage 3 upload/sync parallelism in <code>--phase 2</code>. Default is
+<code>8</code>.</li>
+<li>Optional: set
+<code>PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true</code> to skip
+full image quality checks and gender scoring in Phase 2, checking only
+whether the first product image looks like a product photo. Products are
+persisted with <code>gender_probs_csv = NULL</code>. Default is
+<code>false</code>.</li>
+<li>Optional: set <code>PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD</code>
+to control the minimum CLIP product-photo probability required when
+<code>PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true</code>. Products
+below this threshold are dropped. Must be in <code>[0, 1]</code>.
+Default is <code>0.5</code> (current recommended runtime value:
+<code>0.90</code>).</li>
+<li>Optional: set <code>HF_TOKEN</code> to authenticate Hugging Face
+model downloads (higher limits, fewer unauthenticated warnings).</li>
+<li>Writes use Supabase REST (<code>/rest/v1</code>) with
+<code>SUPABASE_SERVICE_ROLE_KEY</code>.</li>
+</ul>
+<p>Local mode notes:</p>
+<ul>
+<li>Set <code>PERSISTENCE_TARGET=local</code> to skip Supabase writes
+and save results to <code>LOCAL_OUTPUT_PATH</code>.</li>
+<li>In local mode, scraped image URLs are preserved; Supabase image
+upload is not performed.</li>
+</ul>
+<h2 id="troubleshooting">Troubleshooting</h2>
+<h2 id="gcp-redis-pauseresume-runbook">GCP Redis Pause/Resume
+Runbook</h2>
+<p>Use this runbook when you need to temporarily pause Redis and later
+restore it.</p>
+<h3 id="confirm-projectaccount-context">1) Confirm project/account
+context</h3>
+<div class="sourceCode" id="cb18"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="ex">gcloud</span> config list <span class="at">--format</span><span class="op">=</span><span class="st">&#39;text(core.account,core.project,compute.region,compute.zone)&#39;</span></span></code></pre></div>
+<p>Set project explicitly if needed:</p>
+<div class="sourceCode" id="cb19"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb19-1"><a href="#cb19-1" aria-hidden="true" tabindex="-1"></a><span class="ex">gcloud</span> config set project <span class="op">&lt;</span>PROJECT_ID<span class="op">&gt;</span></span></code></pre></div>
+<h3 id="enable-required-apis-one-time">2) Enable required APIs
+(one-time)</h3>
+<div class="sourceCode" id="cb20"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a><span class="ex">gcloud</span> services enable container.googleapis.com <span class="at">--project</span> <span class="op">&lt;</span>PROJECT_ID<span class="op">&gt;</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a><span class="ex">gcloud</span> services enable redis.googleapis.com <span class="at">--project</span> <span class="op">&lt;</span>PROJECT_ID<span class="op">&gt;</span></span></code></pre></div>
+<h3 id="if-redis-runs-as-a-kubernetes-deployment-gke">3) If Redis runs
+as a Kubernetes Deployment (GKE)</h3>
+<p>Get cluster credentials:</p>
+<div class="sourceCode" id="cb21"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb21-1"><a href="#cb21-1" aria-hidden="true" tabindex="-1"></a><span class="ex">gcloud</span> container clusters get-credentials <span class="op">&lt;</span>CLUSTER_NAME<span class="op">&gt;</span> --zone <span class="op">&lt;</span>ZONE<span class="op">&gt;</span> --project <span class="op">&lt;</span>PROJECT_ID<span class="op">&gt;</span></span>
+<span id="cb21-2"><a href="#cb21-2" aria-hidden="true" tabindex="-1"></a><span class="co"># or regional cluster:</span></span>
+<span id="cb21-3"><a href="#cb21-3" aria-hidden="true" tabindex="-1"></a><span class="ex">gcloud</span> container clusters get-credentials <span class="op">&lt;</span>CLUSTER_NAME<span class="op">&gt;</span> --region <span class="op">&lt;</span>REGION<span class="op">&gt;</span> --project <span class="op">&lt;</span>PROJECT_ID<span class="op">&gt;</span></span></code></pre></div>
+<p>Find Redis deployment + namespace:</p>
+<div class="sourceCode" id="cb22"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get deploy <span class="at">-A</span> <span class="kw">|</span> <span class="fu">grep</span> <span class="at">-i</span> redis</span></code></pre></div>
+<p>Pause Redis deployment (scale to zero):</p>
+<div class="sourceCode" id="cb23"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb23-1"><a href="#cb23-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> scale deployment <span class="op">&lt;</span>REDIS_DEPLOYMENT_NAME<span class="op">&gt;</span> --replicas=0 <span class="at">-n</span> <span class="op">&lt;</span>NAMESPACE<span class="op">&gt;</span></span>
+<span id="cb23-2"><a href="#cb23-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> get deploy <span class="op">&lt;</span>REDIS_DEPLOYMENT_NAME<span class="op">&gt;</span> -n <span class="op">&lt;</span>NAMESPACE<span class="op">&gt;</span></span></code></pre></div>
+<p>Restart Redis deployment (restore replicas):</p>
+<div class="sourceCode" id="cb24"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> scale deployment <span class="op">&lt;</span>REDIS_DEPLOYMENT_NAME<span class="op">&gt;</span> --replicas=1 <span class="at">-n</span> <span class="op">&lt;</span>NAMESPACE<span class="op">&gt;</span></span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="ex">kubectl</span> rollout status deployment/<span class="op">&lt;</span>REDIS_DEPLOYMENT_NAME<span class="op">&gt;</span> -n <span class="op">&lt;</span>NAMESPACE<span class="op">&gt;</span></span></code></pre></div>
+<p>If your deployment normally uses more than one replica, restore that
+original count.</p>
+<h3 id="if-redis-runs-as-memorystore-managed-redis">4) If Redis runs as
+Memorystore (managed Redis)</h3>
+<p>List instances in region:</p>
+<div class="sourceCode" id="cb25"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb25-1"><a href="#cb25-1" aria-hidden="true" tabindex="-1"></a><span class="ex">gcloud</span> redis instances list <span class="at">--region</span> <span class="op">&lt;</span>REGION<span class="op">&gt;</span> --project <span class="op">&lt;</span>PROJECT_ID<span class="op">&gt;</span></span></code></pre></div>
+<p>Pause/Resume behavior for Memorystore:</p>
+<ul>
+<li>Memorystore does not support a direct “pause” state like a GKE
+deployment scale-to-zero.</li>
+<li>To stop billing/traffic you typically use maintenance or
+deprovision/recreate workflows (or switch clients away
+temporarily).</li>
+<li>If needed, use application-side pause (disable workers) while
+keeping Memorystore up.</li>
+</ul>
+<h3 id="quick-verification-checklist">5) Quick verification
+checklist</h3>
+<ul>
+<li>GKE pause expected: deployment shows <code>AVAILABLE=0</code> and no
+Redis pods in namespace.</li>
+<li>GKE resume expected: rollout completes and Redis health checks
+pass.</li>
+<li>App checks: queue workers reconnect cleanly and timeout/error rates
+normalize.</li>
+</ul>
+<h3
+id="zsh-killed-aisley-scraper-crawl-stores"><code>zsh: killed aisley-scraper crawl-stores</code></h3>
+<p>This usually means the OS terminated the process due to memory
+pressure (SIGKILL), not a Python exception.</p>
+<ol type="1">
+<li>Re-run with a low-memory profile:</li>
+</ol>
+<div class="sourceCode" id="cb26"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="va">CRAWL_STORE_BATCH_SIZE</span><span class="op">=</span>1 <span class="va">CRAWL_GLOBAL_CONCURRENCY</span><span class="op">=</span>2 <span class="va">IMAGE_VALIDATION_CONCURRENCY</span><span class="op">=</span>1 <span class="ex">aisley-scraper</span> crawl-stores</span></code></pre></div>
+<ol start="2" type="1">
+<li>If you want these defaults for all future runs, add them to
+<code>.env</code>:</li>
+</ol>
+<div class="sourceCode" id="cb27"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb27-1"><a href="#cb27-1" aria-hidden="true" tabindex="-1"></a><span class="va">CRAWL_STORE_BATCH_SIZE</span><span class="op">=</span>1</span>
+<span id="cb27-2"><a href="#cb27-2" aria-hidden="true" tabindex="-1"></a><span class="va">CRAWL_GLOBAL_CONCURRENCY</span><span class="op">=</span>2</span>
+<span id="cb27-3"><a href="#cb27-3" aria-hidden="true" tabindex="-1"></a><span class="va">IMAGE_VALIDATION_CONCURRENCY</span><span class="op">=</span>1</span></code></pre></div>
+<ol start="3" type="1">
+<li>Resume behavior:</li>
+</ol>
+<ul>
+<li>Running <code>aisley-scraper crawl-stores</code> (without
+<code>--fresh</code>) resumes from pending/failed stores in the active
+run id.</li>
+<li>Use <code>--fresh</code> only when you intentionally want to start a
+new run id.</li>
+</ul>
+<h3
+id="phase-2-no-staged-websites-to-process"><code>Phase 2: no staged websites to process</code></h3>
+<p>This means the selected run id has no rows left in
+<code>shopify_stores_staging</code>.</p>
+<p>Common cases:</p>
+<ul>
+<li>Phase 2 already finished and cleaned up staging for that run.</li>
+<li><code>.aisley_active_run_id</code> points at the wrong run id.</li>
+<li>The run id has only <code>pending</code> rows in
+<code>crawl_store_runs</code>, which means it is not a valid Phase 2
+resume target.</li>
+</ul>
+<p>To find the correct staged run id:</p>
+<div class="sourceCode" id="cb28"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> diagnose-staged-runs</span></code></pre></div>
+<p>Then resume explicitly:</p>
+<div class="sourceCode" id="cb29"><pre
+class="sourceCode bash"><code class="sourceCode bash"><span id="cb29-1"><a href="#cb29-1" aria-hidden="true" tabindex="-1"></a><span class="ex">aisley-scraper</span> crawl-stores <span class="at">--phase</span> 2 <span class="at">--run-id</span> <span class="op">&lt;</span>run-id<span class="op">&gt;</span></span></code></pre></div>
+<h2 id="requirements-handled">Requirements handled</h2>
+<ul>
+<li>Store profile extraction: store name, website, instagram (online),
+or address (offline).</li>
+<li>Product extraction: item name, description, <code>sku</code>,
+<code>price_cents</code> (integer), <code>updated_at</code>, images,
+sizes/colors/brand only when explicitly present and associated with
+product image context.</li>
+<li>Product extraction also includes <code>gender_label</code>
+(<code>male</code> / <code>female</code> / <code>unisex</code>) only
+when explicitly present in scraped product data.</li>
+<li>Image persistence: scraped source image URLs are kept in
+<code>products.images</code>. <code>products.supabase_images</code> is
+currently not populated because Phase 2 uploads are disabled.</li>
+<li>Supabase persistence with idempotent upserts.</li>
+</ul>
+</body>
+</html>
