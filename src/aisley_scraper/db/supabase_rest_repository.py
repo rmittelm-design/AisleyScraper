@@ -461,6 +461,95 @@ class SupabaseRestRepository:
             headers={"Prefer": "return=minimal"},
         )
 
+    def list_products_for_first_image_validation_scan(
+        self,
+        *,
+        limit: int,
+        after_id: int | None = None,
+    ) -> list[dict[str, object]]:
+        target_limit = max(1, limit)
+        cursor_id = max(0, after_id) if after_id is not None else None
+        out: list[dict[str, object]] = []
+
+        while len(out) < target_limit:
+            page_limit = min(200, max(50, target_limit - len(out)))
+            params = {
+                "select": "id,store_id,product_id,item_uuid,images",
+                "images": "neq.[]",
+                "order": "id.asc",
+                "limit": str(page_limit),
+            }
+            if cursor_id is not None:
+                params["id"] = f"gt.{cursor_id}"
+
+            response = self._request(
+                "GET",
+                "/shopify_products",
+                params=params,
+            )
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                break
+
+            typed_rows = [row for row in rows if isinstance(row, dict)]
+            max_row_id = max(
+                (int(row_id) for row in typed_rows if isinstance((row_id := row.get("id")), int)),
+                default=cursor_id or 0,
+            )
+            cursor_id = max_row_id
+
+            uuids = [
+                item_uuid
+                for row in typed_rows
+                if isinstance((item_uuid := row.get("item_uuid")), str) and item_uuid
+            ]
+            if not uuids:
+                continue
+
+            # item_embeddings has a composite PK; we only need existence by item_uuid.
+            unique_uuids = sorted(set(uuids))
+            uuid_filter = ",".join(unique_uuids)
+            emb_response = self._request(
+                "GET",
+                "/item_embeddings",
+                params={
+                    "select": "item_uuid",
+                    "item_uuid": f"in.({uuid_filter})",
+                },
+            )
+            emb_rows = emb_response.json()
+            if not isinstance(emb_rows, list) or not emb_rows:
+                continue
+
+            embedded_item_uuids = {
+                item_uuid
+                for row in emb_rows
+                if isinstance(row, dict)
+                if isinstance((item_uuid := row.get("item_uuid")), str)
+            }
+            if not embedded_item_uuids:
+                continue
+
+            for row in typed_rows:
+                row_item_uuid = row.get("item_uuid")
+                if not isinstance(row_item_uuid, str) or row_item_uuid not in embedded_item_uuids:
+                    continue
+                out.append(row)
+                if len(out) >= target_limit:
+                    break
+
+        return out
+
+    def delete_item_embeddings_for_item_uuid(self, item_uuid: str) -> None:
+        self._request(
+            "DELETE",
+            "/item_embeddings",
+            params={
+                "item_uuid": f"eq.{item_uuid}",
+            },
+            headers={"Prefer": "return=minimal"},
+        )
+
     # ── Staging helpers (two-phase pipeline) ─────────────────────────────────
 
     def upsert_staged_store(self, run_id: str, store: StoreProfile) -> None:

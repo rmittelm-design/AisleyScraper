@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter
 import errno
 import gc
 import logging
@@ -15,6 +16,7 @@ from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.orchestrator import scrape_many, scrape_many_stream
 from aisley_scraper.crawl.image_verifier import (
+    evaluate_first_image_product_validation,
     verify_first_image_product_validation,
     verify_product_images,
 )
@@ -144,6 +146,31 @@ def _build_parser() -> argparse.ArgumentParser:
 
     cleanup = sub.add_parser("cleanup-runs", help="Delete all temporary staging rows except the active run")
     cleanup.add_argument("--run-id", required=False, help="Active run ID to keep (default: read from state file)")
+
+    filter_products = sub.add_parser(
+        "filter-shopify-products",
+        help=(
+            "Delete existing shopify_products rows whose first image fails product-photo validation "
+            "below PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD"
+        ),
+    )
+    filter_products.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of rows to scan",
+    )
+    filter_products.add_argument(
+        "--batch-size",
+        type=int,
+        default=200,
+        help="Scan batch size",
+    )
+    filter_products.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report rows that would be deleted without deleting",
+    )
 
     crawl = sub.add_parser("crawl-stores")
     crawl.add_argument("--limit", type=int, default=None)
@@ -362,16 +389,10 @@ def run_crawl(
     cleared_disk_cache_files, disk_cache_dir = _clear_fetcher_disk_cache(settings)
 
     repo = SupabaseRestRepository(settings)
-    upload_images = not skip_image_upload
+    upload_images = False  # Disabled: Phase 2 no longer uploads images to Supabase
 
     try:
         repo.ensure_schema()
-        if upload_images:
-            print("Preflight: checking for orphaned storage objects...")
-            _run_orphan_preflight(settings)
-            print("Preflight: storage orphan check passed.")
-        else:
-            print("Preflight: skipped (--skip-image-upload)")
 
         if phase == "2":
             resolved_run_id = _resolve_existing_run_id(settings.crawl_run_state_path, run_id)
@@ -1952,6 +1973,151 @@ def run_cleanup_runs(run_id: str | None = None) -> int:
     return 0
 
 
+def run_filter_shopify_products_first_image_validation(
+    *,
+    limit: int | None = None,
+    batch_size: int = 200,
+    dry_run: bool = False,
+) -> int:
+    settings = get_settings()
+    _setup_logging(settings.log_level)
+    repo = SupabaseRestRepository(settings)
+
+    effective_batch_size = max(1, int(batch_size))
+    requested_limit = max(0, int(limit)) if limit is not None else None
+    concurrency = max(1, int(settings.image_validation_concurrency))
+    threshold = float(settings.phase2_first_image_product_prob_threshold)
+
+    print(
+        "Filtering shopify_products by first-image product validation "
+        f"(threshold={threshold:.2f}, dry_run={dry_run})..."
+    )
+
+    async def _run_async() -> int:
+        fetcher = Fetcher(settings)
+        try:
+            processed = 0
+            deleted = 0
+            last_id: int | None = None
+            failure_reasons: Counter[str] = Counter()
+
+            while True:
+                if requested_limit is not None and processed >= requested_limit:
+                    break
+
+                fetch_limit = effective_batch_size
+                if requested_limit is not None:
+                    fetch_limit = min(fetch_limit, requested_limit - processed)
+                if fetch_limit <= 0:
+                    break
+
+                list_for_filter_scan = getattr(repo, "list_products_for_first_image_validation_scan", None)
+                if callable(list_for_filter_scan):
+                    rows = list_for_filter_scan(limit=fetch_limit, after_id=last_id)
+                else:
+                    rows = repo.list_products_for_integrity_scan(limit=fetch_limit, offset=processed)
+
+                if not rows:
+                    break
+
+                async def _evaluate_row(
+                    row: dict[str, object],
+                    sem: asyncio.Semaphore,
+                ) -> tuple[str, int | None, int, str, str | None, float | None, str | None]:
+                    row_id_raw = row.get("id")
+                    row_id = int(row_id_raw) if isinstance(row_id_raw, int) else None
+                    store_id_raw = row.get("store_id")
+                    product_id_raw = row.get("product_id")
+                    item_uuid_raw = row.get("item_uuid")
+                    item_uuid = item_uuid_raw if isinstance(item_uuid_raw, str) and item_uuid_raw else None
+                    image_urls_raw = row.get("images")
+
+                    if not isinstance(store_id_raw, int) or not isinstance(product_id_raw, str):
+                        return ("keep", row_id, 0, "", item_uuid, None, "invalid_row")
+
+                    first_image = ""
+                    if isinstance(image_urls_raw, list):
+                        for value in image_urls_raw:
+                            if isinstance(value, str) and value.strip():
+                                first_image = value.strip()
+                                break
+                    if not first_image:
+                        return (
+                            "keep",
+                            row_id,
+                            store_id_raw,
+                            product_id_raw,
+                            item_uuid,
+                            None,
+                            "missing_image",
+                        )
+
+                    keep, reason, product_prob = await evaluate_first_image_product_validation(
+                        image_urls=[first_image],
+                        fetcher=fetcher,
+                        settings=settings,
+                        semaphore=sem,
+                    )
+                    return (
+                        "keep" if keep else "delete",
+                        row_id,
+                        store_id_raw,
+                        product_id_raw,
+                        item_uuid,
+                        product_prob,
+                        reason,
+                    )
+
+                sem = asyncio.Semaphore(concurrency)
+                evaluations = await asyncio.gather(*(_evaluate_row(row, sem) for row in rows))
+
+                deleted_item_embedding_uuids: set[str] = set()
+                for action, row_id, store_id, product_id, item_uuid, product_prob, reason in evaluations:
+                    processed += 1
+                    if row_id is not None and (last_id is None or row_id > last_id):
+                        last_id = row_id
+                    if reason:
+                        failure_reasons[reason] += 1
+                    if action != "delete":
+                        continue
+                    if dry_run:
+                        deleted += 1
+                        continue
+                    repo.delete_product(store_id, product_id)
+                    if item_uuid and item_uuid not in deleted_item_embedding_uuids:
+                        delete_embedding = getattr(repo, "delete_item_embeddings_for_item_uuid", None)
+                        if callable(delete_embedding):
+                            delete_embedding(item_uuid)
+                        deleted_item_embedding_uuids.add(item_uuid)
+                    deleted += 1
+                    logger.info(
+                        "Deleted low-score product row store_id=%s product_id=%s score=%s threshold=%.2f",
+                        store_id,
+                        product_id,
+                        product_prob,
+                        threshold,
+                    )
+
+                print(
+                    "Filter progress: "
+                    f"processed={processed} deleted={deleted} dry_run={dry_run}"
+                )
+
+            summary = (
+                "Filter complete: "
+                f"processed={processed} "
+                f"{'would_delete' if dry_run else 'deleted'}={deleted} "
+                f"threshold={threshold:.2f} "
+                f"failure_reasons={dict(failure_reasons)}"
+            )
+            print(summary)
+            return 0
+        finally:
+            await fetcher.close()
+
+    return asyncio.run(_run_async())
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -1962,6 +2128,12 @@ def main() -> int:
         return run_diagnose_staged_runs()
     if args.command == "cleanup-runs":
         return run_cleanup_runs(getattr(args, "run_id", None))
+    if args.command == "filter-shopify-products":
+        return run_filter_shopify_products_first_image_validation(
+            limit=getattr(args, "limit", None),
+            batch_size=getattr(args, "batch_size", 200),
+            dry_run=getattr(args, "dry_run", False),
+        )
     if args.command == "crawl-stores":
         return run_crawl(
             args.limit,

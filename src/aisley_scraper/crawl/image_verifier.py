@@ -38,6 +38,74 @@ def _filename_from_url(image_url: str) -> str:
     return "image.jpg"
 
 
+async def evaluate_first_image_product_validation(
+    *,
+    image_urls: list[str],
+    fetcher: Fetcher,
+    settings: Settings,
+    semaphore: asyncio.Semaphore | None = None,
+) -> tuple[bool, str | None, float | None]:
+    """Return (keep_product, reason, product_prob) using the Phase-2 first-image rules."""
+    first_image_url = next(
+        (
+            image_url.strip()
+            for image_url in image_urls
+            if image_url and image_url.strip()
+        ),
+        "",
+    )
+    if not first_image_url:
+        return False, "missing_image", None
+
+    threshold = float(settings.phase2_first_image_product_prob_threshold)
+    per_image_timeout_sec = float(settings.image_validation_attempt_timeout_sec)
+
+    try:
+        if semaphore is None:
+            content = await asyncio.wait_for(
+                fetcher.get_bytes(first_image_url),
+                timeout=per_image_timeout_sec,
+            )
+        else:
+            async with semaphore:
+                content = await asyncio.wait_for(
+                    fetcher.get_bytes(first_image_url),
+                    timeout=per_image_timeout_sec,
+                )
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                validate_product_photo_only,
+                content=content,
+                filename=_filename_from_url(first_image_url),
+                min_product_prob=threshold,
+            ),
+            timeout=per_image_timeout_sec,
+        )
+        product_payload = result.get("product") if isinstance(result, dict) else None
+        product_prob = None
+        if isinstance(product_payload, dict):
+            prob = product_payload.get("product_prob")
+            if isinstance(prob, (int, float)):
+                product_prob = float(prob)
+        return True, None, product_prob
+    except asyncio.TimeoutError:
+        return True, "timeout", None
+    except ImageValidationFailure as exc:
+        if exc.code in {"not_a_product_photo", "unsupported_file_type", "invalid_image"}:
+            product_prob = None
+            details = exc.details or {}
+            if isinstance(details, dict):
+                prob = details.get("product_prob")
+                if isinstance(prob, (int, float)):
+                    product_prob = float(prob)
+            return False, exc.code, product_prob
+        return True, exc.code, None
+    except (httpx.HTTPError, TimeoutError):
+        return True, "fetch_error", None
+    except Exception:
+        return True, "task_error", None
+
+
 async def _verify_single_image_url(
     image_url: str,
     fetcher: Fetcher,
@@ -353,43 +421,13 @@ async def verify_first_image_product_validation(
     network_preserved_products = 0
 
     async def _validate_product(product: ProductRecord) -> tuple[ProductRecord, bool, str | None]:
-        first_image_url = next(
-            (
-                image_url.strip()
-                for image_url in product.images
-                if image_url and image_url.strip()
-            ),
-            "",
+        keep, reason, _product_prob = await evaluate_first_image_product_validation(
+            image_urls=product.images,
+            fetcher=fetcher,
+            settings=settings,
+            semaphore=semaphore,
         )
-        if not first_image_url:
-            return product, False, "missing_image"
-
-        try:
-            async with semaphore:
-                content = await asyncio.wait_for(
-                    fetcher.get_bytes(first_image_url),
-                    timeout=per_image_timeout_sec,
-                )
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    validate_product_photo_only,
-                    content=content,
-                    filename=_filename_from_url(first_image_url),
-                    min_product_prob=threshold,
-                ),
-                timeout=per_image_timeout_sec,
-            )
-            return product, True, None
-        except asyncio.TimeoutError:
-            return product, True, "timeout"
-        except ImageValidationFailure as exc:
-            if exc.code in {"not_a_product_photo", "unsupported_file_type", "invalid_image"}:
-                return product, False, exc.code
-            return product, True, exc.code
-        except (httpx.HTTPError, TimeoutError):
-            return product, True, "fetch_error"
-        except Exception:
-            return product, True, "task_error"
+        return product, keep, reason
 
     results = await asyncio.gather(*(_validate_product(product) for product in products))
 

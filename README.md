@@ -152,6 +152,28 @@ PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD=0.65   # drop products below this prod
 
 Gender scoring can be backfilled later by re-running Phase 2 with `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=false`.
 
+#### Standalone filter for existing shopify_products rows
+
+To apply the same first-image product-photo gate to rows already in `shopify_products` (outside scraping), run:
+
+```bash
+aisley-scraper filter-shopify-products
+```
+
+This command:
+
+- Scans existing `shopify_products` rows with at least one image.
+- Validates only the first image using the same product-photo classifier.
+- Uses `PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD` as the drop threshold.
+- Deletes rows whose first-image product probability is below threshold.
+- Preserves rows on transient fetch/timeout failures.
+
+Useful flags:
+
+```bash
+aisley-scraper filter-shopify-products --dry-run --limit 1000 --batch-size 200
+```
+
 Disk-backed image cache for Phase 2:
 
 ```

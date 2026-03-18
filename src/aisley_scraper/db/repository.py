@@ -315,3 +315,67 @@ class Repository:
                     ),
                 )
             conn.commit()
+
+    def list_products_for_first_image_validation_scan(
+        self,
+        *,
+        limit: int,
+        after_id: int | None = None,
+    ) -> list[dict[str, object]]:
+        if after_id is None:
+            sql = """
+                        select id, store_id, product_id, item_uuid, images
+            from shopify_products
+            where images <> '[]'::jsonb
+                            and exists (
+                                select 1
+                                from item_embeddings
+                                where item_embeddings.item_uuid = shopify_products.item_uuid
+                            )
+            order by id asc
+            limit %s;
+            """
+            params: tuple[object, ...] = (max(1, limit),)
+        else:
+            sql = """
+                        select id, store_id, product_id, item_uuid, images
+            from shopify_products
+                        where images <> '[]'::jsonb
+                            and id > %s
+                            and exists (
+                                select 1
+                                from item_embeddings
+                                where item_embeddings.item_uuid = shopify_products.item_uuid
+                            )
+            order by id asc
+            limit %s;
+            """
+            params = (max(0, after_id), max(1, limit))
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+        out: list[dict[str, object]] = []
+        for row in rows:
+            out.append(
+                {
+                    "id": row[0],
+                    "store_id": row[1],
+                    "product_id": row[2],
+                    "item_uuid": str(row[3]) if row[3] is not None else None,
+                    "images": list(row[4] or []),
+                }
+            )
+        return out
+
+    def delete_item_embeddings_for_item_uuid(self, item_uuid: str) -> None:
+        sql = """
+        delete from item_embeddings
+        where item_uuid = %s;
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (item_uuid,))
+            conn.commit()

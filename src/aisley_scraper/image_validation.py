@@ -71,9 +71,9 @@ CLIP_PRODUCT_POSITIVE_PROMPTS = [
 ]
 
 CLIP_PRODUCT_NEGATIVE_PROMPTS = [
-    "a screenshot",
+    "a screenshot of a phone, website, or software interface",
     "a meme",
-    "a selfie",
+    "a selfie or close-up portrait of a person's face",
     "a group photo",
     "a landscape photo",
     "a store logo",
@@ -106,6 +106,24 @@ class ImageValidationFailure(Exception):
         if self.details:
             payload["details"] = self.details
         return payload
+
+
+def _clip_logit_scale(model: object) -> float:
+    logit_scale = getattr(model, "logit_scale", None)
+    if logit_scale is None:
+        return 100.0
+
+    try:
+        scale_value = logit_scale.exp() if hasattr(logit_scale, "exp") else logit_scale
+        if hasattr(scale_value, "item"):
+            scale_value = scale_value.item()
+        scale = float(scale_value)
+    except Exception:
+        return 100.0
+
+    if scale <= 0:
+        return 100.0
+    return scale
 
 
 def _safe_basename(name: str) -> str:
@@ -557,24 +575,38 @@ def product_probability_clip(pil_img) -> dict[str, Any]:
     with torch.no_grad():
         image_features = model.encode_image(image_input)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        logits = (image_features @ text_features.T).squeeze(0)
-        probs = torch.softmax(logits, dim=-1)
+        logit_scale = _clip_logit_scale(model)
+        prompt_logits = (logit_scale * (image_features @ text_features.T)).squeeze(0)
+        prompt_probs = torch.softmax(prompt_logits, dim=-1)
 
-        # Aggregate all product-like prompt probabilities for a more stable score.
-        product_prob = float(probs[:positive_count].sum().item())
-        best_positive_idx = int(torch.argmax(probs[:positive_count]).item())
-        best_negative_idx_local = int(torch.argmax(probs[positive_count:]).item())
-        best_negative_idx = positive_count + best_negative_idx_local
-        product_margin = float(probs[best_positive_idx].item() - probs[best_negative_idx].item())
-        best_idx = int(torch.argmax(probs).item())
-        return {
-            "product_prob": product_prob,
-            "product_margin": product_margin,
-            "best_positive_prompt": prompts[best_positive_idx],
-            "best_negative_prompt": prompts[best_negative_idx],
-            "best_prompt": prompts[best_idx],
-            "probs": {prompts[i]: float(probs[i].item()) for i in range(len(prompts))},
-        }
+    best_positive_idx = int(torch.argmax(prompt_probs[:positive_count]).item())
+    best_negative_idx_local = int(torch.argmax(prompt_probs[positive_count:]).item())
+    best_negative_idx = positive_count + best_negative_idx_local
+    best_idx = int(torch.argmax(prompt_probs).item())
+
+    # Binary score: ratio of best positive prompt probability to best negative.
+    # This is more robust than averaging class feature embeddings, because it is
+    # not fooled by dark/moody images matching an unrelated negative prompt
+    # (e.g. "a meme") when CLIP's dominant match is clearly a positive prompt.
+    max_positive_prob = float(prompt_probs[best_positive_idx].item())
+    max_negative_prob = float(prompt_probs[best_negative_idx].item())
+    denom = max_positive_prob + max_negative_prob
+    product_prob = (max_positive_prob / denom) if denom > 0 else 0.5
+    non_product_prob = 1.0 - product_prob
+    product_margin = max_positive_prob - max_negative_prob
+    return {
+        "product_prob": product_prob,
+        "non_product_prob": non_product_prob,
+        "product_margin": product_margin,
+        "best_positive_prompt": prompts[best_positive_idx],
+        "best_negative_prompt": prompts[best_negative_idx],
+        "best_prompt": prompts[best_idx],
+        "class_probs": {
+            "product": product_prob,
+            "non_product": non_product_prob,
+        },
+        "probs": {prompts[i]: float(prompt_probs[i].item()) for i in range(len(prompts))},
+    }
 
 
 def validate_and_normalize_upload(
