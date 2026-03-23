@@ -1,8 +1,14 @@
 # Aisley Scraper
 
-Env-driven Shopify store scraper that ingests URLs from CSV and persists store + product data to Supabase Postgres.
+Env-driven Shopify store scraper that ingests URLs from TSV and persists store + product data to Supabase Postgres.
 
 ## Quick start
+
+Run all commands from the project root directory:
+
+```bash
+cd /Users/ronimittelman/Desktop/Projects/Projects/AisleyScraper
+```
 
 1. Copy `.env.example` to `.env` and fill required values.
 2. Install dependencies:
@@ -16,7 +22,9 @@ Env-driven Shopify store scraper that ingests URLs from CSV and persists store +
 
 	This installs image-validation dependencies used at runtime, including:
 	`opencv-python-headless` (`cv2`) and `google-cloud-vision`.
-3. Run `aisley-scraper ingest-stores --csv ./data/stores.csv`.
+3. Run `aisley-scraper ingest-stores --csv ./data/NYC_stores.tsv`.
+
+	Note: the CLI flag is still named `--csv` for backward compatibility, but the loader expects tab-delimited TSV input.
 4. Run `aisley-scraper crawl-stores`.
 
 If you are upgrading an existing deployment, apply migrations in order before crawling:
@@ -26,7 +34,7 @@ If you are upgrading an existing deployment, apply migrations in order before cr
 
 Restart behavior for `crawl-stores`:
 
-- Crawl source is DB-first: existing `shopify_stores` are processed first, then unseen CSV stores are appended.
+- Crawl source is DB-first: existing `shopify_stores` are processed first, then unseen TSV stores are appended.
 - A run id is persisted in `.aisley_active_run_id` by default, so restarts resume from pending/failed stores in the same run.
 - Use `--fresh` to start a new run id.
 - Use `--run-id <id>` to explicitly resume a specific run.
@@ -214,13 +222,13 @@ Note: `.env.example` is only a template. Runtime values are loaded from `.env`.
 - `SUPABASE_STORAGE_PATH`: folder prefix inside the bucket (for example `aisley`).
 - `PERSISTENCE_TARGET`: `supabase` (default) or `local`.
 - `LOCAL_OUTPUT_PATH`: local JSON output path used when `PERSISTENCE_TARGET=local`.
-- `INPUT_CSV_PATH`: path to your input CSV file.
+- `INPUT_CSV_PATH`: path to your input TSV file.
 - `USER_AGENT` (optional): crawler user agent with contact info. Defaults to blank if unset.
 
 Recommended preflight checks:
 
 - Ensure the storage bucket exists in Supabase and is readable if you plan to use public URLs.
-- Ensure your CSV has the expected URL column (default `store_url`) or update `INPUT_CSV_URL_COLUMN`.
+- Ensure your TSV has `url` as the first column (or as a header column if `INPUT_CSV_HAS_HEADER=true`).
 - Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_STORE_BATCH_SIZE`, `CRAWL_GLOBAL_QPS`) before large runs.
 - Default concurrency is conservative for long-run stability: `CRAWL_GLOBAL_CONCURRENCY=15`, `CRAWL_STORE_BATCH_SIZE=3`, `IMAGE_VALIDATION_CONCURRENCY=4`.
 - If the OS kills the process during heavy runs, try `CRAWL_STORE_BATCH_SIZE=1`, `CRAWL_GLOBAL_CONCURRENCY=2`, and `IMAGE_VALIDATION_CONCURRENCY=1`.
