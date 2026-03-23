@@ -29,6 +29,8 @@ class Repository:
           store_type text not null check (store_type in ('online','offline')),
           instagram_handle text,
           address text,
+                    lat double precision,
+                    long double precision,
                     scraped boolean not null default true,
           raw jsonb,
           first_seen_at timestamptz default now(),
@@ -63,6 +65,8 @@ class Repository:
         );
 
                 alter table shopify_stores add column if not exists scraped boolean not null default true;
+            alter table shopify_stores add column if not exists lat double precision;
+            alter table shopify_stores add column if not exists long double precision;
         alter table shopify_products add column if not exists gender_label text;
         alter table shopify_products add column if not exists gender_probs_csv text;
         alter table shopify_products add column if not exists price_cents bigint;
@@ -110,13 +114,15 @@ class Repository:
 
     def upsert_store(self, store: StoreProfile) -> int:
         sql = """
-        insert into shopify_stores (website, store_name, store_type, instagram_handle, address, raw)
-        values (%s, %s, %s, %s, %s, %s)
+                insert into shopify_stores (website, store_name, store_type, instagram_handle, address, lat, long, raw)
+                values (%s, %s, %s, %s, %s, %s, %s, %s)
         on conflict (website) do update
           set store_name = case when shopify_stores.store_name is distinct from excluded.store_name then excluded.store_name else shopify_stores.store_name end,
               store_type = case when shopify_stores.store_type is distinct from excluded.store_type then excluded.store_type else shopify_stores.store_type end,
               instagram_handle = case when shopify_stores.instagram_handle is distinct from excluded.instagram_handle then excluded.instagram_handle else shopify_stores.instagram_handle end,
               address = case when shopify_stores.address is distinct from excluded.address then excluded.address else shopify_stores.address end,
+                            lat = case when shopify_stores.lat is distinct from excluded.lat then excluded.lat else shopify_stores.lat end,
+                            long = case when shopify_stores.long is distinct from excluded.long then excluded.long else shopify_stores.long end,
               raw = case when shopify_stores.raw is distinct from excluded.raw then excluded.raw else shopify_stores.raw end,
               last_seen_at = now()
         returning id;
@@ -127,6 +133,8 @@ class Repository:
             "store_type": store.store_type,
             "instagram_handle": store.instagram_handle,
             "address": store.address,
+            "lat": store.lat,
+            "long": store.long,
         }
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -138,6 +146,8 @@ class Repository:
                         store.store_type,
                         store.instagram_handle,
                         store.address,
+                        store.lat,
+                        store.long,
                         json.dumps(payload),
                     ),
                 )
@@ -249,6 +259,10 @@ class Repository:
                     ),
                 )
             conn.commit()
+
+    def upsert_products_batch(self, store_id: int, products: list[ProductRecord]) -> None:
+        for product in products:
+            self.upsert_product(store_id, product)
 
     def delete_product(self, store_id: int, product_id: str) -> None:
         sql = """

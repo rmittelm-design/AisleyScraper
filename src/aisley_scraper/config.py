@@ -80,6 +80,7 @@ class Settings(BaseSettings):
         alias="IMAGE_VALIDATION_QUEUE_MAX_RETRIES",
     )
     phase2_upload_concurrency: int = Field(default=8, alias="PHASE2_UPLOAD_CONCURRENCY")
+    phase2_db_upsert_batch_size: int = Field(default=500, alias="PHASE2_DB_UPSERT_BATCH_SIZE")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
     fetcher_byte_cache_max_mb: int = Field(default=256, alias="FETCHER_BYTE_CACHE_MAX_MB")
     fetcher_disk_cache_enabled: bool = Field(default=True, alias="FETCHER_DISK_CACHE_ENABLED")
@@ -122,6 +123,7 @@ class Settings(BaseSettings):
         "crawl_http_max_keepalive_connections",
         "image_validation_concurrency",
         "phase2_upload_concurrency",
+        "phase2_db_upsert_batch_size",
     )
     @classmethod
     def positive_int(cls, value: int) -> int:

@@ -124,6 +124,7 @@ Tune enrichment concurrency independently of the crawl:
 ```
 IMAGE_VALIDATION_CONCURRENCY=6
 PHASE2_UPLOAD_CONCURRENCY=8
+PHASE2_DB_UPSERT_BATCH_SIZE=500
 POSTPROCESS_PRODUCT_CHUNK_SIZE=150
 ```
 
@@ -231,6 +232,7 @@ Recommended preflight checks:
 - Optional: set `FETCHER_DISK_CACHE_MAX_MB` to cap total on-disk cached image bytes before oldest files are evicted. Default is `2048`.
 - Optional: set `FETCHER_BYTE_CACHE_MAX_MB` to cap the in-memory portion of the fetch cache. Default is `256`.
 - Optional: set `PHASE2_UPLOAD_CONCURRENCY` to control Stage 3 upload/sync parallelism in `--phase 2`. Default is `8`.
+- Optional: set `PHASE2_DB_UPSERT_BATCH_SIZE` to control how many products are upserted per Supabase REST request in Phase 2 Stage 3. Default is `500`.
 - Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true` to skip full image quality checks and gender scoring in Phase 2, checking only whether the first product image looks like a product photo. Products are persisted with `gender_probs_csv = NULL`. Default is `false`.
 - Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD` to control the minimum CLIP product-photo probability required when `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true`. Products below this threshold are dropped. Must be in `[0, 1]`. Default is `0.5` (current recommended runtime value: `0.90`).
 - Optional: set `HF_TOKEN` to authenticate Hugging Face model downloads (higher limits, fewer unauthenticated warnings).

@@ -7,6 +7,8 @@ create table if not exists public.shopify_stores (
   store_type text not null check (store_type in ('online','offline')),
   instagram_handle text,
   address text,
+  lat double precision,
+  long double precision,
   scraped boolean not null default true,
   raw jsonb,
   first_seen_at timestamptz default now(),

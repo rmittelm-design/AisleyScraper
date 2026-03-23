@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class SupabaseRestRepository:
     def __init__(self, settings: Settings) -> None:
         self._base_url = f"{settings.supabase_url.rstrip('/')}/rest/v1"
+        self._phase2_db_upsert_batch_size = max(1, int(settings.phase2_db_upsert_batch_size))
         self._headers = {
             "Authorization": f"Bearer {settings.supabase_service_role_key}",
             "apikey": settings.supabase_service_role_key,
@@ -94,6 +95,66 @@ class SupabaseRestRepository:
             if isinstance(website, str) and website:
                 websites.append(website)
         return websites
+
+    def list_store_profiles(self, *, limit: int = 1000, offset: int = 0) -> list[StoreProfile]:
+        response = self._request(
+            "GET",
+            "/shopify_stores",
+            params={
+                "select": "website,store_name,store_type,instagram_handle,address,lat,long",
+                "order": "id.asc",
+                "limit": str(max(1, limit)),
+                "offset": str(max(0, offset)),
+            },
+        )
+        rows = response.json()
+        if not isinstance(rows, list):
+            return []
+
+        profiles: list[StoreProfile] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            website = row.get("website")
+            store_name = row.get("store_name")
+            store_type = row.get("store_type")
+            if not isinstance(website, str) or not website:
+                continue
+            if not isinstance(store_name, str) or not store_name:
+                continue
+            if not isinstance(store_type, str) or not store_type:
+                continue
+
+            lat = row.get("lat")
+            long = row.get("long")
+            profiles.append(
+                StoreProfile(
+                    website=website,
+                    store_name=store_name,
+                    store_type=store_type,
+                    instagram_handle=row.get("instagram_handle") if isinstance(row.get("instagram_handle"), str) else None,
+                    address=row.get("address") if isinstance(row.get("address"), str) else None,
+                    lat=float(lat) if isinstance(lat, (float, int)) else None,
+                    long=float(long) if isinstance(long, (float, int)) else None,
+                )
+            )
+        return profiles
+
+    def list_all_store_profiles(self) -> list[StoreProfile]:
+        profiles: list[StoreProfile] = []
+        offset = 0
+        page_size = 1000
+
+        while True:
+            batch = self.list_store_profiles(limit=page_size, offset=offset)
+            if not batch:
+                break
+            profiles.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+
+        return profiles
 
     def list_all_store_websites(self) -> list[str]:
         websites: list[str] = []
@@ -269,12 +330,16 @@ class SupabaseRestRepository:
             "store_type": store.store_type,
             "instagram_handle": store.instagram_handle,
             "address": store.address,
+            "lat": store.lat,
+            "long": store.long,
             "raw": {
                 "website": store.website,
                 "store_name": store.store_name,
                 "store_type": store.store_type,
                 "instagram_handle": store.instagram_handle,
                 "address": store.address,
+                "lat": store.lat,
+                "long": store.long,
             },
             "scraped": True,
             "last_seen_at": self._utc_now_iso(),
@@ -379,36 +444,49 @@ class SupabaseRestRepository:
         return out
 
     def upsert_product(self, store_id: int, product: ProductRecord) -> None:
-        payload: dict[str, object] = {
-            "store_id": store_id,
-            "product_id": product.product_id,
-            "product_handle": product.product_handle,
-            "product_url": product.product_url,
-            "item_name": product.item_name,
-            "description": product.description,
-            "sku": product.sku,
-            "updated_at": product.updated_at,
-            "price_cents": product.price_cents,
-            "images": product.images,
-            "supabase_images": product.supabase_images,
-            "gender_label": product.gender_label,
-            "gender_probs_csv": product.gender_probs_csv,
-            "sizes": product.sizes,
-            "colors": product.colors,
-            "brand": product.brand,
-            "product_type": product.product_type,
-            "unavailable": product.unavailable,
-            "scraped": True,
-            "last_seen_at": self._utc_now_iso(),
-        }
+        self.upsert_products_batch(store_id, [product])
 
-        self._request(
-            "POST",
-            "/shopify_products",
-            params={"on_conflict": "store_id,product_id"},
-            json_body=payload,
-            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-        )
+    def upsert_products_batch(self, store_id: int, products: list[ProductRecord]) -> None:
+        if not products:
+            return
+
+        now = self._utc_now_iso()
+        page_size = self._phase2_db_upsert_batch_size
+        for start in range(0, len(products), page_size):
+            chunk = products[start : start + page_size]
+            payload: list[dict[str, object]] = [
+                {
+                    "store_id": store_id,
+                    "product_id": product.product_id,
+                    "product_handle": product.product_handle,
+                    "product_url": product.product_url,
+                    "item_name": product.item_name,
+                    "description": product.description,
+                    "sku": product.sku,
+                    "updated_at": product.updated_at,
+                    "price_cents": product.price_cents,
+                    "images": product.images,
+                    "supabase_images": product.supabase_images,
+                    "gender_label": product.gender_label,
+                    "gender_probs_csv": product.gender_probs_csv,
+                    "sizes": product.sizes,
+                    "colors": product.colors,
+                    "brand": product.brand,
+                    "product_type": product.product_type,
+                    "unavailable": product.unavailable,
+                    "scraped": True,
+                    "last_seen_at": now,
+                }
+                for product in chunk
+            ]
+
+            self._request(
+                "POST",
+                "/shopify_products",
+                params={"on_conflict": "store_id,product_id"},
+                json_body=payload,
+                headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+            )
 
     def delete_product(self, store_id: int, product_id: str) -> None:
         self._request(

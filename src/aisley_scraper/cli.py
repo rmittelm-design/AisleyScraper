@@ -24,13 +24,14 @@ from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
 from aisley_scraper.diagnostics import diagnose_staged_runs
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
 from aisley_scraper.extract.store_profile import classify_store
+from aisley_scraper.geocoding import geocode_address
 from aisley_scraper.gender_probs import (
     enrich_gender_probabilities_for_products,
     one_hot_gender_probs_csv,
 )
 from aisley_scraper.ingest.csv_loader import load_store_seeds
 from aisley_scraper.local_output import write_local_results
-from aisley_scraper.models import ProductRecord, ScrapeResult, StoreSeed
+from aisley_scraper.models import ProductRecord, ScrapeResult, StoreProfile, StoreSeed
 from aisley_scraper.normalize.products import enforce_attribute_policy, normalize_product
 from aisley_scraper.storage import StorageUploader
 from aisley_scraper.storage_integrity import (
@@ -325,6 +326,58 @@ def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
 
 def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreSeed]:
     csv_seeds = _dedupe_seeds_by_domain(load_store_seeds(settings.input_csv_path, settings))
+
+    list_profiles = getattr(repo, "list_all_store_profiles", None)
+    if callable(list_profiles):
+        existing_profiles = list_profiles()
+        existing_by_domain: dict[str, StoreProfile] = {}
+        for profile in existing_profiles:
+            domain = urlparse(profile.website).netloc.strip().lower()
+            if domain and domain not in existing_by_domain:
+                existing_by_domain[domain] = profile
+
+        geocode_cache: dict[str, tuple[float, float] | None] = {}
+        for seed in csv_seeds:
+            if not seed.address:
+                continue
+
+            domain = urlparse(seed.store_url).netloc.strip().lower()
+            if not domain:
+                continue
+
+            existing_profile = existing_by_domain.get(domain)
+            if existing_profile is None:
+                continue
+
+            existing_address = (existing_profile.address or "").strip()
+            if existing_address:
+                continue
+
+            existing_profile.address = seed.address
+
+            cache_key = seed.address.strip().lower()
+            coords = geocode_cache.get(cache_key)
+            if cache_key not in geocode_cache:
+                user_agent = (settings.user_agent or "").strip() or "aisley-scraper/1.0"
+                coords = geocode_address(
+                    seed.address,
+                    user_agent=user_agent,
+                    timeout_sec=float(getattr(settings, "crawl_request_timeout_sec", 25)),
+                )
+                geocode_cache[cache_key] = coords
+
+            if coords is not None:
+                existing_profile.lat, existing_profile.long = coords
+
+            try:
+                repo.upsert_store(existing_profile)
+            except Exception as exc:
+                logger.warning(
+                    "Failed store backfill from TSV address for website=%s: %s",
+                    existing_profile.website,
+                    exc,
+                )
+
     db_websites = _get_store_urls_from_repo(repo)
 
     db_seeds = [StoreSeed(store_url=website) for website in db_websites]
@@ -443,6 +496,31 @@ def run_crawl(
                 seeds = all_seeds
 
         uploader = StorageUploader(settings)
+        geocode_cache: dict[str, tuple[float, float] | None] = {}
+
+        def _apply_store_geocode_if_available(store: StoreProfile) -> None:
+            if not store.address:
+                return
+            if store.lat is not None and store.long is not None:
+                return
+
+            cache_key = store.address.strip().lower()
+            if not cache_key:
+                return
+
+            if cache_key in geocode_cache:
+                coords = geocode_cache[cache_key]
+            else:
+                user_agent = (settings.user_agent or "").strip() or "aisley-scraper/1.0"
+                coords = geocode_address(
+                    store.address,
+                    user_agent=user_agent,
+                    timeout_sec=float(getattr(settings, "crawl_request_timeout_sec", 25)),
+                )
+                geocode_cache[cache_key] = coords
+
+            if coords is not None:
+                store.lat, store.long = coords
 
         success_count = 0
         processed_count = 0
@@ -452,6 +530,7 @@ def run_crawl(
                 print(f"FAIL {seed.store_url}: {outcome}")
                 return False
 
+            _apply_store_geocode_if_available(outcome.store)
             store_id = repo.upsert_store(outcome.store)
             existing_state_by_product_id: dict[
                 str,
@@ -1070,6 +1149,7 @@ def run_crawl(
                 print(f"FAIL {seed.store_url}: {outcome}")
                 return False
             try:
+                _apply_store_geocode_if_available(outcome.store)
                 repo.upsert_staged_store(resolved_run_id, outcome.store)
                 repo.upsert_staged_products(resolved_run_id, seed.store_url, outcome.products)
                 return True
@@ -1192,6 +1272,7 @@ def run_crawl(
                             )
                             if staged_store is None:
                                 raise RuntimeError("staging store row missing")
+                            await asyncio.to_thread(_apply_store_geocode_if_available, staged_store)
                             staged_products = await asyncio.to_thread(
                                 repo.get_staged_products, resolved_run_id, website
                             )
@@ -1223,17 +1304,17 @@ def run_crawl(
                         return not bool(existing_probs or product.gender_probs_csv)
 
                     # ── Stage 3: storage uploads + DB upserts ─────────────────────
-                    async def _finalize_product(
+                    async def _prepare_product_for_upsert(
                         product: ProductRecord, store_id: int, existing_states: dict
-                    ) -> bool:
+                    ) -> tuple[bool, ProductRecord | None]:
                         existing = existing_states.get(product.product_id)
 
                         # New products with no valid images or marked unavailable: skip.
                         if existing is None and (not product.images or product.unavailable):
-                            return True
+                            return True, None
                         # Products whose images were all rejected by validation: skip upsert.
                         if not product.images:
-                            return True
+                            return True, None
 
                         existing_imgs = list(existing[0]) if existing else []
                         existing_supa = list(existing[1]) if existing else []
@@ -1269,7 +1350,7 @@ def run_crawl(
                                         "Upload failed store_id=%s product=%s: %s",
                                         store_id, product.product_id, exc,
                                     )
-                                    return False
+                                    return False, None
                         elif images_unchanged:
                             # Images and upload count match: reuse existing Supabase URLs.
                             product.supabase_images = existing_supa
@@ -1342,38 +1423,59 @@ def run_crawl(
                                 "Skipping upsert: incomplete required fields store_id=%s product=%s",
                                 store_id, product.product_id,
                             )
-                            return False
+                            return False, None
 
                         if allow_null_gender_probs:
                             product.gender_probs_csv = None
 
-                        try:
-                            await asyncio.to_thread(repo.upsert_product, store_id, product)
-                            return True
-                        except Exception as exc:
-                            logger.warning(
-                                "Upsert failed store_id=%s product=%s: %s",
-                                store_id, product.product_id, exc,
-                            )
-                            return False
+                        return True, product
 
                     async def _finalize_store(website: str, store_map: dict[str, tuple]) -> bool:
                         store_id, staged_products, existing_states = store_map[website]
 
                         results = await asyncio.gather(
-                            *[_finalize_product(p, store_id, existing_states) for p in staged_products],
+                            *[
+                                _prepare_product_for_upsert(p, store_id, existing_states)
+                                for p in staged_products
+                            ],
                             return_exceptions=True,
                         )
 
-                        failure_count = sum(
-                            1 for r in results if isinstance(r, Exception) or r is False
-                        )
+                        failure_count = 0
+                        to_upsert: list[ProductRecord] = []
+                        for result in results:
+                            if isinstance(result, Exception):
+                                failure_count += 1
+                                continue
+                            ok, prepared = result
+                            if not ok:
+                                failure_count += 1
+                                continue
+                            if prepared is not None:
+                                to_upsert.append(prepared)
+
                         if failure_count:
                             logger.error(
                                 "Phase 2: %s/%s products failed for %s — staging preserved for retry",
                                 failure_count, len(staged_products), website,
                             )
                             return False
+
+                        if to_upsert:
+                            try:
+                                await asyncio.to_thread(
+                                    repo.upsert_products_batch,
+                                    store_id,
+                                    to_upsert,
+                                )
+                            except Exception as exc:
+                                logger.error(
+                                    "Phase 2: batch upsert failed for %s (%s products): %s",
+                                    website,
+                                    len(to_upsert),
+                                    exc,
+                                )
+                                return False
 
                         await asyncio.to_thread(
                             repo.delete_staged_run_website, resolved_run_id, website

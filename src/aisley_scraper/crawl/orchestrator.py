@@ -17,6 +17,14 @@ from aisley_scraper.normalize.products import normalize_product
 logger = logging.getLogger(__name__)
 
 
+def _apply_seed_store_metadata(store, seed: StoreSeed):
+    if seed.store_name:
+        store.store_name = seed.store_name
+    if seed.address:
+        store.address = seed.address
+    return store
+
+
 async def _fetch_all_products(
     *,
     base: str,
@@ -61,6 +69,7 @@ async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) ->
     base = seed.store_url.rstrip("/")
     homepage = await fetcher.get_text(base)
     store = classify_store(homepage, base, settings)
+    store = _apply_seed_store_metadata(store, seed)
 
     extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
     await verify_product_images(products=extracted, fetcher=fetcher, settings=settings)
@@ -106,6 +115,7 @@ async def scrape_many_stream(
                 base = seed.store_url.rstrip("/")
                 homepage = await fetcher.get_text(base)
                 store = classify_store(homepage, base, settings)
+                store = _apply_seed_store_metadata(store, seed)
 
                 extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
                 products = [normalized for p in extracted if p.images if (normalized := normalize_product(p)) is not None]

@@ -9,6 +9,8 @@ class StoreSeed:
     store_url: str
     source_id: str | None = None
     notes: str | None = None
+    store_name: str | None = None
+    address: str | None = None
 
 
 @dataclass(slots=True)
@@ -18,6 +20,8 @@ class StoreProfile:
     store_type: str
     instagram_handle: str | None = None
     address: str | None = None
+    lat: float | None = None
+    long: float | None = None
 
 
 @dataclass(slots=True)

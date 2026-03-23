@@ -211,3 +211,42 @@ def test_scrape_many_stream_surfaces_postprocess_errors(monkeypatch) -> None:
     _seed, outcome = asyncio.run(_collect())
 
     assert isinstance(outcome, Exception)
+
+
+def test_scrape_store_uses_seed_name_and_address_when_present(monkeypatch) -> None:
+    settings = _settings()
+    seed = StoreSeed(
+        store_url="https://example.com",
+        store_name="Seeded Name",
+        address="Seeded Address",
+    )
+
+    def _fake_classify_store(_homepage: str, base: str, _settings: Settings) -> StoreProfile:
+        _ = _settings
+        return StoreProfile(
+            store_name="Extracted Name",
+            website=base,
+            store_type="online",
+            address="Extracted Address",
+        )
+
+    async def _fake_verify_product_images(*, products, fetcher, settings):
+        _ = (products, fetcher, settings)
+        return None
+
+    async def _fake_enrich_gender_probabilities_for_products(*, products, fetcher, concurrency):
+        _ = (products, fetcher, concurrency)
+        return None
+
+    monkeypatch.setattr(orchestrator, "classify_store", _fake_classify_store)
+    monkeypatch.setattr(orchestrator, "verify_product_images", _fake_verify_product_images)
+    monkeypatch.setattr(
+        orchestrator,
+        "enrich_gender_probabilities_for_products",
+        _fake_enrich_gender_probabilities_for_products,
+    )
+
+    result = asyncio.run(orchestrator.scrape_store(seed, settings, _FakeFetcher(settings)))
+
+    assert result.store.store_name == "Seeded Name"
+    assert result.store.address == "Seeded Address"
