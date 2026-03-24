@@ -175,6 +175,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     crawl = sub.add_parser("crawl-stores")
     crawl.add_argument("--limit", type=int, default=None)
+    crawl.add_argument("--csv", required=False, help="Override INPUT_CSV_PATH from .env")
     crawl.add_argument("--run-id", required=False)
     crawl.add_argument("--fresh", action="store_true")
     crawl.add_argument(
@@ -327,10 +328,11 @@ def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
 def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreSeed]:
     csv_seeds = _dedupe_seeds_by_domain(load_store_seeds(settings.input_csv_path, settings))
 
+    existing_by_domain: dict[str, StoreProfile] = {}
     list_profiles = getattr(repo, "list_all_store_profiles", None)
     if callable(list_profiles):
         existing_profiles = list_profiles()
-        existing_by_domain: dict[str, StoreProfile] = {}
+        existing_by_domain = {}
         for profile in existing_profiles:
             domain = urlparse(profile.website).netloc.strip().lower()
             if domain and domain not in existing_by_domain:
@@ -378,9 +380,24 @@ def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreS
                     exc,
                 )
 
+    # Build a domain → address map from the CSV (the authoritative address source),
+    # falling back to whatever the DB has if the domain isn't in the CSV.
+    csv_address_by_domain: dict[str, str | None] = {}
+    for seed in csv_seeds:
+        domain = urlparse(seed.store_url).netloc.strip().lower()
+        if domain:
+            csv_address_by_domain[domain] = seed.address
+
     db_websites = _get_store_urls_from_repo(repo)
 
-    db_seeds = [StoreSeed(store_url=website) for website in db_websites]
+    db_seeds = []
+    for website in db_websites:
+        domain = urlparse(website).netloc.strip().lower()
+        address: str | None = csv_address_by_domain.get(domain)
+        if not address:
+            existing = existing_by_domain.get(domain)
+            address = existing.address if existing else None
+        db_seeds.append(StoreSeed(store_url=website, address=address))
     db_seeds = _dedupe_seeds_by_domain(db_seeds)
 
     seen_domains = {urlparse(seed.store_url).netloc.strip().lower() for seed in db_seeds}
@@ -413,8 +430,11 @@ def run_crawl(
     fresh: bool = False,
     phase: str = "both",
     skip_image_upload: bool = False,
+    csv_path: str | None = None,
 ) -> int:
     settings = get_settings()
+    if csv_path:
+        settings.input_csv_path = csv_path
     _setup_logging(settings.log_level)
     allow_null_gender_probs = settings.phase2_first_image_product_validation_only
 
@@ -442,7 +462,7 @@ def run_crawl(
     cleared_disk_cache_files, disk_cache_dir = _clear_fetcher_disk_cache(settings)
 
     repo = SupabaseRestRepository(settings)
-    upload_images = False  # Disabled: Phase 2 no longer uploads images to Supabase
+    upload_images = not skip_image_upload
 
     try:
         repo.ensure_schema()
@@ -452,7 +472,11 @@ def run_crawl(
             all_seeds: list[StoreSeed] = []
             seeds: list[StoreSeed] = []
         else:
-            all_seeds = _build_db_first_seeds(settings, repo)
+            if csv_path:
+                # Explicit --csv: use only those stores, don't merge with DB.
+                all_seeds = _dedupe_seeds_by_domain(load_store_seeds(csv_path, settings))
+            else:
+                all_seeds = _build_db_first_seeds(settings, repo)
             all_seeds = _dedupe_seeds_by_domain(all_seeds)
             if limit is not None:
                 all_seeds = all_seeds[:limit]
@@ -1999,6 +2023,9 @@ def run_crawl(
 
             return processed_in_batch, success_in_batch
 
+        if phase not in ("1", "2"):
+            _run_orphan_preflight(settings)
+
         if phase == "1":
             if disk_cache_dir is not None:
                 print(
@@ -2243,6 +2270,7 @@ def main() -> int:
             fresh=args.fresh,
             phase=args.phase,
             skip_image_upload=args.skip_image_upload,
+            csv_path=getattr(args, "csv", None),
         )
 
     return 1

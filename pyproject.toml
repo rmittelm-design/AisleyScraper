@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Shopify store intelligence scraper"
 requires-python = ">=3.11"
 dependencies = [
+  "curl-cffi>=0.13.0",
   "httpx>=0.26,<0.29",
   "h2>=4.1.0",
   "beautifulsoup4>=4.12.0",

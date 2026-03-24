@@ -1,4 +1,5 @@
 from aisley_scraper import geocoding
+from geopy.exc import GeopyError
 
 
 class _FakeLocation:
@@ -40,7 +41,56 @@ def test_geocode_address_returns_none_when_not_found(monkeypatch) -> None:
             _ = (query, exactly_one, timeout, kwargs)
             return None
 
+    class _FakePhoton:
+        def __init__(self, *, user_agent: str) -> None:
+            _ = user_agent
+
+        def geocode(self, query: str, exactly_one: bool, timeout: float, **kwargs):
+            _ = (query, exactly_one, timeout, kwargs)
+            return None
+
+    class _FakeArcGIS:
+        def geocode(self, query: str, exactly_one: bool, timeout: float, **kwargs):
+            _ = (query, exactly_one, timeout, kwargs)
+            return None
+
     monkeypatch.setattr(geocoding, "Nominatim", _FakeNominatim)
+    monkeypatch.setattr(geocoding, "Photon", _FakePhoton)
+    monkeypatch.setattr(geocoding, "ArcGIS", lambda: _FakeArcGIS())
 
     coords = geocoding.geocode_address("Unknown Place", user_agent="aisley-test-agent")
     assert coords is None
+
+
+def test_geocode_address_falls_back_when_primary_provider_errors(monkeypatch) -> None:
+    class _FailingNominatim:
+        def __init__(self, *, user_agent: str) -> None:
+            assert user_agent == "aisley-test-agent"
+
+        def geocode(self, query: str, exactly_one: bool, timeout: float, **kwargs):
+            _ = (query, exactly_one, timeout, kwargs)
+            raise GeopyError("blocked")
+
+    class _EmptyPhoton:
+        def __init__(self, *, user_agent: str) -> None:
+            assert user_agent == "aisley-test-agent"
+
+        def geocode(self, query: str, exactly_one: bool, timeout: float, **kwargs):
+            _ = (query, exactly_one, timeout, kwargs)
+            return None
+
+    class _WorkingArcGIS:
+        def geocode(self, query: str, exactly_one: bool, timeout: float, **kwargs):
+            _ = (query, exactly_one, timeout, kwargs)
+            return _FakeLocation(37.422, -122.084)
+
+    monkeypatch.setattr(geocoding, "Nominatim", _FailingNominatim)
+    monkeypatch.setattr(geocoding, "Photon", _EmptyPhoton)
+    monkeypatch.setattr(geocoding, "ArcGIS", lambda: _WorkingArcGIS())
+
+    coords = geocoding.geocode_address(
+        "1600 Amphitheatre Parkway, Mountain View, CA",
+        user_agent="aisley-test-agent",
+    )
+
+    assert coords == (37.422, -122.084)

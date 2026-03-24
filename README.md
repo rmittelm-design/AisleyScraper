@@ -35,12 +35,13 @@ If you are upgrading an existing deployment, apply migrations in order before cr
 Restart behavior for `crawl-stores`:
 
 - Crawl source is DB-first: existing `shopify_stores` are processed first, then unseen TSV stores are appended.
+- Use `--csv <path>` with `crawl-stores` to run Phase 1 from that TSV only (no DB-first merge).
 - A run id is persisted in `.aisley_active_run_id` by default, so restarts resume from pending/failed stores in the same run.
 - Use `--fresh` to start a new run id.
 - Use `--run-id <id>` to explicitly resume a specific run.
 - For two-phase resume, `--phase 2` now requires an existing staged run id and will not create a new run implicitly.
 
-Orphaned-storage preflight is currently disabled.
+Orphaned-storage preflight runs only for `--phase both`.
 
 ## Crawl Run Modes
 
@@ -84,13 +85,17 @@ aisley-scraper crawl-stores --skip-image-upload
 
 By default (`--phase both`) the scraper fetches, enriches (image validation + CLIP gender scoring), and writes to `shopify_stores` / `shopify_products` all in one pass per store.
 
-Image uploads are currently disabled in runtime configuration, so `--skip-image-upload` is effectively a no-op at the moment.
+Image uploads are enabled by default in `--phase both` and `--phase 2`; use `--skip-image-upload` to disable uploads for that run.
 
 The `--phase` flag splits this into two independent stages, which lets Phase 1 run at much higher concurrency (no image downloads or CLIP scoring) and keeps `shopify_stores` / `shopify_products` consistent — partial results are never visible to readers until a store is fully enriched.
 
 ### Phase 1 — scrape to staging
 
 Fetches product JSON from all stores and writes raw data to intermediate tables (`shopify_stores_staging`, `shopify_products_staging`). No images are uploaded, no CLIP scoring is performed, and `shopify_stores` / `shopify_products` are not touched. Each store is marked `scraped` in `crawl_store_runs` when done.
+
+Important: Phase 1 relies on each store exposing a public Shopify JSON endpoint at `/products.json`.
+If a site returns `404` or `410` for `/products.json`, that store is marked `failed` for the run and is not staged.
+This can happen even when the homepage URL opens normally in a browser.
 
 ```bash
 aisley-scraper crawl-stores --phase 1 --fresh
@@ -223,7 +228,8 @@ Note: `.env.example` is only a template. Runtime values are loaded from `.env`.
 - `PERSISTENCE_TARGET`: `supabase` (default) or `local`.
 - `LOCAL_OUTPUT_PATH`: local JSON output path used when `PERSISTENCE_TARGET=local`.
 - `INPUT_CSV_PATH`: path to your input TSV file.
-- `USER_AGENT` (optional): crawler user agent with contact info. Defaults to blank if unset.
+- `USER_AGENT` (optional): crawler user agent with contact info. If unset, the crawler uses a browser-like default user agent.
+- `USER_AGENT` (optional): crawler user agent with contact info. If unset, the crawler uses a browser-like default user agent.
 
 Recommended preflight checks:
 
@@ -373,10 +379,34 @@ Then resume explicitly:
 aisley-scraper crawl-stores --phase 2 --run-id <run-id>
 ```
 
+### `Phase 1 complete: X/46 stores staged successfully`
+
+When this number is below the TSV row count, check run status counts:
+
+```bash
+python - <<'PY'
+from aisley_scraper.config import get_settings
+from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
+
+repo = SupabaseRestRepository(get_settings())
+run_id = "<run-id>"
+for status in ["pending", "scraped", "failed", "completed"]:
+	print(status, repo.count_run_store_status(run_id=run_id, status=status))
+PY
+```
+
+Typical interpretation:
+
+- `scraped = N` means `N` stores were staged successfully.
+- `failed = M` means `M` stores failed before staging (often `/products.json` returns `404` or `410`).
+- `pending = 0` means the run is complete for all input stores.
+
+If you need all rows to stage, remove known non-`/products.json` domains from the TSV or add a separate HTML/JSON-LD fallback extractor.
+
 ## Requirements handled
 
 - Store profile extraction: store name, website, instagram (online), or address (offline).
 - Product extraction: item name, description, `sku`, `price_cents` (integer), `updated_at`, images, sizes/colors/brand only when explicitly present and associated with product image context.
 - Product extraction also includes `gender_label` (`male` / `female` / `unisex`) only when explicitly present in scraped product data.
-- Image persistence: scraped source image URLs are kept in `products.images`. `products.supabase_images` is currently not populated because Phase 2 uploads are disabled.
+- Image persistence: scraped source image URLs are kept in `products.images`. `products.supabase_images` is populated during Phase 2 unless `--skip-image-upload` is used.
 - Supabase persistence with idempotent upserts.

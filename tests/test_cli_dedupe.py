@@ -118,6 +118,10 @@ def test_run_crawl_skips_new_unavailable_products(monkeypatch) -> None:
         async def close(self) -> None:
             return None
 
+        def get_cached_bytes(self, url: str) -> bytes | None:
+            _ = url
+            return None
+
     async def _fake_enrich_gender_probabilities_for_products(
         *,
         products: list[ProductRecord],
@@ -244,6 +248,10 @@ def test_run_crawl_skip_image_upload_flag_bypasses_storage_uploads(monkeypatch) 
             _ = _settings
 
         async def close(self) -> None:
+            return None
+
+        def get_cached_bytes(self, url: str) -> bytes | None:
+            _ = url
             return None
 
     async def _fake_enrich_gender_probabilities_for_products(
@@ -1078,6 +1086,10 @@ def test_run_crawl_repairs_transient_upload_failure_in_finalize(monkeypatch) -> 
         async def close(self) -> None:
             return None
 
+        def get_cached_bytes(self, url: str) -> bytes | None:
+            _ = url
+            return None
+
     async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
         _ = (products, fetcher, settings)
         return None
@@ -1193,6 +1205,10 @@ def test_run_crawl_cleans_orphan_uploads_when_final_upsert_fails(monkeypatch) ->
             _ = _settings
 
         async def close(self) -> None:
+            return None
+
+        def get_cached_bytes(self, url: str) -> bytes | None:
+            _ = url
             return None
 
     async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
@@ -1311,6 +1327,10 @@ def test_run_crawl_does_not_upsert_incomplete_finalize_rows(monkeypatch, capsys)
             _ = _settings
 
         async def close(self) -> None:
+            return None
+
+        def get_cached_bytes(self, url: str) -> bytes | None:
+            _ = url
             return None
 
     async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):

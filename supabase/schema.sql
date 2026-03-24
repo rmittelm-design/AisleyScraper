@@ -55,6 +55,8 @@ create table if not exists public.shopify_stores_staging (
   store_type       text not null check (store_type in ('online', 'offline')),
   instagram_handle text,
   address          text,
+  lat              double precision,
+  long             double precision,
   raw              jsonb,
   scraped_at       timestamptz not null default now(),
   unique (run_id, website)

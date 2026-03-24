@@ -102,6 +102,12 @@ def _extract_explicit_gender_label(prod: dict[str, Any]) -> str | None:
     return None
 
 
+def _extract_gender_from_item_name(item_name: Any) -> str | None:
+    if not isinstance(item_name, str):
+        return None
+    return _normalize_gender_token(item_name)
+
+
 def _normalize_product_type_and_gender(value: Any) -> tuple[str | None, str | None]:
     if value is None:
         return None, None
@@ -302,7 +308,8 @@ def extract_products_from_products_json(
 
         product_type, gender_from_product_type = _normalize_product_type_and_gender(prod.get("product_type"))
         explicit_gender = _extract_explicit_gender_label(prod)
-        gender_label = explicit_gender or gender_from_product_type
+        gender_from_item_name = _extract_gender_from_item_name(prod.get("title"))
+        gender_label = explicit_gender or gender_from_product_type or gender_from_item_name
 
         out.append(
             ProductRecord(

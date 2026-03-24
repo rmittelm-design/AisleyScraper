@@ -5,12 +5,14 @@ import hashlib
 import json
 import logging
 import random
+import time
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from curl_cffi import requests as curl_cffi_requests
 
 from aisley_scraper.config import Settings
 
@@ -26,6 +28,7 @@ class Fetcher:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._logger = logging.getLogger(__name__)
+        self._request_user_agent = (settings.user_agent or "").strip() or _BROWSER_USER_AGENT
         timeout = httpx.Timeout(
             connect=settings.crawl_connect_timeout_sec,
             read=settings.crawl_request_timeout_sec,
@@ -43,7 +46,7 @@ class Fetcher:
                 limits=limits,
                 http2=http2_enabled,
                 follow_redirects=True,
-                headers={"User-Agent": settings.user_agent},
+                headers={"User-Agent": self._request_user_agent},
             )
         except ImportError as exc:
             if not http2_enabled:
@@ -56,7 +59,7 @@ class Fetcher:
                 limits=limits,
                 http2=False,
                 follow_redirects=True,
-                headers={"User-Agent": settings.user_agent},
+                headers={"User-Agent": self._request_user_agent},
             )
         # Secondary client with HTTP/1.1 and browser-like headers for image fallback fetches.
         self._image_fallback_client = httpx.AsyncClient(
@@ -84,9 +87,21 @@ class Fetcher:
         self._disk_cache_dir = Path(self._settings.fetcher_disk_cache_dir)
         self._disk_cache_max_bytes = max(0, int(self._settings.fetcher_disk_cache_max_mb)) * 1024 * 1024
         self._jitter_lock = asyncio.Lock()
+        self._rate_limit_lock = asyncio.Lock()
+        self._next_global_request_at = 0.0
         self._long_jitter_request_countdown = self._next_long_jitter_countdown()
         if self._disk_cache_enabled:
             self._disk_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _reserve_global_request_delay(self, now: float) -> float:
+        qps = max(0, int(self._settings.crawl_global_qps))
+        if qps <= 0:
+            self._next_global_request_at = now
+            return 0.0
+
+        scheduled_at = max(now, self._next_global_request_at)
+        self._next_global_request_at = scheduled_at + (1.0 / qps)
+        return max(0.0, scheduled_at - now)
 
     def _next_long_jitter_countdown(self) -> int:
         min_requests = max(0, int(self._settings.crawl_long_jitter_every_min_requests))
@@ -103,9 +118,14 @@ class Fetcher:
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
     async def _apply_jitter(self) -> None:
-        """Apply random jitter delay before fetch requests to avoid rate limiting."""
+        """Apply global pacing and random jitter before fetch requests."""
+        async with self._rate_limit_lock:
+            rate_delay_sec = self._reserve_global_request_delay(time.monotonic())
+
         jitter_ms = max(0, int(self._settings.crawl_jitter_ms))
-        delay_sec = random.uniform(0, jitter_ms / 1000.0) if jitter_ms > 0 else 0.0
+        delay_sec = rate_delay_sec
+        if jitter_ms > 0:
+            delay_sec += random.uniform(0, jitter_ms / 1000.0)
 
         async with self._jitter_lock:
             if self._long_jitter_request_countdown > 0:
@@ -116,6 +136,27 @@ class Fetcher:
 
         if delay_sec > 0:
             await asyncio.sleep(delay_sec)
+
+    @staticmethod
+    def _default_referer(url: str) -> str:
+        domain = urlparse(url).netloc
+        return f"https://{domain}/" if domain else "https://www.google.com/"
+
+    def _text_request_headers(self, url: str) -> dict[str, str]:
+        return {
+            "User-Agent": self._request_user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": self._default_referer(url),
+        }
+
+    def _json_request_headers(self, url: str) -> dict[str, str]:
+        return {
+            "User-Agent": self._request_user_agent,
+            "Accept": "application/json,text/javascript,*/*;q=0.1",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": self._default_referer(url),
+        }
 
     def _disk_cache_path_for_url(self, url: str) -> Path:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
@@ -206,7 +247,7 @@ class Fetcher:
         accept: str | None = None,
     ) -> bytes:
         # Some targets block python clients while allowing curl/browser traffic.
-        effective_user_agent = user_agent or self._settings.user_agent or "Mozilla/5.0"
+        effective_user_agent = user_agent or self._request_user_agent or "Mozilla/5.0"
         args = [
             "curl",
             "-sSL",
@@ -221,6 +262,7 @@ class Fetcher:
             args.extend(["-e", referer])
         if accept:
             args.extend(["-H", f"Accept: {accept}"])
+        args.extend(["-H", "Accept-Language: en-US,en;q=0.9"])
         args.append(url)
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -232,6 +274,25 @@ class Fetcher:
             err = stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"curl fallback failed for {url}: {err}")
         return stdout
+
+    async def _curl_cffi_get_json(self, url: str) -> dict[str, Any]:
+        headers = self._json_request_headers(url)
+
+        def _request() -> dict[str, Any]:
+            response = curl_cffi_requests.get(
+                url,
+                impersonate="chrome124",
+                timeout=max(1, self._settings.crawl_request_timeout_sec),
+                headers=headers,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                return payload
+            return {}
+
+        return await asyncio.to_thread(_request)
 
     @staticmethod
     def _should_use_curl_fallback(exc: Exception) -> bool:
@@ -262,32 +323,80 @@ class Fetcher:
         async with self._domain_semaphores[domain]:
             await self._apply_jitter()
             try:
-                response = await self._client.get(url)
+                response = await self._client.get(url, headers=self._text_request_headers(url))
                 response.raise_for_status()
                 return response.text
             except Exception as exc:
                 if not self._should_use_curl_fallback(exc):
                     raise
                 self._logger.info("Using curl fallback for %s", url)
-                return (await self._curl_fetch(url)).decode("utf-8", errors="replace")
+                return (
+                    await self._curl_fetch(
+                        url,
+                        user_agent=_BROWSER_USER_AGENT,
+                        referer=self._default_referer(url),
+                        accept=self._text_request_headers(url)["Accept"],
+                    )
+                ).decode("utf-8", errors="replace")
 
     async def get_json(self, url: str) -> dict[str, Any]:
         domain = urlparse(url).netloc
         async with self._domain_semaphores[domain]:
             await self._apply_jitter()
+            curl_cffi_exc: Exception | None = None
+            curl_exc: Exception | None = None
             try:
-                response = await self._client.get(url)
+                response = await self._client.get(url, headers=self._json_request_headers(url))
                 response.raise_for_status()
-                payload = response.json()
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        return payload
+                    return {}
+                except ValueError:
+                    # Server returned 200 but with empty/non-JSON body (bot protection).
+                    self._logger.info(
+                        "Non-JSON response from %s (status=%s, body_prefix=%r), trying curl fallback",
+                        url, response.status_code, response.text[:120],
+                    )
             except Exception as exc:
                 if not self._should_use_curl_fallback(exc):
                     raise
-                self._logger.info("Using curl fallback for %s", url)
-                payload = json.loads((await self._curl_fetch(url)).decode("utf-8", errors="replace"))
+                self._logger.info("HTTP error for %s: %s, trying curl fallback", url, exc)
 
-            if isinstance(payload, dict):
+            try:
+                payload = await self._curl_cffi_get_json(url)
+                self._logger.info("curl-cffi JSON fallback succeeded for %s", url)
                 return payload
-            return {}
+            except Exception as exc:
+                curl_cffi_exc = exc
+                self._logger.info("curl-cffi JSON fallback failed for %s: %s", url, exc)
+
+            # Curl fallback with browser user-agent.
+            try:
+                raw = (
+                    await self._curl_fetch(
+                        url,
+                        user_agent=_BROWSER_USER_AGENT,
+                        referer=self._default_referer(url),
+                        accept=self._json_request_headers(url)["Accept"],
+                    )
+                ).decode("utf-8", errors="replace")
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    return payload
+                return {}
+            except (ValueError, json.JSONDecodeError) as exc:
+                curl_exc = exc
+                self._logger.info(
+                    "Curl fallback also returned non-JSON for %s (body_prefix=%r)",
+                    url, raw[:120] if "raw" in dir() else "",
+                )
+
+            raise ValueError(
+                f"Could not retrieve JSON from {url} (bot-blocked or not a Shopify store): "
+                f"curl_cffi={curl_cffi_exc}; curl={curl_exc}"
+            )
 
     async def get_bytes(self, url: str) -> bytes:
         cached = self._byte_cache.get(url)

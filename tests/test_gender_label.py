@@ -202,3 +202,46 @@ def test_extract_gender_from_product_type_and_keep_category() -> None:
     # Explicit gender still wins while category is preserved.
     assert out[1].gender_label == "female"
     assert out[1].product_type == "Tops"
+
+
+def test_extract_gender_from_item_name_keywords() -> None:
+    payload = {
+        "products": [
+            {
+                "id": 11,
+                "title": "Women's Running Shorts",
+                "handle": "womens-running-shorts",
+                "body_html": "",
+                "images": [{"src": "https://cdn.example.com/w1.jpg"}],
+                "options": [],
+                "variants": [],
+                "vendor": "Brand",
+            },
+            {
+                "id": 12,
+                "title": "Man Utility Jacket",
+                "handle": "man-utility-jacket",
+                "body_html": "",
+                "images": [{"src": "https://cdn.example.com/m1.jpg"}],
+                "options": [],
+                "variants": [],
+                "vendor": "Brand",
+            },
+            {
+                "id": 13,
+                "title": "Men's Canvas Shoes",
+                "handle": "mens-canvas-shoes",
+                "body_html": "",
+                "images": [{"src": "https://cdn.example.com/m2.jpg"}],
+                "options": [],
+                "variants": [],
+                "vendor": "Brand",
+            },
+        ]
+    }
+
+    out = extract_products_from_products_json(payload, _settings())
+    assert len(out) == 3
+    assert out[0].gender_label == "female"
+    assert out[1].gender_label == "male"
+    assert out[2].gender_label == "male"

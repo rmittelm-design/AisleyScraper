@@ -19,9 +19,9 @@ class GenderProbComputationError(RuntimeError):
 
 
 _EXPLICIT_GENDER_TO_CSV: dict[str, str] = {
-    "male": "1.0,0.0,0.0",
-    "female": "0.0,1.0,0.0",
-    "unisex": "0.0,0.0,1.0",
+    "male": "1.0,0,0",
+    "female": "0,1.0,0",
+    "unisex": "0,0,1.0",
 }
 
 _GENDER_CLASSES: tuple[str, str, str] = ("male", "female", "unisex")

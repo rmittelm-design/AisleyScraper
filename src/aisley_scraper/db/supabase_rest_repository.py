@@ -329,9 +329,6 @@ class SupabaseRestRepository:
             "store_name": store.store_name,
             "store_type": store.store_type,
             "instagram_handle": store.instagram_handle,
-            "address": store.address,
-            "lat": store.lat,
-            "long": store.long,
             "raw": {
                 "website": store.website,
                 "store_name": store.store_name,
@@ -344,6 +341,14 @@ class SupabaseRestRepository:
             "scraped": True,
             "last_seen_at": self._utc_now_iso(),
         }
+        # Only include address/lat/long when non-null so that merge-duplicates
+        # never overwrites an existing value with NULL.
+        if store.address is not None:
+            payload["address"] = store.address
+        if store.lat is not None:
+            payload["lat"] = store.lat
+        if store.long is not None:
+            payload["long"] = store.long
         response = self._request(
             "POST",
             "/shopify_stores",
@@ -638,12 +643,16 @@ class SupabaseRestRepository:
             "store_type": store.store_type,
             "instagram_handle": store.instagram_handle,
             "address": store.address,
+            "lat": store.lat,
+            "long": store.long,
             "raw": {
                 "website": store.website,
                 "store_name": store.store_name,
                 "store_type": store.store_type,
                 "instagram_handle": store.instagram_handle,
                 "address": store.address,
+                "lat": store.lat,
+                "long": store.long,
             },
             "scraped_at": self._utc_now_iso(),
         }
@@ -700,7 +709,7 @@ class SupabaseRestRepository:
             "GET",
             "/shopify_stores_staging",
             params={
-                "select": "store_name,store_type,instagram_handle,address",
+                "select": "store_name,store_type,instagram_handle,address,lat,long",
                 "run_id": f"eq.{run_id}",
                 "website": f"eq.{website}",
                 "limit": "1",
@@ -710,12 +719,16 @@ class SupabaseRestRepository:
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             return None
         row = rows[0]
+        lat = row.get("lat")
+        long_ = row.get("long")
         return StoreProfile(
             website=website,
             store_name=row.get("store_name", ""),
             store_type=row.get("store_type", "online"),
             instagram_handle=row.get("instagram_handle"),
             address=row.get("address"),
+            lat=float(lat) if lat is not None else None,
+            long=float(long_) if long_ is not None else None,
         )
 
     def list_all_staged_run_websites(self, *, run_id: str) -> list[str]:
@@ -911,49 +924,10 @@ class SupabaseRestRepository:
         return out
 
     def _delete_rows_for_run_in_chunks(self, table: str, run_id: str, *, batch_size: int = 200) -> None:
-        """Delete rows for one run in bounded chunks to avoid large DELETE failures."""
-        deleted_total = 0
-        batch_count = 0
-        while True:
-            response = self._request(
-                "GET",
-                f"/{table}",
-                params={
-                    "select": "id",
-                    "run_id": f"eq.{run_id}",
-                    "order": "id.asc",
-                    "limit": str(max(1, batch_size)),
-                },
-            )
-            rows = response.json()
-            if not isinstance(rows, list) or not rows:
-                return
-
-            row_ids: list[int] = []
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                row_id = row.get("id")
-                if isinstance(row_id, int):
-                    row_ids.append(row_id)
-
-            if not row_ids:
-                return
-
-            id_filter = ",".join(str(row_id) for row_id in row_ids)
-            self._request(
-                "DELETE",
-                f"/{table}",
-                params={"id": f"in.({id_filter})"},
-                headers={"Prefer": "return=minimal"},
-            )
-            batch_count += 1
-            deleted_total += len(row_ids)
-            if batch_count % 25 == 0:
-                logger.warning(
-                    "Fresh cleanup progress: table=%s run_id=%s deleted=%s batches=%s",
-                    table,
-                    run_id,
-                    deleted_total,
-                    batch_count,
-                )
+        """Delete all rows for a run_id using a single indexed DELETE."""
+        self._request(
+            "DELETE",
+            f"/{table}",
+            params={"run_id": f"eq.{run_id}"},
+            headers={"Prefer": "return=minimal"},
+        )
