@@ -441,9 +441,20 @@ class Repository:
                             raise RuntimeError("failed to insert store branch")
                         result_ids[i] = int(row[0])
 
-                # Delete existing rows no branch claimed (cascade their products).
+                # Before deleting unclaimed rows, move any products they hold onto
+                # the primary branch (index 0) so the ON DELETE CASCADE can never
+                # drop a product — products that are already on the primary are
+                # left to cascade away as duplicates. This keeps every store's
+                # products on its single primary id.
                 stale = [sid for sid, _addr in existing if sid not in used]
                 if stale:
+                    primary_id = result_ids[0]
+                    cur.execute(
+                        "update shopify_products set store_id = %s "
+                        "where store_id = any(%s) and product_id not in "
+                        "(select product_id from shopify_products where store_id = %s);",
+                        (primary_id, stale, primary_id),
+                    )
                     cur.execute("delete from shopify_stores where id = any(%s);", (stale,))
             conn.commit()
         return result_ids
