@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
+from dataclasses import replace
 import errno
 import gc
 import logging
@@ -10,7 +11,6 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
 from uuid import uuid4
-from urllib.parse import urlparse
 
 from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.fetcher import Fetcher
@@ -20,19 +20,20 @@ from aisley_scraper.crawl.image_verifier import (
     verify_first_image_product_validation,
     verify_product_images,
 )
-from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
+from aisley_scraper.db.repository import Repository
 from aisley_scraper.diagnostics import diagnose_staged_runs
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.geocoding import geocode_address
-from aisley_scraper.gender_probs import (
-    enrich_gender_probabilities_for_products,
-    one_hot_gender_probs_csv,
+from aisley_scraper.ingest.csv_loader import (
+    _domain_key,
+    dedupe_seeds_by_domain,
+    load_store_seeds,
+    load_store_seeds_from_dir,
 )
-from aisley_scraper.ingest.csv_loader import load_store_seeds
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreProfile, StoreSeed
-from aisley_scraper.normalize.products import enforce_attribute_policy, normalize_product
+from aisley_scraper.normalize.products import normalize_product
 from aisley_scraper.storage import StorageUploader
 from aisley_scraper.storage_integrity import (
     delete_orphan_storage_objects,
@@ -73,15 +74,9 @@ class _DiskSafeRotatingFileHandler(RotatingFileHandler):
 
 
 def _dedupe_seeds_by_domain(seeds: list[StoreSeed]) -> list[StoreSeed]:
-    seen_domains: set[str] = set()
-    deduped: list[StoreSeed] = []
-    for seed in seeds:
-        domain = urlparse(seed.store_url).netloc.strip().lower()
-        if not domain or domain in seen_domains:
-            continue
-        seen_domains.add(domain)
-        deduped.append(seed)
-    return deduped
+    # Domain-level dedupe (scheme/www-insensitive); on duplicate domains keep the
+    # row with the most branch addresses. Shared with the TSV-folder loader.
+    return dedupe_seeds_by_domain(seeds)
 
 
 def _chunk_products_for_phase2(
@@ -248,7 +243,7 @@ def _clear_fetcher_disk_cache(settings) -> tuple[int, Path | None]:
     return removed, cache_dir
 
 
-def _get_store_urls_from_repo(repo: SupabaseRestRepository) -> list[str]:
+def _get_store_urls_from_repo(repo: Repository) -> list[str]:
     list_all = getattr(repo, "list_all_store_websites", None)
     if callable(list_all):
         return list_all()
@@ -325,8 +320,8 @@ def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
         raise RuntimeError(f"orphan preflight failed: remaining_orphans={len(remaining_orphans)}")
 
 
-def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreSeed]:
-    csv_seeds = _dedupe_seeds_by_domain(load_store_seeds(settings.input_csv_path, settings))
+def _build_db_first_seeds(settings, repo: Repository) -> list[StoreSeed]:
+    csv_seeds = _dedupe_seeds_by_domain(load_store_seeds_from_dir(settings.input_tsv_dir, settings))
 
     existing_by_domain: dict[str, StoreProfile] = {}
     list_profiles = getattr(repo, "list_all_store_profiles", None)
@@ -334,7 +329,7 @@ def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreS
         existing_profiles = list_profiles()
         existing_by_domain = {}
         for profile in existing_profiles:
-            domain = urlparse(profile.website).netloc.strip().lower()
+            domain = _domain_key(profile.website)
             if domain and domain not in existing_by_domain:
                 existing_by_domain[domain] = profile
 
@@ -343,7 +338,7 @@ def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreS
             if not seed.address:
                 continue
 
-            domain = urlparse(seed.store_url).netloc.strip().lower()
+            domain = _domain_key(seed.store_url)
             if not domain:
                 continue
 
@@ -380,32 +375,30 @@ def _build_db_first_seeds(settings, repo: SupabaseRestRepository) -> list[StoreS
                     exc,
                 )
 
-    # Build a domain → address map from the CSV (the authoritative address source),
-    # falling back to whatever the DB has if the domain isn't in the CSV.
-    csv_address_by_domain: dict[str, str | None] = {}
+    # Build a domain → ALL addresses map from the CSV (the authoritative address
+    # source), keyed by the www-insensitive domain. Carrying every branch address
+    # here (not just the first) is what lets each branch become its own store row.
+    csv_addresses_by_domain: dict[str, list[str]] = {}
     for seed in csv_seeds:
-        domain = urlparse(seed.store_url).netloc.strip().lower()
+        domain = _domain_key(seed.store_url)
         if domain:
-            csv_address_by_domain[domain] = seed.address
+            csv_addresses_by_domain[domain] = list(seed.addresses)
 
     db_websites = _get_store_urls_from_repo(repo)
 
     db_seeds = []
     for website in db_websites:
-        domain = urlparse(website).netloc.strip().lower()
-        address: str | None = csv_address_by_domain.get(domain)
-        if not address:
+        domain = _domain_key(website)
+        addresses = list(csv_addresses_by_domain.get(domain) or [])
+        if not addresses:
             existing = existing_by_domain.get(domain)
-            address = existing.address if existing else None
-        db_seeds.append(StoreSeed(store_url=website, address=address))
+            if existing and existing.address:
+                addresses = [existing.address]
+        db_seeds.append(StoreSeed(store_url=website, addresses=addresses))
     db_seeds = _dedupe_seeds_by_domain(db_seeds)
 
-    seen_domains = {urlparse(seed.store_url).netloc.strip().lower() for seed in db_seeds}
-    csv_new = [
-        seed
-        for seed in csv_seeds
-        if urlparse(seed.store_url).netloc.strip().lower() not in seen_domains
-    ]
+    seen_domains = {_domain_key(seed.store_url) for seed in db_seeds}
+    csv_new = [seed for seed in csv_seeds if _domain_key(seed.store_url) not in seen_domains]
     return db_seeds + csv_new
 
 
@@ -433,13 +426,13 @@ def run_crawl(
     csv_path: str | None = None,
 ) -> int:
     settings = get_settings()
-    if csv_path:
-        settings.input_csv_path = csv_path
     _setup_logging(settings.log_level)
-    allow_null_gender_probs = settings.phase2_first_image_product_validation_only
+    # Gender scoring has been removed; products are never required to carry gender
+    # probabilities (gender_probs_csv stays NULL).
+    allow_null_gender_probs = True
 
     if settings.persistence_target == "local":
-        seeds = load_store_seeds(settings.input_csv_path, settings)
+        seeds = load_store_seeds_from_dir(settings.input_tsv_dir, settings)
         seeds = _dedupe_seeds_by_domain(seeds)
         if limit is not None:
             seeds = seeds[:limit]
@@ -461,7 +454,7 @@ def run_crawl(
 
     cleared_disk_cache_files, disk_cache_dir = _clear_fetcher_disk_cache(settings)
 
-    repo = SupabaseRestRepository(settings)
+    repo = Repository(settings)
     upload_images = not skip_image_upload
 
     try:
@@ -546,6 +539,57 @@ def run_crawl(
             if coords is not None:
                 store.lat, store.long = coords
 
+        # Branch addresses (TSV columns 3+) are authoritative. At production
+        # write time we create one shopify_stores row per branch; scraped
+        # products link only to the first branch.
+        # Key by the scheme- and www-insensitive domain so a seed url like
+        # http://www.x.com still matches a store scraped as https://x.com.
+        # Keying on the raw netloc dropped branches whenever the www/scheme of
+        # the TSV url and the scraped website disagreed.
+        try:
+            _branch_addresses_by_domain: dict[str, list[str]] = {
+                _domain_key(seed.store_url): list(seed.addresses)
+                for seed in load_store_seeds_from_dir(settings.input_tsv_dir, settings)
+                if seed.addresses
+            }
+        except FileNotFoundError:
+            _branch_addresses_by_domain = {}
+
+        def _branch_addresses_for(website: str) -> list[str]:
+            return _branch_addresses_by_domain.get(_domain_key(website), [])
+
+        def _upsert_store_with_branches(store: StoreProfile) -> int:
+            """Upsert one row per branch address; return the first branch's id
+            (the product target). Online / address-less stores collapse to a
+            single row."""
+            addresses = _branch_addresses_for(store.website)
+            if not addresses:
+                _apply_store_geocode_if_available(store)
+                return repo.upsert_store(store)
+            branches: list[StoreProfile] = []
+            for branch_address in addresses:
+                branch = replace(store, address=branch_address, lat=None, long=None)
+                _apply_store_geocode_if_available(branch)
+                branches.append(branch)
+            # Reconcile the website's rows to exactly this branch set, REUSING
+            # existing row ids (so the primary branch keeps its id and its
+            # shopify_products stay attached). This also removes stale rows like
+            # a pre-branch NULL-address placeholder. Guarded to the
+            # addresses-present path so an empty/missing TSV never rewrites good
+            # branch rows.
+            sync_branches = getattr(repo, "sync_store_branches", None)
+            if callable(sync_branches):
+                branch_ids = sync_branches(store.website, branches)
+                return branch_ids[0]
+            # Fallback for repos without sync (e.g. test fakes): plain upserts.
+            first_id: int | None = None
+            for branch in branches:
+                branch_id = repo.upsert_store(branch)
+                if first_id is None:
+                    first_id = branch_id
+            assert first_id is not None  # branches is non-empty here
+            return first_id
+
         success_count = 0
         processed_count = 0
 
@@ -554,8 +598,7 @@ def run_crawl(
                 print(f"FAIL {seed.store_url}: {outcome}")
                 return False
 
-            _apply_store_geocode_if_available(outcome.store)
-            store_id = repo.upsert_store(outcome.store)
+            store_id = _upsert_store_with_branches(outcome.store)
             existing_state_by_product_id: dict[
                 str,
                 tuple[list[str], list[str]] | tuple[list[str], list[str], str | None] | None,
@@ -659,14 +702,6 @@ def run_crawl(
                 existing_state_by_product_id[product.product_id] = existing_image_state
                 original_images_by_product_id[product.product_id] = list(product.images)
 
-                explicit_gender_probs = one_hot_gender_probs_csv(product.gender_label)
-                if explicit_gender_probs is not None:
-                    product.gender_probs_csv = explicit_gender_probs
-                elif existing_image_state is not None:
-                    _, _, existing_gender_probs = _split_existing_state(existing_image_state)
-                    if existing_gender_probs:
-                        product.gender_probs_csv = existing_gender_probs
-
                 if existing_image_state is None and product.unavailable:
                     continue
 
@@ -690,26 +725,6 @@ def run_crawl(
                         fetcher=postprocess_fetcher,
                         settings=settings,
                     )
-                    # Image cap for validation/scoring: keep all but validate only first N.
-                    max_images_for_validation = max(
-                        1, settings.phase2_max_images_per_product
-                    )
-                    original_images_map: dict[str, list[str]] = {}
-                    for product in products:
-                        if product.images:
-                            original_images_map[product.product_id] = list(product.images)
-                            product.images = product.images[:max_images_for_validation]
-                    try:
-                        await enrich_gender_probabilities_for_products(
-                            products=products,
-                            fetcher=postprocess_fetcher,
-                            concurrency=settings.image_validation_concurrency,
-                        )
-                    finally:
-                        # Restore all original images after scoring.
-                        for product in products:
-                            if product.product_id in original_images_map:
-                                product.images = original_images_map[product.product_id]
                     for product in products:
                         for image_url in product.images:
                             normalized_url = image_url.strip()
@@ -725,55 +740,12 @@ def run_crawl(
                     await postprocess_fetcher.close()
 
             async def _enrich_products_only(products: list) -> None:
-                enrich_fetcher = Fetcher(settings)
-                try:
-                    # Image cap for validation/scoring: keep all but validate only first N.
-                    max_images_for_validation = max(
-                        1, settings.phase2_max_images_per_product
-                    )
-                    original_images_map: dict[str, list[str]] = {}
-                    for product in products:
-                        if product.images:
-                            original_images_map[product.product_id] = list(product.images)
-                            product.images = product.images[:max_images_for_validation]
-                    try:
-                        await enrich_gender_probabilities_for_products(
-                            products=products,
-                            fetcher=enrich_fetcher,
-                            concurrency=settings.image_validation_concurrency,
-                        )
-                    finally:
-                        # Restore all original images after scoring.
-                        for product in products:
-                            if product.product_id in original_images_map:
-                                product.images = original_images_map[product.product_id]
-                finally:
-                    clear_cached_bytes = getattr(enrich_fetcher, "clear_cached_bytes", None)
-                    if callable(clear_cached_bytes):
-                        clear_cached_bytes()
-                    await enrich_fetcher.close()
+                # Gender scoring removed; nothing to enrich.
+                return
 
             def _try_enrich_from_supabase_images(product) -> None:
-                if product.gender_probs_csv:
-                    return
-                if not product.supabase_images:
-                    return
-
-                original_images = list(product.images)
-                try:
-                    # Source CDN URLs can intermittently fail for CLIP fetch; use
-                    # already-uploaded Supabase URLs as a second-pass scoring source.
-                    product.images = list(product.supabase_images)
-                    asyncio.run(_enrich_products_only([product]))
-                except Exception as exc:
-                    logger.warning(
-                        "Supabase-image gender enrichment failed for store=%s product=%s: %s",
-                        store_id,
-                        product.product_id,
-                        exc,
-                    )
-                finally:
-                    product.images = original_images
+                # Gender scoring removed; nothing to enrich.
+                return
 
             def _safe_upload_new_product_images(product) -> list[str]:
                 if not upload_images:
@@ -853,7 +825,8 @@ def run_crawl(
                 images_incomplete = upload_images and (
                     len(product.supabase_images or []) != len(product.images)
                 )
-                if product.images and (images_incomplete or not product.gender_probs_csv):
+                missing_gender = (not allow_null_gender_probs) and not product.gender_probs_csv
+                if product.images and (images_incomplete or missing_gender):
                     logger.warning(
                         "Skipping final upsert with incomplete required fields for store=%s product=%s",
                         store_id,
@@ -994,7 +967,9 @@ def run_crawl(
                 fallback_products_needing_enrich = [
                     product
                     for product in fallback_products
-                    if product.images and not product.gender_probs_csv
+                    if product.images
+                    and not allow_null_gender_probs
+                    and not product.gender_probs_csv
                 ]
                 if fallback_products_needing_enrich:
                     for chunk in _chunk_products(fallback_products_needing_enrich):
@@ -1077,11 +1052,15 @@ def run_crawl(
                 if product.images
                 and (
                     (upload_images and len(product.supabase_images or []) != len(product.images))
-                    or not product.gender_probs_csv
+                    or (not allow_null_gender_probs and not product.gender_probs_csv)
                 )
             ]
             if missing_required_fields:
-                missing_gender = [product for product in missing_required_fields if not product.gender_probs_csv]
+                missing_gender = [
+                    product
+                    for product in missing_required_fields
+                    if not allow_null_gender_probs and not product.gender_probs_csv
+                ]
                 if missing_gender:
                     for chunk in _chunk_products(missing_gender):
                         try:
@@ -1126,7 +1105,7 @@ def run_crawl(
                 if product.images
                 and (
                     (upload_images and len(product.supabase_images or []) != len(product.images))
-                    or not product.gender_probs_csv
+                    or (not allow_null_gender_probs and not product.gender_probs_csv)
                 )
             ]
             if unresolved_required_fields:
@@ -1296,11 +1275,13 @@ def run_crawl(
                             )
                             if staged_store is None:
                                 raise RuntimeError("staging store row missing")
-                            await asyncio.to_thread(_apply_store_geocode_if_available, staged_store)
                             staged_products = await asyncio.to_thread(
                                 repo.get_staged_products, resolved_run_id, website
                             )
-                            store_id = await asyncio.to_thread(repo.upsert_store, staged_store)
+                            # One store row per branch; products link to first branch.
+                            store_id = await asyncio.to_thread(
+                                _upsert_store_with_branches, staged_store
+                            )
                             product_ids = [p.product_id for p in staged_products if p.product_id]
                             existing_states: dict = {}
                             if product_ids:
@@ -1413,36 +1394,10 @@ def run_crawl(
                                     )
                                     product.supabase_images = existing_supa or []
 
-                        # Supabase-image fallback gender scoring.
-                        if (
-                            not allow_null_gender_probs
-                            and not product.gender_probs_csv
-                            and product.supabase_images
-                        ):
-                            orig = list(product.images)
-                            product.images = list(product.supabase_images)
-                            # Image cap for validation/scoring: keep all but validate only first N.
-                            max_images_for_validation = max(
-                                1, settings.phase2_max_images_per_product
-                            )
-                            product.images = product.images[:max_images_for_validation]
-                            try:
-                                await enrich_gender_probabilities_for_products(
-                                    [product], fetcher=fetcher, concurrency=1
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "Supabase-fallback scoring failed store_id=%s product=%s: %s",
-                                    store_id, product.product_id, exc,
-                                )
-                            finally:
-                                product.images = orig
-
                         images_incomplete = upload_images and (
                             len(product.supabase_images) != len(product.images)
                         )
-                        missing_gender_probs = (not allow_null_gender_probs) and (not product.gender_probs_csv)
-                        if images_incomplete or missing_gender_probs:
+                        if images_incomplete:
                             logger.warning(
                                 "Skipping upsert: incomplete required fields store_id=%s product=%s",
                                 store_id, product.product_id,
@@ -1562,18 +1517,9 @@ def run_crawl(
                                 failed_load.append(website)
                                 continue
                             store_id, staged_products, existing_states = outcome
-                            # Apply one-hot gender overrides and inherit existing scores before Stage 2.
+                            # Gender scoring removed: products carry no gender probabilities.
                             for product in staged_products:
-                                if allow_null_gender_probs:
-                                    product.gender_probs_csv = None
-                                else:
-                                    explicit = one_hot_gender_probs_csv(product.gender_label)
-                                    if explicit is not None:
-                                        product.gender_probs_csv = explicit
-                                    elif not product.gender_probs_csv:
-                                        state = existing_states.get(product.product_id)
-                                        if state is not None and state[2]:
-                                            product.gender_probs_csv = state[2]
+                                product.gender_probs_csv = None
                             store_map[website] = (store_id, staged_products, existing_states)
 
                         to_enrich: list[ProductRecord] = [
@@ -1599,7 +1545,11 @@ def run_crawl(
                                 to_enrich,
                                 max_products=phase2_product_chunk_size,
                                 max_unique_image_urls=phase2_unique_url_budget,
-                                max_images_per_product_for_budget=settings.phase2_max_images_per_product,
+                                max_images_per_product_for_budget=(
+                                    settings.product_validation_max_images
+                                    if settings.phase2_first_image_product_validation_only
+                                    else settings.phase2_max_images_per_product
+                                ),
                             )
                             total_product_chunks = len(product_chunks)
                             logger.info(
@@ -1624,10 +1574,18 @@ def run_crawl(
                                     f"({chunk_pct:.1f}%) products={len(product_chunk)}"
                                 )
 
-                                # ── Image cap for validation/scoring: keep all but validate only first N ──
-                                max_images_for_validation = max(
-                                    1, settings.phase2_max_images_per_product
-                                )
+                                # ── Image cap for validation/scoring ──
+                                # First-image product mode samples the first K lead images
+                                # (item kept if ANY is a product); otherwise use the
+                                # per-product image cap.
+                                if settings.phase2_first_image_product_validation_only:
+                                    max_images_for_validation = max(
+                                        1, settings.product_validation_max_images
+                                    )
+                                else:
+                                    max_images_for_validation = max(
+                                        1, settings.phase2_max_images_per_product
+                                    )
                                 original_images_map: dict[str, list[str]] = {}
                                 for product in product_chunk:
                                     if product.images:
@@ -1680,56 +1638,7 @@ def run_crawl(
                                             settings=settings,
                                         )
 
-                                to_score = [p for p in product_chunk if p.images and not p.gender_probs_csv]
-                                if to_score and not allow_null_gender_probs:
-                                    logger.info(
-                                        "Phase 2 stage 2: CLIP scoring chunk %s/%s (%s products)",
-                                        chunk_index,
-                                        total_product_chunks,
-                                        len(to_score),
-                                    )
-                                    print(
-                                        f"Phase 2 scoring chunk: {chunk_index}/{total_product_chunks} "
-                                        f"products={len(to_score)}"
-                                    )
-                                    if stall_interval > 0:
-                                        stask = asyncio.create_task(
-                                            enrich_gender_probabilities_for_products(
-                                                products=to_score,
-                                                fetcher=fetcher,
-                                                concurrency=settings.image_validation_concurrency,
-                                            )
-                                        )
-                                        while True:
-                                            try:
-                                                await asyncio.wait_for(
-                                                    asyncio.shield(stask),
-                                                    timeout=float(stall_interval),
-                                                )
-                                                break
-                                            except asyncio.TimeoutError:
-                                                still_pending = sum(
-                                                    1 for p in to_score if not p.gender_probs_csv
-                                                )
-                                                logger.warning(
-                                                    "Phase 2 CLIP scoring still running "
-                                                    "(chunk=%s/%s): %s/%s products pending",
-                                                    chunk_index,
-                                                    total_product_chunks,
-                                                    still_pending,
-                                                    len(to_score),
-                                                )
-                                    else:
-                                        await enrich_gender_probabilities_for_products(
-                                            products=to_score,
-                                            fetcher=fetcher,
-                                            concurrency=settings.image_validation_concurrency,
-                                        )
-                                elif to_score:
-                                    for product in to_score:
-                                        product.gender_probs_csv = None
-
-                                # ── Restore all original images after validation/scoring ──
+                                # ── Restore all original images after validation ──
                                 for product in product_chunk:
                                     if product.product_id in original_images_map:
                                         product.images = original_images_map[product.product_id]
@@ -2082,7 +1991,7 @@ def run_crawl(
 def run_cleanup_runs(run_id: str | None = None) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
-    repo = SupabaseRestRepository(settings)
+    repo = Repository(settings)
 
     keep_run_id = run_id
     if not keep_run_id:
@@ -2110,7 +2019,7 @@ def run_filter_shopify_products_first_image_validation(
 ) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
-    repo = SupabaseRestRepository(settings)
+    repo = Repository(settings)
 
     effective_batch_size = max(1, int(batch_size))
     requested_limit = max(0, int(limit)) if limit is not None else None
