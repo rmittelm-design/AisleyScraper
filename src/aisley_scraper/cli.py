@@ -189,6 +189,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    rebuild = sub.add_parser(
+        "rebuild-branches",
+        help=(
+            "Materialize/reconcile one shopify_stores row per TSV branch address "
+            "against existing stores (no re-scrape). Reuses store ids, keeps "
+            "products on their single original id, dedupes by domain. Idempotent."
+        ),
+    )
+    rebuild.add_argument("--limit", type=int, default=None, help="Max domains to process")
+    rebuild.add_argument(
+        "--skip-geocode",
+        action="store_true",
+        help="Don't geocode new branch addresses (leave lat/long NULL; fill on a later run)",
+    )
+
     return parser
 
 
@@ -400,6 +415,86 @@ def _build_db_first_seeds(settings, repo: Repository) -> list[StoreSeed]:
     seen_domains = {_domain_key(seed.store_url) for seed in db_seeds}
     csv_new = [seed for seed in csv_seeds if _domain_key(seed.store_url) not in seen_domains]
     return db_seeds + csv_new
+
+
+def run_rebuild_branches(limit: int | None = None, skip_geocode: bool = False) -> int:
+    """Materialize/reconcile branch store rows from the TSV branch addresses
+    against the EXISTING production stores — no re-scrape, no image work.
+
+    For every domain that has branch addresses in ``INPUT_TSV_DIR`` and an
+    existing ``shopify_stores`` row, build one branch profile per address (copied
+    from the live store row, geocoded best-effort) and call
+    ``sync_store_branches``. That reuses existing row ids by domain (so each
+    store's products stay on its single original id), creates the missing branch
+    rows, converges websites to canonical, and drops stale rows. Idempotent and
+    re-runnable; lat/long already present is preserved, so a later run just fills
+    in addresses that failed to geocode.
+    """
+    settings = get_settings()
+    _setup_logging(settings.log_level)
+    repo = Repository(settings)
+    repo.ensure_schema()
+
+    branch_addresses_by_domain: dict[str, list[str]] = {}
+    for seed in load_store_seeds_from_dir(settings.input_tsv_dir, settings):
+        if seed.addresses:
+            branch_addresses_by_domain[_domain_key(seed.store_url)] = list(seed.addresses)
+
+    # One base profile per domain — prefer the row that already carries an
+    # address (the live, products-bearing row).
+    base_by_domain: dict[str, StoreProfile] = {}
+    for profile in repo.list_all_store_profiles():
+        domain = _domain_key(profile.website)
+        if not domain:
+            continue
+        current = base_by_domain.get(domain)
+        if current is None or (profile.address and not current.address):
+            base_by_domain[domain] = profile
+
+    geocode_cache: dict[str, tuple[float, float] | None] = {}
+
+    def _geocode(address: str) -> tuple[float, float] | None:
+        if skip_geocode or not address:
+            return None
+        key = address.strip().lower()
+        if key not in geocode_cache:
+            user_agent = (settings.user_agent or "").strip() or "aisley-scraper/1.0"
+            try:
+                geocode_cache[key] = geocode_address(
+                    address,
+                    user_agent=user_agent,
+                    timeout_sec=float(getattr(settings, "crawl_request_timeout_sec", 25)),
+                )
+            except Exception:
+                geocode_cache[key] = None
+        return geocode_cache[key]
+
+    domains = [d for d in branch_addresses_by_domain if d in base_by_domain]
+    if limit is not None:
+        domains = domains[:limit]
+
+    reconciled = 0
+    total_rows = 0
+    for domain in domains:
+        base = base_by_domain[domain]
+        branches: list[StoreProfile] = []
+        for address in branch_addresses_by_domain[domain]:
+            branch = replace(base, address=address, lat=None, long=None)
+            coords = _geocode(address)
+            if coords is not None:
+                branch.lat, branch.long = coords
+            branches.append(branch)
+        try:
+            ids = repo.sync_store_branches(base.website, branches)
+        except Exception as exc:
+            logger.warning("rebuild-branches failed for domain=%s: %s", domain, exc)
+            continue
+        reconciled += 1
+        total_rows += len(ids)
+        print(f"{domain}: {len(ids)} branch row(s)")
+
+    print(f"Rebuilt branches for {reconciled} domain(s) ({total_rows} store rows).")
+    return 0
 
 
 def run_ingest(csv_path: str | None) -> int:
@@ -2180,6 +2275,11 @@ def main() -> int:
             phase=args.phase,
             skip_image_upload=args.skip_image_upload,
             csv_path=getattr(args, "csv", None),
+        )
+    if args.command == "rebuild-branches":
+        return run_rebuild_branches(
+            limit=getattr(args, "limit", None),
+            skip_geocode=getattr(args, "skip_geocode", False),
         )
 
     return 1
