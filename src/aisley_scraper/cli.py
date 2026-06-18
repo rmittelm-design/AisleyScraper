@@ -204,6 +204,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Don't geocode new branch addresses (leave lat/long NULL; fill on a later run)",
     )
 
+    prune = sub.add_parser(
+        "prune-stores",
+        help=(
+            "TSV is the source of truth: delete shopify_stores whose domain is not "
+            "in any TSV file (their products cascade). Dry-run unless --execute."
+        ),
+    )
+    prune.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply deletions (default: dry-run preview)",
+    )
+
     return parser
 
 
@@ -497,6 +510,51 @@ def run_rebuild_branches(limit: int | None = None, skip_geocode: bool = False) -
     return 0
 
 
+def _tsv_domains(settings) -> set[str]:
+    """Set of www/scheme-insensitive domains present across all TSV files."""
+    domains = {
+        _domain_key(seed.store_url)
+        for seed in load_store_seeds_from_dir(settings.input_tsv_dir, settings)
+    }
+    domains.discard("")
+    return domains
+
+
+def run_prune_stores(execute: bool = False) -> int:
+    """Make the TSV the source of truth: delete every shopify_stores row whose
+    domain is not present in any TSV file (their products cascade). Dry-run by
+    default; pass execute=True to apply.
+    """
+    settings = get_settings()
+    _setup_logging(settings.log_level)
+    repo = Repository(settings)
+    repo.ensure_schema()
+
+    keep_domains = _tsv_domains(settings)
+    if not keep_domains:
+        print("No TSV domains found in INPUT_TSV_DIR — refusing to prune (would wipe the table).")
+        return 1
+
+    prod_domains = sorted({_domain_key(p.website) for p in repo.list_all_store_profiles()})
+    extra = [d for d in prod_domains if d not in keep_domains]
+    print(
+        f"TSV domains={len(keep_domains)} store-table domains={len(prod_domains)} "
+        f"not_in_tsv={len(extra)}"
+    )
+    for domain in extra:
+        print("  -", domain)
+    if not extra:
+        print("Nothing to prune — every store is already in the TSV.")
+        return 0
+    if not execute:
+        print(f"(dry-run) re-run with --execute to delete {len(extra)} stores and their products.")
+        return 0
+
+    deleted, removed = repo.delete_stores_not_in_domains(keep_domains)
+    print(f"Deleted {deleted} store rows across {len(removed)} domains not in the TSV (products cascaded).")
+    return 0
+
+
 def run_ingest(csv_path: str | None) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
@@ -565,6 +623,18 @@ def run_crawl(
                 all_seeds = _dedupe_seeds_by_domain(load_store_seeds(csv_path, settings))
             else:
                 all_seeds = _build_db_first_seeds(settings, repo)
+                # TSV is the source of truth: remove stores whose domain is not in
+                # any TSV file (products cascade). Only on a full-directory crawl
+                # (never on a --csv subset) and never against an empty TSV set.
+                prune_fn = getattr(repo, "delete_stores_not_in_domains", None)
+                if callable(prune_fn):
+                    keep_domains = _tsv_domains(settings)
+                    if keep_domains:
+                        pruned, _removed = prune_fn(keep_domains)
+                        if pruned:
+                            logger.warning(
+                                "Pruned %s stores not present in the TSV files", pruned
+                            )
             all_seeds = _dedupe_seeds_by_domain(all_seeds)
             if limit is not None:
                 all_seeds = all_seeds[:limit]
@@ -2284,6 +2354,8 @@ def main() -> int:
             limit=getattr(args, "limit", None),
             skip_geocode=getattr(args, "skip_geocode", False),
         )
+    if args.command == "prune-stores":
+        return run_prune_stores(execute=getattr(args, "execute", False))
 
     return 1
 

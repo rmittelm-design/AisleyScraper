@@ -506,6 +506,32 @@ class Repository:
             )
         return profiles
 
+    def delete_stores_not_in_domains(self, keep_domains: set[str]) -> tuple[int, list[str]]:
+        """Delete every ``shopify_stores`` row whose www/scheme-insensitive domain
+        is NOT in ``keep_domains`` (the TSV is the source of truth). Products
+        cascade via the FK. Returns ``(rows_deleted, removed_domains)``.
+
+        No-op if ``keep_domains`` is empty — refuses to wipe the table against an
+        empty/missing TSV set.
+        """
+        if not keep_domains:
+            return 0, []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select id, website from shopify_stores;")
+                rows = cur.fetchall()
+                to_delete: list[int] = []
+                removed_domains: set[str] = set()
+                for sid, website in rows:
+                    domain = _domain_key(website)
+                    if domain not in keep_domains:
+                        to_delete.append(int(sid))
+                        removed_domains.add(domain)
+                if to_delete:
+                    cur.execute("delete from shopify_stores where id = any(%s);", (to_delete,))
+            conn.commit()
+        return len(to_delete), sorted(removed_domains)
+
     # ── Crawl run tracking ────────────────────────────────────────────────────
     def initialize_crawl_run(self, *, run_id: str, websites: list[str]) -> None:
         if not websites:
