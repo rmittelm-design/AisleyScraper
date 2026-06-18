@@ -18,10 +18,18 @@ class Settings(BaseSettings):
     supabase_storage_bucket: str = Field(alias="SUPABASE_STORAGE_BUCKET")
     supabase_storage_path: str = Field(alias="SUPABASE_STORAGE_PATH")
 
+    # Direct Postgres connection string (psycopg). All table reads/writes go
+    # through this; the Supabase REST API is no longer used for table I/O.
+    database_url: str = Field(default="", alias="DATABASE_URL")
+    db_connect_timeout_sec: int = Field(default=10, alias="DB_CONNECT_TIMEOUT_SEC")
+
     persistence_target: str = Field(default="supabase", alias="PERSISTENCE_TARGET")
     local_output_path: str = Field(default="./out/scrape_results.json", alias="LOCAL_OUTPUT_PATH")
 
-    input_csv_path: str = Field(alias="INPUT_CSV_PATH")
+    # Folder holding the per-store TSV seed files. Every *.tsv in this directory
+    # is parsed and merged by url. Each row is: url \t store_name \t addr1 \t addr2 ...
+    input_tsv_dir: str = Field(default="./data/stores", alias="INPUT_TSV_DIR")
+    input_csv_path: str = Field(default="./data/stores.tsv", alias="INPUT_CSV_PATH")
     input_csv_has_header: bool = Field(default=True, alias="INPUT_CSV_HAS_HEADER")
     input_csv_url_column: str = Field(default="store_url", alias="INPUT_CSV_URL_COLUMN")
     input_csv_source_id_column: str = Field(default="source_id", alias="INPUT_CSV_SOURCE_ID_COLUMN")
@@ -65,8 +73,15 @@ class Settings(BaseSettings):
         alias="SHOPIFY_PRODUCTS_MAX_ITEMS_PER_STORE",
     )
 
+    # CLIP/SigLIP encoder used for product classification and gender scoring.
+    # Default is the fashion-specialized Marqo-FashionSigLIP (loaded via open_clip
+    # hf-hub). For a plain OpenCLIP checkpoint set CLIP_PRETRAINED too (e.g.
+    # CLIP_MODEL_NAME=ViT-B-32, CLIP_PRETRAINED=laion2b_s34b_b79k).
+    clip_model_name: str = Field(default="hf-hub:Marqo/marqo-fashionSigLIP", alias="CLIP_MODEL_NAME")
+    clip_pretrained: str = Field(default="", alias="CLIP_PRETRAINED")
+
     image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
-    image_validation_concurrency: int = Field(default=4, alias="IMAGE_VALIDATION_CONCURRENCY")
+    image_validation_concurrency: int = Field(default=2, alias="IMAGE_VALIDATION_CONCURRENCY")
     image_validation_attempt_timeout_sec: float = Field(
         default=6.0,
         alias="IMAGE_VALIDATION_ATTEMPT_TIMEOUT_SEC",
@@ -79,14 +94,14 @@ class Settings(BaseSettings):
         default=3,
         alias="IMAGE_VALIDATION_QUEUE_MAX_RETRIES",
     )
-    phase2_upload_concurrency: int = Field(default=8, alias="PHASE2_UPLOAD_CONCURRENCY")
+    phase2_upload_concurrency: int = Field(default=3, alias="PHASE2_UPLOAD_CONCURRENCY")
     phase2_db_upsert_batch_size: int = Field(default=500, alias="PHASE2_DB_UPSERT_BATCH_SIZE")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
     fetcher_byte_cache_max_mb: int = Field(default=256, alias="FETCHER_BYTE_CACHE_MAX_MB")
     fetcher_disk_cache_enabled: bool = Field(default=True, alias="FETCHER_DISK_CACHE_ENABLED")
     fetcher_disk_cache_dir: str = Field(default=".aisley_image_cache", alias="FETCHER_DISK_CACHE_DIR")
     fetcher_disk_cache_max_mb: int = Field(default=2048, alias="FETCHER_DISK_CACHE_MAX_MB")
-    image_min_width: int = Field(default=650, alias="IMAGE_MIN_WIDTH")
+    image_min_width: int = Field(default=600, alias="IMAGE_MIN_WIDTH")
     image_min_height: int = Field(default=800, alias="IMAGE_MIN_HEIGHT")
     postprocess_product_chunk_size: int = Field(
         default=200,
@@ -103,6 +118,12 @@ class Settings(BaseSettings):
     phase2_first_image_product_validation_only: bool = Field(
         default=False,
         alias="PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY",
+    )
+    # First-image product classifier samples up to this many lead images per
+    # item and keeps the item if ANY scores as a product photo (max over images).
+    product_validation_max_images: int = Field(
+        default=3,
+        alias="PRODUCT_VALIDATION_MAX_IMAGES",
     )
     phase2_first_image_product_prob_threshold: float = Field(
         default=0.5,
@@ -124,6 +145,7 @@ class Settings(BaseSettings):
         "image_validation_concurrency",
         "phase2_upload_concurrency",
         "phase2_db_upsert_batch_size",
+        "product_validation_max_images",
     )
     @classmethod
     def positive_int(cls, value: int) -> int:
