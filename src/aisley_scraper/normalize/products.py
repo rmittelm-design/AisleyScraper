@@ -6,7 +6,7 @@ from aisley_scraper.models import ProductRecord
 
 
 # Minimum number of scraped images an item must have to be kept.
-MIN_PRODUCT_IMAGES = 4
+MIN_PRODUCT_IMAGES = 3
 
 
 # Substrings that mark an item as kids/children/baby apparel. Matched

@@ -71,17 +71,17 @@ def test_normalize_product_keeps_non_cosmetics() -> None:
     assert out.product_id == "4"
 
 
-def test_should_exclude_items_with_fewer_than_four_images() -> None:
-    for n in (0, 1, 2, 3):
+def test_should_exclude_items_with_fewer_than_three_images() -> None:
+    for n in (0, 1, 2):
         p = _p("Plain Dress")
         p.images = [f"https://example.com/{i}.jpg" for i in range(n)]
         assert should_exclude_product(p) is True, f"{n} images should be excluded"
         assert normalize_product(p) is None
-    # Exactly 4 images is kept.
-    p4 = _p("Plain Dress")
-    p4.images = [f"https://example.com/{i}.jpg" for i in range(4)]
-    assert should_exclude_product(p4) is False
-    assert normalize_product(p4) is not None
+    # Exactly 3 images is kept.
+    p3 = _p("Plain Dress")
+    p3.images = [f"https://example.com/{i}.jpg" for i in range(3)]
+    assert should_exclude_product(p3) is False
+    assert normalize_product(p3) is not None
 
 
 _FOUR_IMAGES = [f"https://example.com/{i}.jpg" for i in range(4)]
