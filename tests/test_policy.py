@@ -163,6 +163,10 @@ def test_should_exclude_non_apparel_categories() -> None:
         _p("Hydrating Conditioner"),
         _p("Volumizing Shampoo"),
         _p("Vitamin C Serum"),
+        _p("Vintage Band Tee", ptype="Vintage"),
+        _p("Curated Vintage Denim"),
+        _p("Beauty Blender", ptype="Beauty"),
+        _p("Beauties Sample Set"),
     ]
     for product in drops:
         assert should_exclude_product(product) is True, product.item_name
@@ -191,6 +195,7 @@ def test_category_filter_preserves_apparel_collisions() -> None:
         _p("Pinstripe Tailored Blazer"),                 # bare 'pin' not matched
         _p("Pintuck Poplin Blouse"),                     # bare 'pin' not matched
         _p("Mirrored Sequin Mini Dress"),               # 'mirror' in 'mirrored'
+        _p("Beautiful Day Maxi Dress"),                  # 'beauty' boundary != 'beautiful'
         # Jewelry & watches are intentionally KEPT (not filtered).
         _p("Gold Signet Ring", ptype="Jewelry"),
         _p("Pearl Necklace"),

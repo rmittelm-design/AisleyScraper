@@ -41,6 +41,7 @@ _KIDS_SUBSTRINGS: tuple[str, ...] = (
 # already handled by the kids list.)
 _NON_APPAREL_PATTERN = re.compile(
     r"\b(?:"
+    r"vintage|beaut(?:y|ies)|"
     r"furniture|box(?:es)?|"
     r"petwear|pets?|gift\s+cards?|gifts?|cards?|puzzles?|sundries|sundry|"
     r"bar\s+goodies?|candles?|lighters?|catchalls?|coffee\s+table\s+books?|books?|"
