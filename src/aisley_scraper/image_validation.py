@@ -11,6 +11,10 @@ from typing import Any, Optional
 
 from aisley_scraper.hf_auth import ensure_hf_token_from_settings
 
+# Let any op the MPS (Apple-Silicon GPU) backend doesn't implement fall back to
+# CPU instead of raising. Must be set before torch initializes the MPS backend.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     raw = os.getenv(name)
@@ -417,15 +421,20 @@ def assess_image_quality(pil_img) -> dict[str, Any]:
 
 
 _CLIP_LOCK = threading.Lock()
+# Serializes actual model inference (encode_image/encode_text). The GPU/MPS
+# processes one batch at a time anyway, and serializing avoids MPS thread-safety
+# issues while letting download/decode/blur still run concurrently in workers.
+_CLIP_INFER_LOCK = threading.Lock()
 _CLIP_MODEL = None
 _CLIP_PREPROCESS = None
 _CLIP_TOKENIZER = None
+_CLIP_DEVICE = "cpu"
 _CLIP_TEXT_PROMPTS: Optional[list[str]] = None
 _CLIP_TEXT_FEATURES = None
 
 
 def _get_clip():
-    global _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_TOKENIZER
+    global _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_TOKENIZER, _CLIP_DEVICE
     with _CLIP_LOCK:
         if _CLIP_MODEL is not None:
             return _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_TOKENIZER
@@ -457,10 +466,31 @@ def _get_clip():
             model, _, preprocess = open_clip.create_model_and_transforms(model_name)
         tokenizer = open_clip.get_tokenizer(model_name)
 
+        # Run inference on the fastest available device: Apple-Silicon GPU (MPS,
+        # which uses unified memory so it adds no extra RAM), else CUDA, else CPU.
+        # Fall back to CPU if moving the model fails.
+        device = "cpu"
+        try:
+            if torch.backends.mps.is_available():
+                device = "mps"
+            elif torch.cuda.is_available():
+                device = "cuda"
+        except Exception:
+            device = "cpu"
+        if device != "cpu":
+            try:
+                model = model.to(device)
+            except Exception as exc:
+                logger.warning("CLIP: could not use device=%s (%s); falling back to CPU", device, exc)
+                device = "cpu"
+                model = model.to("cpu")
+
         model.eval()
         _CLIP_MODEL = model
         _CLIP_PREPROCESS = preprocess
         _CLIP_TOKENIZER = tokenizer
+        _CLIP_DEVICE = device
+        logger.info("CLIP model loaded on device=%s", device)
         return _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_TOKENIZER
 
 
@@ -489,7 +519,7 @@ def warmup_clip(*, strict: bool = True) -> None:
         if _CLIP_TEXT_FEATURES is not None and _CLIP_TEXT_PROMPTS == prompts:
             # Still proceed to the dummy forward pass below.
             pass
-        text_input = tokenizer(prompts)
+        text_input = tokenizer(prompts).to(_CLIP_DEVICE)
         with torch.no_grad():
             text_features = model.encode_text(text_input)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
@@ -501,7 +531,7 @@ def warmup_clip(*, strict: bool = True) -> None:
         from PIL import Image
 
         dummy = Image.new("RGB", (224, 224), color=(255, 255, 255))
-        image_input = _CLIP_PREPROCESS(dummy).unsqueeze(0)
+        image_input = _CLIP_PREPROCESS(dummy).unsqueeze(0).to(_CLIP_DEVICE)
         with torch.no_grad():
             _ = model.encode_image(image_input)
     except Exception as exc:
@@ -542,7 +572,7 @@ def product_probability_clip(pil_img) -> dict[str, Any]:
     prompts = product_prompts + non_product_prompts
     positive_count = len(product_prompts)
 
-    image_input = preprocess(pil_img.convert("RGB")).unsqueeze(0)
+    image_input = preprocess(pil_img.convert("RGB")).unsqueeze(0).to(_CLIP_DEVICE)
 
     # Use cached text embeddings if available; otherwise compute once and cache.
     with _CLIP_LOCK:
@@ -554,31 +584,39 @@ def product_probability_clip(pil_img) -> dict[str, Any]:
             cached_prompts = _CLIP_TEXT_PROMPTS
             cached_features = _CLIP_TEXT_FEATURES
     if cached_features is None or cached_prompts != prompts:
-        text_input = tokenizer(prompts)
-        with torch.no_grad():
+        text_input = tokenizer(prompts).to(_CLIP_DEVICE)
+        with torch.no_grad(), _CLIP_INFER_LOCK:
             text_features = model.encode_text(text_input)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
     else:
         text_features = cached_features
 
-    with torch.no_grad():
+    with torch.no_grad(), _CLIP_INFER_LOCK:
         image_features = model.encode_image(image_input)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         logit_scale = _clip_logit_scale(model)
         prompt_logits = (logit_scale * (image_features @ text_features.T)).squeeze(0)
         prompt_probs = torch.softmax(prompt_logits, dim=-1)
 
-    best_positive_idx = int(torch.argmax(prompt_probs[:positive_count]).item())
-    best_negative_idx_local = int(torch.argmax(prompt_probs[positive_count:]).item())
-    best_negative_idx = positive_count + best_negative_idx_local
-    best_idx = int(torch.argmax(prompt_probs).item())
+    # Pull the probabilities to host memory ONCE, then do all argmax/indexing on
+    # the Python list. Reading individual tensor elements (.item()) each force a
+    # device->host sync; on MPS/CUDA ~55 of them per image would erase the GPU
+    # speedup, so we do a single transfer here.
+    probs_list = prompt_probs.detach().to("cpu").tolist()
+
+    best_positive_idx = max(range(positive_count), key=lambda i: probs_list[i])
+    best_negative_idx = positive_count + max(
+        range(len(probs_list) - positive_count),
+        key=lambda i: probs_list[positive_count + i],
+    )
+    best_idx = max(range(len(probs_list)), key=lambda i: probs_list[i])
 
     # Binary score: ratio of best positive prompt probability to best negative.
     # This is more robust than averaging class feature embeddings, because it is
     # not fooled by dark/moody images matching an unrelated negative prompt
     # (e.g. "a meme") when CLIP's dominant match is clearly a positive prompt.
-    max_positive_prob = float(prompt_probs[best_positive_idx].item())
-    max_negative_prob = float(prompt_probs[best_negative_idx].item())
+    max_positive_prob = float(probs_list[best_positive_idx])
+    max_negative_prob = float(probs_list[best_negative_idx])
     # Equivalent to sigmoid(logit_scale * (cos_pos - cos_neg)): the shared softmax
     # denominator cancels, so this is a calibrated-by-logit_scale margin between
     # the best positive and best negative prompt. softmax outputs are strictly
@@ -596,7 +634,7 @@ def product_probability_clip(pil_img) -> dict[str, Any]:
             "product": product_prob,
             "non_product": non_product_prob,
         },
-        "probs": {prompts[i]: float(prompt_probs[i].item()) for i in range(len(prompts))},
+        "probs": {prompts[i]: float(probs_list[i]) for i in range(len(prompts))},
     }
 
 

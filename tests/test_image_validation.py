@@ -30,6 +30,15 @@ class _FakeTensor:
     def item(self) -> float:
         return float(np.array(self.values).item())
 
+    def to(self, _device):
+        return self
+
+    def detach(self):
+        return self
+
+    def tolist(self):
+        return np.array(self.values).tolist()
+
     def __matmul__(self, other):
         return _FakeTensor(self.values @ other.values)
 
@@ -96,6 +105,16 @@ class _FakeModel:
         return _FakeTensor(values)
 
 
+class _FakeTokenized:
+    """Stand-in for a tokenizer's tensor output; supports .to(device)."""
+
+    def __init__(self, prompts) -> None:
+        self.prompts = prompts
+
+    def to(self, _device):
+        return self
+
+
 class _FakeImage:
     def convert(self, _mode: str):
         return self
@@ -111,7 +130,7 @@ def _run_product_probability(monkeypatch, *, image_index: int, scale: float = 10
     monkeypatch.setattr(
         image_validation,
         "_get_clip",
-        lambda: (model, lambda image: _FakeTensor([1.0]), lambda prompts: prompts),
+        lambda: (model, lambda image: _FakeTensor([1.0]), lambda prompts: _FakeTokenized(prompts)),
     )
     monkeypatch.setattr(image_validation, "warmup_clip", lambda strict=False: None)
     monkeypatch.setattr(image_validation, "_CLIP_TEXT_PROMPTS", None)
