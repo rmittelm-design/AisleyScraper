@@ -1871,6 +1871,7 @@ def run_crawl(
 
                 seen_product_ids: set[str] = set()
                 yielded_any = False
+                kept_count = 0
 
                 for page in range(1, max_pages + 1):
                     products_url = f"{base}/products.json?limit={page_limit}&page={page}"
@@ -1878,29 +1879,31 @@ def run_crawl(
                     extracted = extract_products_from_products_json(payload, settings, base_url=base)
 
                     page_products = []
+                    hit_cap = False
                     for product in extracted:
                         if product.product_id in seen_product_ids:
                             continue
                         seen_product_ids.add(product.product_id)
-                        if product.images:
-                            normalized = normalize_product(product)
-                            if normalized is not None:
-                                page_products.append(normalized)
-
-                        if max_items_per_store > 0 and len(seen_product_ids) >= max_items_per_store:
-                            logger.warning(
-                                "Reached per-store product cap for %s: collected=%s cap=%s",
-                                base,
-                                len(seen_product_ids),
-                                max_items_per_store,
-                            )
-                            break
+                        normalized = normalize_product(product)
+                        if normalized is not None:
+                            page_products.append(normalized)
+                            kept_count += 1
+                            # Cap AFTER filtering: count only products that passed.
+                            if max_items_per_store > 0 and kept_count >= max_items_per_store:
+                                logger.warning(
+                                    "Reached per-store product cap (after filtering) for %s: kept=%s cap=%s",
+                                    base,
+                                    kept_count,
+                                    max_items_per_store,
+                                )
+                                hit_cap = True
+                                break
 
                     if page_products:
                         yielded_any = True
                         yield ScrapeResult(store=store, products=page_products)
 
-                    if max_items_per_store > 0 and len(seen_product_ids) >= max_items_per_store:
+                    if hit_cap:
                         break
 
                     products_raw = payload.get("products", []) if isinstance(payload, dict) else []

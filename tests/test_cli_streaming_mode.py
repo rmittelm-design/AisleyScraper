@@ -24,13 +24,13 @@ class _FakeFetcher:
                         "id": 1001,
                         "handle": "item-1001",
                         "title": "Item 1001",
-                        "images": [{"src": "https://cdn.example.com/1001.jpg"}],
+                        "images": [{"src": "https://cdn.example.com/1001-0.jpg"}, {"src": "https://cdn.example.com/1001-1.jpg"}, {"src": "https://cdn.example.com/1001-2.jpg"}, {"src": "https://cdn.example.com/1001-3.jpg"}],
                     },
                     {
                         "id": 1002,
                         "handle": "item-1002",
                         "title": "Item 1002",
-                        "images": [{"src": "https://cdn.example.com/1002.jpg"}],
+                        "images": [{"src": "https://cdn.example.com/1002-0.jpg"}, {"src": "https://cdn.example.com/1002-1.jpg"}, {"src": "https://cdn.example.com/1002-2.jpg"}, {"src": "https://cdn.example.com/1002-3.jpg"}],
                     },
                 ]
             }
@@ -41,7 +41,7 @@ class _FakeFetcher:
                         "id": 1003,
                         "handle": "item-1003",
                         "title": "Item 1003",
-                        "images": [{"src": "https://cdn.example.com/1003.jpg"}],
+                        "images": [{"src": "https://cdn.example.com/1003-0.jpg"}, {"src": "https://cdn.example.com/1003-1.jpg"}, {"src": "https://cdn.example.com/1003-2.jpg"}, {"src": "https://cdn.example.com/1003-3.jpg"}],
                     }
                 ]
             }
@@ -144,27 +144,17 @@ def test_run_crawl_streaming_mode_persists_page_by_page_without_orchestrator_fet
         _ = (products, fetcher, settings)
         return None
 
-    async def _fake_enrich_gender_probabilities_for_products(*, products, fetcher, concurrency):
-        _ = (products, fetcher, concurrency)
-        for product in products:
-            if product.gender_probs_csv is None:
-                product.gender_probs_csv = "0.1,0.8,0.1"
 
     _FakeRestRepo.inserted_product_ids = []
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
     monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
     monkeypatch.setattr(cli, "_build_db_first_seeds", lambda _settings, _repo: [seed])
-    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRestRepo)
+    monkeypatch.setattr(cli, "Repository", _FakeRestRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
     monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
     monkeypatch.setattr(cli, "classify_store", _fake_classify_store)
     monkeypatch.setattr(cli, "verify_product_images", _fake_verify_product_images)
-    monkeypatch.setattr(
-        cli,
-        "enrich_gender_probabilities_for_products",
-        _fake_enrich_gender_probabilities_for_products,
-    )
     monkeypatch.setattr(orchestrator, "Fetcher", _FailIfUsedFetcher)
 
     exit_code = cli.run_crawl(limit=1, fresh=True)

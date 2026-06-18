@@ -6,6 +6,11 @@ from aisley_scraper.crawl import orchestrator
 from aisley_scraper.models import ScrapeResult, StoreProfile, StoreSeed
 
 
+def _imgs(prefix: str) -> list[dict]:
+    # >= 4 images so products pass the min-images filter.
+    return [{"src": f"https://cdn.example.com/{prefix}-{i}.jpg"} for i in range(4)]
+
+
 class _FakeFetcher:
     def __init__(self, _settings: Settings) -> None:
         _ = _settings
@@ -22,7 +27,7 @@ class _FakeFetcher:
                         "id": 101,
                         "handle": "item-101",
                         "title": "Item 101",
-                        "images": [{"src": "https://cdn.example.com/101.jpg"}],
+                        "images": _imgs("101"),
                     }
                 ]
             }
@@ -33,7 +38,7 @@ class _FakeFetcher:
                         "id": 202,
                         "handle": "item-202",
                         "title": "Item 202",
-                        "images": [{"src": "https://cdn.example.com/202.jpg"}],
+                        "images": _imgs("202"),
                     }
                 ]
             }
@@ -69,17 +74,9 @@ def test_scrape_store_fetches_multiple_pages(monkeypatch) -> None:
         _ = (products, fetcher, settings)
         return None
 
-    async def _fake_enrich_gender_probabilities_for_products(*, products, fetcher, concurrency):
-        _ = (products, fetcher, concurrency)
-        return None
 
     monkeypatch.setattr(orchestrator, "classify_store", _fake_classify_store)
     monkeypatch.setattr(orchestrator, "verify_product_images", _fake_verify_product_images)
-    monkeypatch.setattr(
-        orchestrator,
-        "enrich_gender_probabilities_for_products",
-        _fake_enrich_gender_probabilities_for_products,
-    )
 
     result = asyncio.run(orchestrator.scrape_store(seed, settings, _FakeFetcher(settings)))
 
@@ -140,7 +137,7 @@ def test_scrape_store_continues_on_sparse_pages_until_empty(monkeypatch) -> None
                             "id": 301,
                             "handle": "item-301",
                             "title": "Item 301",
-                            "images": [{"src": "https://cdn.example.com/301.jpg"}],
+                            "images": _imgs("301"),
                         }
                     ]
                 }
@@ -151,7 +148,7 @@ def test_scrape_store_continues_on_sparse_pages_until_empty(monkeypatch) -> None
                             "id": 302,
                             "handle": "item-302",
                             "title": "Item 302",
-                            "images": [{"src": "https://cdn.example.com/302.jpg"}],
+                            "images": _imgs("302"),
                         }
                     ]
                 }
@@ -168,17 +165,9 @@ def test_scrape_store_continues_on_sparse_pages_until_empty(monkeypatch) -> None
         _ = (products, fetcher, settings)
         return None
 
-    async def _fake_enrich_gender_probabilities_for_products(*, products, fetcher, concurrency):
-        _ = (products, fetcher, concurrency)
-        return None
 
     monkeypatch.setattr(orchestrator, "classify_store", _fake_classify_store)
     monkeypatch.setattr(orchestrator, "verify_product_images", _fake_verify_product_images)
-    monkeypatch.setattr(
-        orchestrator,
-        "enrich_gender_probabilities_for_products",
-        _fake_enrich_gender_probabilities_for_products,
-    )
 
     result = asyncio.run(orchestrator.scrape_store(seed, settings, _SparsePageFetcher(settings)))
 
@@ -218,7 +207,7 @@ def test_scrape_store_uses_seed_name_and_address_when_present(monkeypatch) -> No
     seed = StoreSeed(
         store_url="https://example.com",
         store_name="Seeded Name",
-        address="Seeded Address",
+        addresses=["Seeded Address"],
     )
 
     def _fake_classify_store(_homepage: str, base: str, _settings: Settings) -> StoreProfile:
@@ -234,17 +223,9 @@ def test_scrape_store_uses_seed_name_and_address_when_present(monkeypatch) -> No
         _ = (products, fetcher, settings)
         return None
 
-    async def _fake_enrich_gender_probabilities_for_products(*, products, fetcher, concurrency):
-        _ = (products, fetcher, concurrency)
-        return None
 
     monkeypatch.setattr(orchestrator, "classify_store", _fake_classify_store)
     monkeypatch.setattr(orchestrator, "verify_product_images", _fake_verify_product_images)
-    monkeypatch.setattr(
-        orchestrator,
-        "enrich_gender_probabilities_for_products",
-        _fake_enrich_gender_probabilities_for_products,
-    )
 
     result = asyncio.run(orchestrator.scrape_store(seed, settings, _FakeFetcher(settings)))
 
