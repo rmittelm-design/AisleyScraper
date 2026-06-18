@@ -203,6 +203,15 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Don't geocode new branch addresses (leave lat/long NULL; fill on a later run)",
     )
+    rebuild.add_argument(
+        "--include-missing",
+        action="store_true",
+        help=(
+            "Also create rows for TSV stores not yet in the table (TSV-derived, "
+            "no products) and a single row for address-less TSV stores, so the "
+            "stores table fully mirrors the TSVs"
+        ),
+    )
 
     prune = sub.add_parser(
         "prune-stores",
@@ -430,31 +439,39 @@ def _build_db_first_seeds(settings, repo: Repository) -> list[StoreSeed]:
     return db_seeds + csv_new
 
 
-def run_rebuild_branches(limit: int | None = None, skip_geocode: bool = False) -> int:
-    """Materialize/reconcile branch store rows from the TSV branch addresses
-    against the EXISTING production stores — no re-scrape, no image work.
+def run_rebuild_branches(
+    limit: int | None = None,
+    skip_geocode: bool = False,
+    include_missing: bool = False,
+) -> int:
+    """Materialize/reconcile branch store rows from the TSV branch addresses —
+    no re-scrape, no image work.
 
-    For every domain that has branch addresses in ``INPUT_TSV_DIR`` and an
-    existing ``shopify_stores`` row, build one branch profile per address (copied
-    from the live store row, geocoded best-effort) and call
-    ``sync_store_branches``. That reuses existing row ids by domain (so each
-    store's products stay on its single original id), creates the missing branch
-    rows, converges websites to canonical, and drops stale rows. Idempotent and
-    re-runnable; lat/long already present is preserved, so a later run just fills
-    in addresses that failed to geocode.
+    Default: for every domain that has branch addresses in ``INPUT_TSV_DIR`` AND
+    an existing ``shopify_stores`` row, build one branch profile per address
+    (copied from the live row, geocoded best-effort) and call
+    ``sync_store_branches`` — reusing existing ids (products stay on one id),
+    creating missing branch rows, converging websites to canonical, dropping
+    stale rows. Idempotent; existing lat/long is preserved.
+
+    With ``include_missing=True`` the stores table is made to fully mirror the
+    TSVs: stores not yet in the table get rows from a TSV-derived profile (no
+    products), and address-less TSV stores get a single online row.
     """
     settings = get_settings()
     _setup_logging(settings.log_level)
     repo = Repository(settings)
     repo.ensure_schema()
 
-    branch_addresses_by_domain: dict[str, list[str]] = {}
+    # One seed per domain from the TSVs (dedup, preserve order).
+    seed_by_domain: dict[str, StoreSeed] = {}
     for seed in load_store_seeds_from_dir(settings.input_tsv_dir, settings):
-        if seed.addresses:
-            branch_addresses_by_domain[_domain_key(seed.store_url)] = list(seed.addresses)
+        domain = _domain_key(seed.store_url)
+        if domain and domain not in seed_by_domain:
+            seed_by_domain[domain] = seed
 
-    # One base profile per domain — prefer the row that already carries an
-    # address (the live, products-bearing row).
+    # One base profile per existing domain — prefer the row that already carries
+    # an address (the live, products-bearing row).
     base_by_domain: dict[str, StoreProfile] = {}
     for profile in repo.list_all_store_profiles():
         domain = _domain_key(profile.website)
@@ -482,31 +499,55 @@ def run_rebuild_branches(limit: int | None = None, skip_geocode: bool = False) -
                 geocode_cache[key] = None
         return geocode_cache[key]
 
-    domains = [d for d in branch_addresses_by_domain if d in base_by_domain]
+    domains = list(seed_by_domain.keys())
     if limit is not None:
         domains = domains[:limit]
 
     reconciled = 0
+    created = 0
     total_rows = 0
     for domain in domains:
-        base = base_by_domain[domain]
-        branches: list[StoreProfile] = []
-        for address in branch_addresses_by_domain[domain]:
-            branch = replace(base, address=address, lat=None, long=None)
-            coords = _geocode(address)
-            if coords is not None:
-                branch.lat, branch.long = coords
-            branches.append(branch)
+        seed = seed_by_domain[domain]
+        base = base_by_domain.get(domain)
+        in_prod = base is not None
+        if not in_prod:
+            if not include_missing:
+                continue
+            # TSV-derived profile; sync/upsert canonicalize the website on write.
+            base = StoreProfile(
+                store_name=seed.store_name or domain,
+                website=seed.store_url,
+                store_type="online",
+            )
+            created += 1
+
         try:
-            ids = repo.sync_store_branches(base.website, branches)
+            if seed.addresses:
+                branches: list[StoreProfile] = []
+                for address in seed.addresses:
+                    branch = replace(base, address=address, lat=None, long=None)
+                    coords = _geocode(address)
+                    if coords is not None:
+                        branch.lat, branch.long = coords
+                    branches.append(branch)
+                ids = repo.sync_store_branches(base.website, branches)
+                total_rows += len(ids)
+            else:
+                # Address-less store: ensure a single online row exists. Only
+                # actively created in include_missing mode.
+                if not include_missing:
+                    continue
+                repo.upsert_store(base)
+                total_rows += 1
         except Exception as exc:
             logger.warning("rebuild-branches failed for domain=%s: %s", domain, exc)
             continue
         reconciled += 1
-        total_rows += len(ids)
-        print(f"{domain}: {len(ids)} branch row(s)")
 
-    print(f"Rebuilt branches for {reconciled} domain(s) ({total_rows} store rows).")
+    print(
+        f"Rebuilt {reconciled} store(s) ({total_rows} rows; "
+        f"{created} newly created from the TSV)."
+    )
     return 0
 
 
@@ -2353,6 +2394,7 @@ def main() -> int:
         return run_rebuild_branches(
             limit=getattr(args, "limit", None),
             skip_geocode=getattr(args, "skip_geocode", False),
+            include_missing=getattr(args, "include_missing", False),
         )
     if args.command == "prune-stores":
         return run_prune_stores(execute=getattr(args, "execute", False))
