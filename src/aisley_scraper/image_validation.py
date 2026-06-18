@@ -24,8 +24,11 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
         return default
     return value
 
-MAX_IMAGE_BYTES = 10 * 1024 * 1024
-REQUIRED_MIN_WIDTH = 650
+# Decode guard only — scraped images are not saved by these validators; this
+# just avoids decoding a pathologically large file into memory.
+MAX_IMAGE_BYTES = 50 * 1024 * 1024
+# Keep in sync with config IMAGE_MIN_WIDTH / IMAGE_MIN_HEIGHT (defaults below).
+REQUIRED_MIN_WIDTH = 600
 REQUIRED_MIN_HEIGHT = 800
 REQUIRED_MAX_WIDTH = 12000
 REQUIRED_MAX_HEIGHT = 12000
@@ -55,19 +58,54 @@ MIN_CONTRAST_STD = 18.0
 # richer prompts, so we can keep a stricter threshold.
 MIN_PRODUCT_PROB = 0.50
 
-CLIP_PRODUCT_POSITIVE_PROMPTS = [
+# Broad fashion category taxonomy vendored from the AisleyRebrand backend
+# (app/services/labels.py :: COARSE_CATEGORIES, 41 classes) plus pajamas and
+# lingerie. These are the positive ("is fashion") classes; the configured
+# FashionSigLIP model encodes them. List order is not significant here — the
+# classifier only takes the single best-matching category (max-vs-max).
+BROAD_FASHION_CATEGORIES: list[str] = [
+    "coats", "jackets", "trench", "blazer-as-outerwear", "puffers", "tees",
+    "shirts", "blouses", "sweaters", "cardigans", "hoodies", "sweatshirts",
+    "jeans", "trousers", "pants", "shorts", "skirts", "dresses", "jumpsuits",
+    "rompers", "boots", "sneakers", "heels", "flats", "sandals", "totes",
+    "handbags", "backpacks", "crossbody", "jewelry", "belts", "scarves", "hats",
+    "sunglasses", "leggings", "sports bras", "sets", "sweats", "gowns",
+    "cocktail", "suiting", "pajamas", "lingerie", "sleepwear", "underwear",
+    "tops", "bottoms",
+]
+
+# Natural-language phrasing for prompts (some tokens need expanding,
+# e.g. "trench" -> "a trench coat"). Falls back to the raw token.
+_CATEGORY_PROMPT_PHRASE: dict[str, str] = {
+    "coats": "a coat", "jackets": "a jacket", "trench": "a trench coat",
+    "blazer-as-outerwear": "a blazer", "puffers": "a puffer jacket",
+    "tees": "a t-shirt", "shirts": "a shirt", "blouses": "a blouse",
+    "sweaters": "a sweater", "cardigans": "a cardigan", "hoodies": "a hoodie",
+    "sweatshirts": "a sweatshirt", "jeans": "jeans", "trousers": "trousers",
+    "pants": "pants", "shorts": "shorts", "skirts": "a skirt", "dresses": "a dress",
+    "jumpsuits": "a jumpsuit", "rompers": "a romper", "boots": "boots",
+    "sneakers": "sneakers", "heels": "high heels", "flats": "flat shoes",
+    "sandals": "sandals", "totes": "a tote bag", "handbags": "a handbag",
+    "backpacks": "a backpack", "crossbody": "a crossbody bag", "jewelry": "jewelry",
+    "belts": "a belt", "scarves": "a scarf", "hats": "a hat", "sunglasses": "sunglasses",
+    "leggings": "leggings", "sports bras": "a sports bra", "sets": "a matching clothing set",
+    "sweats": "sweatpants", "gowns": "a gown", "cocktail": "a cocktail dress",
+    "suiting": "a suit", "pajamas": "pajamas", "lingerie": "lingerie",
+    "sleepwear": "sleepwear", "underwear": "underwear", "tops": "a top",
+    "bottoms": "bottoms",
+}
+
+# Generic apparel anchors (catch fashion not captured by a specific category,
+# and an on-model anchor so model shots aren't lost to portrait negatives).
+_GENERIC_FASHION_PROMPTS = [
     "an ecommerce product photo of clothing",
-    "a catalog photo of a garment",
-    "a studio photo of apparel on a plain background",
-    "a fashion product image with a model",
-    "a clothing item laid flat for online store listing",
-    "an ecommerce product photo of shoes",
-    "a catalog photo of footwear",
-    "a studio product image of sneakers or heels",
-    "an ecommerce product photo of a handbag or accessory",
-    "a catalog image of sunglasses, belt, or hat",
-    "a product photo of jewelry on a clean background",
-    "a catalog image of necklace, ring, bracelet, or earrings",
+    "a fashion product photo of an apparel item worn by a model",
+    "a product photo of footwear",
+]
+
+CLIP_PRODUCT_POSITIVE_PROMPTS = _GENERIC_FASHION_PROMPTS + [
+    f"a product photo of {_CATEGORY_PROMPT_PHRASE.get(cat, cat)}"
+    for cat in BROAD_FASHION_CATEGORIES
 ]
 
 CLIP_PRODUCT_NEGATIVE_PROMPTS = [
@@ -104,6 +142,13 @@ CLIP_PRODUCT_NEGATIVE_PROMPTS = [
     "a product photo of sports equipment gym gear or bicycles",
     "a product photo of toys board games or puzzles",
     "a product photo of medical supplies vitamins or supplements",
+    # Reinforce Layer-1 keyword categories that previously had no image backstop.
+    "a product photo of skincare lotion balm serum tanner or cosmetics",
+    "a product photo of shampoo conditioner soap or hair products",
+    "a product photo of a tumbler water bottle mug or drinkware",
+    "a product photo of a scrunchie hair tie or hair clip",
+    "a product photo of a diffuser candle or home fragrance",
+    "a product photo of a mirror tray sponge or pouch",
 ]
 
 # Only reject as too bright/dark when the image is both extreme in mean brightness
@@ -273,14 +318,19 @@ def assess_image_quality(pil_img) -> dict[str, Any]:
 
     img = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    del img  # full-res RGB array not needed past the grayscale conversion
 
     h, w = gray.shape[:2]
-    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    # Use float32 (not float64) for these full-res derivative arrays: it halves
+    # the per-image working set (the dominant memory cost at high resolution),
+    # and the variance / threshold values are unchanged within float32 precision.
+    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
     blur_score_global = float(laplacian.var())
 
-    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     gradient_mag = cv2.magnitude(grad_x, grad_y)
+    del grad_x, grad_y  # only needed to compute gradient_mag
 
     edge_percentile = float(np.percentile(gradient_mag, 75.0))
     edge_threshold = max(edge_percentile, 1.0)
@@ -373,9 +423,6 @@ _CLIP_TOKENIZER = None
 _CLIP_TEXT_PROMPTS: Optional[list[str]] = None
 _CLIP_TEXT_FEATURES = None
 
-_CLIP_GENDER_PROMPTS: Optional[list[str]] = None
-_CLIP_GENDER_TEXT_FEATURES = None
-
 
 def _get_clip():
     global _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_TOKENIZER
@@ -393,12 +440,22 @@ def _get_clip():
                 details={"dependencies": ["torch", "open-clip-torch"], "error": str(exc)},
             )
 
-        # This will download weights the first time if not already cached.
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            "ViT-B-32",
-            pretrained="laion2b_s34b_b79k",
-        )
-        tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        # Resolve the configured encoder (defaults to Marqo-FashionSigLIP via
+        # open_clip hf-hub). This will download weights the first time if not
+        # already cached.
+        from aisley_scraper.config import get_settings
+
+        settings = get_settings()
+        model_name = (settings.clip_model_name or "").strip() or "hf-hub:Marqo/marqo-fashionSigLIP"
+        pretrained = (settings.clip_pretrained or "").strip()
+        if pretrained:
+            model, _, preprocess = open_clip.create_model_and_transforms(
+                model_name, pretrained=pretrained
+            )
+        else:
+            # hf-hub checkpoints bundle their weights; no separate pretrained tag.
+            model, _, preprocess = open_clip.create_model_and_transforms(model_name)
+        tokenizer = open_clip.get_tokenizer(model_name)
 
         model.eval()
         _CLIP_MODEL = model
@@ -415,7 +472,6 @@ def warmup_clip(*, strict: bool = True) -> None:
     """
 
     global _CLIP_TEXT_PROMPTS, _CLIP_TEXT_FEATURES
-    global _CLIP_GENDER_PROMPTS, _CLIP_GENDER_TEXT_FEATURES
 
     try:
         model, _, tokenizer = _get_clip()
@@ -431,7 +487,7 @@ def warmup_clip(*, strict: bool = True) -> None:
     # Encode text prompts once.
     with _CLIP_LOCK:
         if _CLIP_TEXT_FEATURES is not None and _CLIP_TEXT_PROMPTS == prompts:
-            # Still proceed to gender prompt warmup + dummy forward pass below.
+            # Still proceed to the dummy forward pass below.
             pass
         text_input = tokenizer(prompts)
         with torch.no_grad():
@@ -439,22 +495,6 @@ def warmup_clip(*, strict: bool = True) -> None:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         _CLIP_TEXT_PROMPTS = prompts
         _CLIP_TEXT_FEATURES = text_features
-
-    gender_prompts = [
-        "a product photo of men's clothing",
-        "a product photo of women's clothing",
-        "a product photo of unisex clothing",
-    ]
-
-    with _CLIP_LOCK:
-        if _CLIP_GENDER_TEXT_FEATURES is not None and _CLIP_GENDER_PROMPTS == gender_prompts:
-            pass
-        gender_text_input = tokenizer(gender_prompts)
-        with torch.no_grad():
-            gender_text_features = model.encode_text(gender_text_input)
-            gender_text_features = gender_text_features / gender_text_features.norm(dim=-1, keepdim=True)
-        _CLIP_GENDER_PROMPTS = gender_prompts
-        _CLIP_GENDER_TEXT_FEATURES = gender_text_features
 
     # Dummy forward pass to reduce first-request latency (torch/OpenCLIP can do lazy init).
     try:
@@ -482,82 +522,6 @@ def warmup_quality_checks(*, strict: bool = False) -> None:
         if strict:
             raise
         logger.warning("Quality warmup failed: %s", exc)
-
-
-def _format_probs_csv(values: list[float]) -> str:
-    # Stable + compact string for storage.
-    return ",".join(f"{v:.6f}" for v in values)
-
-
-def _parse_probs_csv(value: Optional[str]) -> Optional[list[float]]:
-    if not value:
-        return None
-    parts = [p.strip() for p in str(value).split(",")]
-    if len(parts) != 3:
-        return None
-    try:
-        return [float(parts[0]), float(parts[1]), float(parts[2])]
-    except Exception:
-        return None
-
-
-def gender_probs_clip(pil_img) -> dict[str, Any]:
-    """Return CLIP-based gender probabilities for an image.
-
-    Output probabilities are ordered: [male, female, unisex].
-    """
-    global _CLIP_GENDER_PROMPTS, _CLIP_GENDER_TEXT_FEATURES
-
-    model, preprocess, tokenizer = _get_clip()
-    try:
-        import torch
-    except Exception as exc:  # pragma: no cover
-        raise ImageValidationFailure(
-            code="gender_check_unavailable",
-            message="Server is missing torch; gender verification is unavailable.",
-            details={"dependency": "torch", "error": str(exc)},
-        )
-
-    prompts = [
-        "a product photo of men's clothing",
-        "a product photo of women's clothing",
-        "a product photo of unisex clothing",
-    ]
-    labels = ["male", "female", "unisex"]
-
-    image_input = preprocess(pil_img.convert("RGB")).unsqueeze(0)
-
-    with _CLIP_LOCK:
-        cached_prompts = _CLIP_GENDER_PROMPTS
-        cached_features = _CLIP_GENDER_TEXT_FEATURES
-    if cached_features is None or cached_prompts != prompts:
-        warmup_clip(strict=False)
-        with _CLIP_LOCK:
-            cached_prompts = _CLIP_GENDER_PROMPTS
-            cached_features = _CLIP_GENDER_TEXT_FEATURES
-    if cached_features is None or cached_prompts != prompts:
-        text_input = tokenizer(prompts)
-        with torch.no_grad():
-            text_features = model.encode_text(text_input)
-            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    else:
-        text_features = cached_features
-
-    with torch.no_grad():
-        image_features = model.encode_image(image_input)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        logits = (image_features @ text_features.T).squeeze(0)
-        probs = torch.softmax(logits, dim=-1)
-
-    values = [float(probs[i].item()) for i in range(len(labels))]
-    winner_idx = int(torch.argmax(probs).item())
-    winner = labels[winner_idx]
-    return {
-        "labels": labels,
-        "probs": {labels[i]: values[i] for i in range(len(labels))},
-        "probs_csv": _format_probs_csv(values),
-        "winner": winner,
-    }
 
 
 def product_probability_clip(pil_img) -> dict[str, Any]:
@@ -615,14 +579,16 @@ def product_probability_clip(pil_img) -> dict[str, Any]:
     # (e.g. "a meme") when CLIP's dominant match is clearly a positive prompt.
     max_positive_prob = float(prompt_probs[best_positive_idx].item())
     max_negative_prob = float(prompt_probs[best_negative_idx].item())
+    # Equivalent to sigmoid(logit_scale * (cos_pos - cos_neg)): the shared softmax
+    # denominator cancels, so this is a calibrated-by-logit_scale margin between
+    # the best positive and best negative prompt. softmax outputs are strictly
+    # > 0, so denom is always > 0; fall back to 0.0 (fail-safe drop) defensively.
     denom = max_positive_prob + max_negative_prob
-    product_prob = (max_positive_prob / denom) if denom > 0 else 0.5
+    product_prob = (max_positive_prob / denom) if denom > 0 else 0.0
     non_product_prob = 1.0 - product_prob
-    product_margin = max_positive_prob - max_negative_prob
     return {
         "product_prob": product_prob,
         "non_product_prob": non_product_prob,
-        "product_margin": product_margin,
         "best_positive_prompt": prompts[best_positive_idx],
         "best_negative_prompt": prompts[best_negative_idx],
         "best_prompt": prompts[best_idx],
@@ -659,7 +625,7 @@ def validate_and_normalize_upload(
     if len(content) > MAX_IMAGE_BYTES:
         raise ImageValidationFailure(
             code="file_too_large",
-            message="Image must be smaller than 10MB.",
+            message=f"Image must be smaller than {MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
             details={"max_bytes": MAX_IMAGE_BYTES, "actual_bytes": len(content)},
         )
 
@@ -689,7 +655,7 @@ def validate_and_normalize_upload(
         if len(normalized_bytes) > MAX_IMAGE_BYTES:
             raise ImageValidationFailure(
                 code="file_too_large",
-                message="Image must be smaller than 10MB.",
+                message=f"Image must be smaller than {MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
                 details={"max_bytes": MAX_IMAGE_BYTES, "actual_bytes": len(normalized_bytes)},
             )
         normalized_name = _replace_ext(safe_name, ".jpg")
@@ -831,11 +797,16 @@ def validate_product_photo_only(
     content: bytes,
     filename: str,
     min_product_prob: float = MIN_PRODUCT_PROB,
+    min_width: int = REQUIRED_MIN_WIDTH,
+    min_height: int = REQUIRED_MIN_HEIGHT,
+    check_quality: bool = True,
 ) -> dict[str, Any]:
     """Validate only whether an image appears to be a product photo.
 
     This is intentionally lighter than full image validation and is meant for
-    phase-2 first-image gating.
+    phase-2 first-image gating. When ``check_quality`` is set it also applies a
+    lightweight size + blur gate (the contrast/brightness gates are skipped, as
+    those false-reject valid white-background flat-lays).
     """
     if not content:
         raise ImageValidationFailure(code="empty_file", message="Upload is empty.")
@@ -843,13 +814,33 @@ def validate_product_photo_only(
     if len(content) > MAX_IMAGE_BYTES:
         raise ImageValidationFailure(
             code="file_too_large",
-            message="Image must be smaller than 10MB.",
+            message=f"Image must be smaller than {MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
             details={"max_bytes": MAX_IMAGE_BYTES, "actual_bytes": len(content)},
         )
 
     safe_name = _safe_basename(filename)
     _ = safe_name
     pil_img = _open_pil_image(content)
+
+    if check_quality:
+        width, height = int(getattr(pil_img, "width", 0)), int(getattr(pil_img, "height", 0))
+        if width < min_width or height < min_height:
+            raise ImageValidationFailure(
+                code="resolution_too_low",
+                message=f"Image resolution is too low. Minimum is {min_width}x{min_height} pixels.",
+                details={"width": width, "height": height, "min_width": min_width, "min_height": min_height},
+            )
+        quality = assess_image_quality(pil_img)
+        if bool(quality.get("is_blurry", False)):
+            raise ImageValidationFailure(
+                code="image_too_blurry",
+                message="Image is too blurry. Please upload a sharper photo.",
+                details={
+                    "blur_score": quality.get("blur_score"),
+                    "min_blur_score": quality.get("adaptive_min_blur_score", MIN_BLUR_SCORE),
+                },
+            )
+
     product = product_probability_clip(pil_img)
     product_prob = float(product.get("product_prob", 0.0))
     threshold = float(min_product_prob)
