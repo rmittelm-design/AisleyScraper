@@ -45,6 +45,11 @@ ENV PERSISTENCE_TARGET=supabase \
     IMAGE_VALIDATION_CONCURRENCY=4 \
     PHASE2_UPLOAD_CONCURRENCY=6 \
     PHASE2_STORE_BATCH_SIZE=6 \
-    CLIP_MODEL_NAME=hf-hub:Marqo/marqo-fashionSigLIP
+    CLIP_MODEL_NAME=hf-hub:Marqo/marqo-fashionSigLIP \
+    # --- Safety defaults (override consciously) ---
+    # Never delete stores on a Phase 1 crawl, and don't re-geocode branches that
+    # already have coordinates. Image uploads were removed in code.
+    PRUNE_NONTSV_STORES=false \
+    GEOCODING_ENABLED=false
 
-ENTRYPOINT ["python", "cloud/run_phase2_shard.py"]
+ENTRYPOINT ["python", "cloud/run_pipeline.py"]
