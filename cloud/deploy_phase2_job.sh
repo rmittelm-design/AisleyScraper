@@ -9,12 +9,14 @@
 #   ./cloud/deploy_phase2_job.sh all            # secrets + build + deploy
 #
 # Tunables (env vars, with defaults):
-#   PROJECT, REGION, REPO, IMAGE, JOB, TASKS, PARALLELISM, CPU, MEMORY, TASK_TIMEOUT
+#   PROJECT, REGION, IMAGE, JOB, TASKS, PARALLELISM, CPU, MEMORY, TASK_TIMEOUT
 set -euo pipefail
 
-PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
+# Same GCP project + region as the Aisley Rebrand backend (aisley-backend runs in
+# project "aisley", region "us-east1"). Hardcoded so the deploy doesn't depend on
+# the active `gcloud config` project, which can drift. Override via env if needed.
+PROJECT="${PROJECT:-aisley}"
 REGION="${REGION:-us-east1}"
-REPO="${REPO:-aisley}"                       # Artifact Registry repo
 IMAGE="${IMAGE:-aisley-phase2}"
 TAG="${TAG:-latest}"
 JOB="${JOB:-aisley-phase2}"
@@ -25,7 +27,9 @@ MEMORY="${MEMORY:-4Gi}"
 TASK_TIMEOUT="${TASK_TIMEOUT:-7200s}"         # per-shard wall-clock budget
 MAX_RETRIES="${MAX_RETRIES:-1}"
 
-IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${IMAGE}:${TAG}"
+# gcr.io to match the backend's image convention (gcr.io/aisley/aisley-backend);
+# no Artifact Registry repo to pre-create.
+IMAGE_URI="gcr.io/${PROJECT}/${IMAGE}:${TAG}"
 ENV_FILE="${ENV_FILE:-.env}"
 
 # Non-secret config passed straight to the job (read from .env, with fallbacks).
@@ -58,9 +62,7 @@ _put_secret() {
 }
 
 cmd_build() {
-  gcloud artifacts repositories describe "$REPO" --project "$PROJECT" --location "$REGION" >/dev/null 2>&1 \
-    || gcloud artifacts repositories create "$REPO" --project "$PROJECT" --location "$REGION" --repository-format=docker
-  echo ">> Building $IMAGE_URI"
+  echo ">> Building $IMAGE_URI (project=$PROJECT region=$REGION)"
   gcloud builds submit --project "$PROJECT" --tag "$IMAGE_URI" .
 }
 

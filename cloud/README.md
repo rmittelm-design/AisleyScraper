@@ -22,9 +22,13 @@ The same flags exist on the CLI: `crawl-stores --phase 2 --shard-index k --shard
 
 ## Prerequisites
 - A staged run to enrich. Get its id with `aisley-scraper diagnose-staged-runs`.
-- `gcloud` authed to the right project (currently `aisley`, region `us-east1`).
+- `gcloud` authed with access to project **`aisley`**, region **`us-east1`** — the
+  same project/region as the Aisley Rebrand backend (`aisley-backend`). These are
+  the deploy script's defaults (override with `PROJECT=` / `REGION=`); images go
+  to `gcr.io/aisley/aisley-phase2`, matching the backend's image convention.
 - Your local `.env` with `DATABASE_URL`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
-  `SUPABASE_STORAGE_BUCKET`, `SUPABASE_STORAGE_PATH`.
+  `SUPABASE_STORAGE_BUCKET`, `SUPABASE_STORAGE_PATH`. (These already point at the
+  same Supabase project as the backend.)
 
 ## One-time setup
 ```bash
@@ -51,7 +55,10 @@ skipped and completed stores are removed from staging, so it resumes.
   `PHASE2_UPLOAD_CONCURRENCY=6`, `IMAGE_VALIDATION_CONCURRENCY=4`,
   `CRAWL_GLOBAL_CONCURRENCY=4`, `PHASE2_STORE_BATCH_SIZE=6`,
   `FETCHER_DISK_CACHE_ENABLED=false` (Cloud Run's FS is in-memory, so the disk
-  cache would just eat RAM — the in-memory byte cache covers it).
+  cache would just eat RAM — the in-memory byte cache covers it), and
+  `DB_CONNECT_TIMEOUT_SEC=30` (the job runs in `us-east1` but the Supabase DB is
+  in `us-west-2`; the backend found the default 10s connect timeout intermittently
+  expires cross-region).
 - **Load balance:** hash sharding splits by store *count*, not size, so a few
   giant stores can make one shard finish last. If that bites, raise `TASKS`.
 
