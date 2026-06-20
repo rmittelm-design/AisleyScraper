@@ -702,15 +702,14 @@ class Repository:
                 cur.execute(sql, (store_id, product_id))
             conn.commit()
 
-    def delete_products_batch(self, pairs: list[tuple[int, str]]) -> int:
-        """Delete many products in one statement. ``pairs`` are exact
-        (store_id, product_id) tuples — only those rows are removed."""
-        if not pairs:
+    def delete_products_by_ids(self, ids: list[int]) -> int:
+        """Delete many products in one statement by their primary-key ids."""
+        if not ids:
             return 0
-        sql = "delete from shopify_products where (store_id, product_id) in %s;"
+        sql = "delete from shopify_products where id = any(%s);"
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (tuple((int(s), str(p)) for s, p in pairs),))
+                cur.execute(sql, ([int(i) for i in ids],))
                 deleted = cur.rowcount
             conn.commit()
         return deleted

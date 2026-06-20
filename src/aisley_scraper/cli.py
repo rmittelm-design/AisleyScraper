@@ -689,7 +689,7 @@ def run_prune_nonfashion(
         rows = repo.list_products_for_category_scan(limit=page, after_id=after_id)
         if not rows:
             break
-        page_pairs: list[tuple[int, str]] = []
+        page_ids: list[int] = []
         page_uuids: set[str] = set()
         reached_limit = False
         for row in rows:
@@ -701,25 +701,23 @@ def run_prune_nonfashion(
                 product_handle=row["product_handle"],
                 product_type=row["product_type"],
             ):
-                store_id = int(row["store_id"])
-                product_id = str(row["product_id"])
-                page_pairs.append((store_id, product_id))
+                page_ids.append(int(row["id"]))
                 uuid = row.get("item_uuid")
                 if uuid:
                     page_uuids.add(str(uuid))
                 pending_image_urls.extend(row.get("supabase_images") or [])
                 if len(samples) < 40:
                     samples.append(
-                        f"  store={store_id} product={product_id} "
+                        f"  store={row['store_id']} product={row['product_id']} "
                         f"type={row['product_type']!r} name={row['item_name']!r}"
                     )
             if limit is not None and scanned >= limit:
                 reached_limit = True
                 break
 
-        matched += len(page_pairs)
-        if execute and page_pairs:
-            deleted_rows += repo.delete_products_batch(page_pairs)
+        matched += len(page_ids)
+        if execute and page_ids:
+            deleted_rows += repo.delete_products_by_ids(page_ids)
             if page_uuids:
                 try:
                     deleted_emb += repo.delete_item_embeddings_batch(list(page_uuids))
