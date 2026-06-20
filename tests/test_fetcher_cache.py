@@ -92,6 +92,23 @@ def test_disk_cache_evicts_to_low_water_and_tracks_size(tmp_path) -> None:
     assert fetcher._disk_cache_size == on_disk
 
 
+def test_disk_cache_write_recreates_vanished_dir(tmp_path) -> None:
+    import shutil
+
+    cache_dir = tmp_path / "cache"
+    fetcher = Fetcher(_disk_cache_settings(cache_dir))
+
+    # Simulate the cache dir being cleared out mid-run (a sibling run's startup
+    # cleanup, or iCloud/Dropbox sync) — the old code raised ENOENT on rename.
+    shutil.rmtree(cache_dir)
+    assert not cache_dir.exists()
+
+    fetcher._write_disk_cache("https://cdn.example.com/x.jpg", b"data")
+
+    assert list(cache_dir.glob("*.img"))
+    assert fetcher._disk_cache_size == len(b"data")
+
+
 def test_disk_cache_write_survives_full_disk(tmp_path, monkeypatch) -> None:
     cache_dir = tmp_path / "cache"
     settings = Settings(

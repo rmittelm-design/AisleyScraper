@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
+import os
 import random
 import time
 from collections import OrderedDict, defaultdict
@@ -90,6 +92,8 @@ class Fetcher:
         # every write. The old per-write O(files) scan ran synchronously on the
         # event loop and stalled all concurrent downloads/uploads.
         self._disk_cache_size = 0
+        # Per-write temp-file counter so concurrent writers never share a .tmp.
+        self._disk_cache_tmp_seq = itertools.count()
         self._jitter_lock = asyncio.Lock()
         self._rate_limit_lock = asyncio.Lock()
         self._next_global_request_at = 0.0
@@ -190,13 +194,19 @@ class Fetcher:
         if not self._disk_cache_enabled:
             return
         path = self._disk_cache_path_for_url(url)
-        tmp = path.with_suffix(".tmp")
+        # Unique temp name per write (pid + counter) so two writers — concurrent
+        # workers, or a second run sharing this dir — never collide on the same
+        # .tmp and race the rename. mkdir guards against the dir being cleared
+        # out from under us (e.g. a sibling run's startup cleanup, or iCloud sync).
+        tmp = self._disk_cache_dir / f"{path.name}.{os.getpid()}.{next(self._disk_cache_tmp_seq)}.tmp"
         try:
+            self._disk_cache_dir.mkdir(parents=True, exist_ok=True)
             tmp.write_bytes(content)
             tmp.replace(path)
         except OSError as exc:
-            # Disk full / unwritable: skip the disk cache for this item instead of
-            # failing the fetch — the in-memory byte cache still serves it.
+            # Disk full / unwritable / vanished dir: skip the disk cache for this
+            # item instead of failing the fetch — the in-memory byte cache still
+            # serves it.
             self._logger.warning("Disk cache write skipped for %s: %s", url, exc)
             try:
                 tmp.unlink()
