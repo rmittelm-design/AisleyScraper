@@ -151,6 +151,8 @@ def test_should_exclude_toys_and_dolls() -> None:
     assert should_exclude_product(_p("Babydoll Top")) is True
     assert should_exclude_product(_p("Llama Plushie")) is True
     assert should_exclude_product(_p("Stuffed Animal Bunny")) is True
+    assert should_exclude_product(_p("Wooden Toy Truck")) is True
+    assert should_exclude_product(_p("Toys", ptype="Kids")) is True
 
 
 # 'plush' (fabric), 'teddy' (lingerie), 'dollar' must NOT be matched as toys.

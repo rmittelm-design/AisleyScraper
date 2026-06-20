@@ -63,7 +63,8 @@ _NON_APPAREL_PATTERN = re.compile(
     # Toys / dolls. Bare "plush" (a fabric) and bare "teddy" (lingerie) are NOT
     # matched — we match "plushie" and "teddy bear". "doll" won't match "babydoll"
     # (no word boundary), so "babydoll" is listed explicitly per request.
-    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?"
+    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|"
+    r"toys?"
     r")\b",
     re.IGNORECASE,
 )
