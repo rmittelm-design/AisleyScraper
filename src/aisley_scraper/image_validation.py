@@ -153,6 +153,14 @@ CLIP_PRODUCT_NEGATIVE_PROMPTS = [
     "a product photo of a scrunchie hair tie or hair clip",
     "a product photo of a diffuser candle or home fragrance",
     "a product photo of a mirror tray sponge or pouch",
+    # Reinforce the cosmetics / body-care / shoe-care categories that slipped
+    # through (nail polish, nipple covers, insoles, etc.).
+    "a product photo of nail polish nail lacquer or a manicure",
+    "a product photo of makeup lipstick mascara eyeliner or eyeshadow",
+    "a product photo of nipple covers breast petals or pasties",
+    "a product photo of shoe insoles shoelaces or shoe-care products",
+    "a product photo of a cosmetic bag toiletry bag or makeup pouch",
+    "a product photo of a doll teddy bear plush or toy",
 ]
 
 # Only reject as too bright/dark when the image is both extreme in mean brightness

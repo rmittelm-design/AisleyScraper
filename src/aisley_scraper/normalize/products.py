@@ -129,11 +129,23 @@ _FASHION_TYPE_GUARD = re.compile(
     r"jewel(?:le)?ry|necklaces?|bracelets?|earrings?|rings?|anklets?|pendants?|charms?|brooch(?:es)?|cuffs?|"
     r"tops?|tees?|t-shirts?|shirts?|blouses?|sweaters?|cardigans?|hoodies?|sweatshirts?|knitwear|denim|"
     r"dress(?:es)?|skirts?|pants?|trousers?|jeans|shorts?|leggings?|jumpsuits?|rompers?|gowns?|bottoms?|"
-    r"jackets?|coats?|blazers?|suits?|outerwear|puffers?|"
+    r"jackets?|coats?|trench(?:es)?|blazers?|suits?|outerwear|puffers?|vests?|"
+    r"robes?|kimonos?|cami(?:sole)?s?|bodysuits?|tunics?|polos?|jumpers?|overalls?|tanks?|sets?|"
     r"lingerie|bras?|bralettes?|underwear|sleepwear|pajamas?|swim(?:wear|suits?)?|activewear|loungewear|"
     r"shoes?|boots?|sneakers?|heels?|sandals?|flats?|loafers?|mules?|"
-    r"bags?|totes?|handbags?|clutch(?:es)?|crossbody|backpacks?|purses?|belts?|scarves|scarf|hats?|"
-    r"beanies?|caps?|gloves?|sunglasses"
+    r"bags?|totes?|handbags?|clutch(?:es)?|crossbody|backpacks?|purses?|satchels?|pouch(?:es)?|"
+    r"pochettes?|wristlets?|wallets?|card[\s-]*(?:holder|case)s?|belts?|scarves|scarf|hats?|"
+    r"beanies?|caps?|gloves?|sunglasses|headbands?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Explicitly requested removals that OVERRIDE the fashion guard — these are
+# apparel-shaped (babydoll) or toy-shaped but the user wants them gone regardless.
+_FORCE_DELETE_PATTERN = re.compile(
+    r"\b(?:"
+    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|toys?|"
+    r"nipple[\s-]*covers?|pasties|breast[\s-]*petals?|(?:boob|body|breast|fashion)[\s-]*tape"
     r")\b",
     re.IGNORECASE,
 )
@@ -153,18 +165,25 @@ def matches_clear_nonfashion(
     words (vintage/beauty/glasses) so brand+style names don't trigger a delete.
     """
     pt = (product_type or "").strip()
-    # Guard: anything typed as a real fashion category stays, period.
-    if _FASHION_TYPE_GUARD.search(pt):
+    full_haystack = " ".join(
+        part for part in (item_name, product_url, product_handle, product_type) if part
+    )
+    # Explicit user-requested removals win even over the fashion guard
+    # (e.g. babydoll dresses, dolls/toys, nipple covers).
+    if _FORCE_DELETE_PATTERN.search(full_haystack):
+        return True
+    # Guard: anything NAMED or TYPED as jewelry/apparel/bags stays, period —
+    # protects coats/cardigans/robes/sets/clutches caught by word collisions or
+    # mislabeled product_types.
+    guard_haystack = " ".join(part for part in (item_name, product_type) if part)
+    if _FASHION_TYPE_GUARD.search(guard_haystack):
         return False
     # Beauty/cosmetics by product_type (Beauty / Nail Polish / Fragrance / ...).
     if _BEAUTY_PRODUCT_TYPE_PATTERN.search(pt):
         return True
     # Clear non-apparel categories by keyword, with collision words removed and
     # the kids substrings NOT applied.
-    haystack = " ".join(
-        part for part in (item_name, product_url, product_handle, product_type) if part
-    )
-    return bool(_NON_APPAREL_PATTERN.search(_CLEAR_COLLISION_STRIP.sub(" ", haystack)))
+    return bool(_NON_APPAREL_PATTERN.search(_CLEAR_COLLISION_STRIP.sub(" ", full_haystack)))
 
 
 def should_exclude_product(product: ProductRecord) -> bool:

@@ -21,6 +21,11 @@ def test_clear_nonfashion_deletes_unambiguous_nonfashion() -> None:
     assert _clear("Cuticle Oil", ptype="Beauty") is True
     assert _clear("Gel Insoles") is True
     assert _clear("Porcelain Doll", ptype="Toys") is True
+    # Explicit force-deletes win even over the apparel/jewelry guard.
+    assert _clear("Gingham Babydoll Dress") is True
+    assert _clear("Hot Shot Babydoll Tank", ptype="102 Tanks") is True
+    assert _clear("Chewy Vuiton Handbag Dog Toy", ptype="Home Accents") is True
+    assert _clear("Nood No-Show Nipple Cover", ptype="Nipple covers") is True
 
 
 def test_clear_nonfashion_protects_jewelry_and_apparel() -> None:
@@ -29,13 +34,19 @@ def test_clear_nonfashion_protects_jewelry_and_apparel() -> None:
     assert _clear("egirl Cross Bead Bracelet", ptype="Bracelets") is False
     assert _clear("Glass Bead Bracelet", ptype="Bracelets") is False
     assert _clear("Sequin & Glass Wing Earrings", ptype="Earrings") is False
-    # Apparel collisions must be protected.
-    assert _clear("Babydoll Top", ptype="tops") is False
+    # Apparel caught by collisions / mislabeled product_types must be protected.
     assert _clear("Boyfriend Cardigan", ptype="tops") is False
     assert _clear("It Girl Pants", ptype="Pants") is False
     assert _clear("Vintage Havana Henley", ptype="tops") is False
     assert _clear("Gilded Beauty Blouse", ptype="Tops") is False
     assert _clear("Straw Cowboy Hat", ptype="accessories") is False
+    assert _clear("Tanner Trench - Khaki", ptype="Trench") is False
+    assert _clear("Marina Color Block Cardigan", ptype="Gift Card") is False
+    assert _clear("Sweet Heart Spa Robe", ptype="244 Other Gifts") is False
+    assert _clear("JOH BOX SEAM SET", ptype="Sets") is False
+    # Bags / small accessories protected.
+    assert _clear("Vida Card Case", ptype="Accessories") is False
+    assert _clear("Vida Small Pouch", ptype="Accessories") is False
 
 
 def test_policy_clears_attributes_without_images() -> None:
