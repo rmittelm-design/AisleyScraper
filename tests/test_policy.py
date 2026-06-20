@@ -144,6 +144,22 @@ def test_should_exclude_body_and_shoe_accessories() -> None:
     assert should_exclude_product(_p("Leather Shoe Patch Kit")) is True
 
 
+# Toys / dolls (incl. babydoll, which is filtered per request).
+def test_should_exclude_toys_and_dolls() -> None:
+    assert should_exclude_product(_p("Porcelain Doll")) is True
+    assert should_exclude_product(_p("Plush Teddy Bear")) is True
+    assert should_exclude_product(_p("Babydoll Top")) is True
+    assert should_exclude_product(_p("Llama Plushie")) is True
+    assert should_exclude_product(_p("Stuffed Animal Bunny")) is True
+
+
+# 'plush' (fabric), 'teddy' (lingerie), 'dollar' must NOT be matched as toys.
+def test_toy_terms_do_not_drop_apparel() -> None:
+    assert should_exclude_product(_p("Plush Velvet Robe", ptype="Sleepwear")) is False
+    assert should_exclude_product(_p("Lace Teddy", ptype="Lingerie")) is False
+    assert should_exclude_product(_p("Dollar Print Tee", ptype="Tops")) is False
+
+
 # These apparel terms collide with the accessory words above and must be KEPT.
 def test_accessory_terms_do_not_drop_apparel() -> None:
     assert should_exclude_product(_p("Lace Midi Dress", ptype="Dresses")) is False

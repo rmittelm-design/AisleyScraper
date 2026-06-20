@@ -59,7 +59,11 @@ _NON_APPAREL_PATTERN = re.compile(
     # Matched as phrases — bare "lace"/"patch"/"petal"/"tape" are NOT matched
     # because they collide with apparel (lace dress, patch pocket, petal sleeve).
     r"nipple[\s-]*covers?|pasties|breast[\s-]*petals?|(?:boob|body|breast|fashion)[\s-]*tape|"
-    r"insoles?|shoe[\s-]*laces?|shoelaces?|shoe[\s-]*patch(?:es)?"
+    r"insoles?|shoe[\s-]*laces?|shoelaces?|shoe[\s-]*patch(?:es)?|"
+    # Toys / dolls. Bare "plush" (a fabric) and bare "teddy" (lingerie) are NOT
+    # matched — we match "plushie" and "teddy bear". "doll" won't match "babydoll"
+    # (no word boundary), so "babydoll" is listed explicitly per request.
+    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?"
     r")\b",
     re.IGNORECASE,
 )
