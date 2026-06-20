@@ -126,16 +126,20 @@ _CLEAR_COLLISION_STRIP = re.compile(r"\bvintage\b|\bbeaut(?:y|ies)\b|\bglass(?:e
 # even if a keyword (e.g. "card" in "Tarot Card Necklace") matches the name.
 _FASHION_TYPE_GUARD = re.compile(
     r"\b(?:"
-    r"jewel(?:le)?ry|necklaces?|bracelets?|earrings?|rings?|anklets?|pendants?|charms?|brooch(?:es)?|cuffs?|"
+    r"apparel|clothing|jewel(?:le)?ry|jwlnck|necklaces?|bracelets?|earrings?|rings?|anklets?|"
+    r"pendants?|charms?|brooch(?:es)?|cuffs?|chains?|"
     r"tops?|tees?|t-shirts?|shirts?|blouses?|sweaters?|cardigans?|hoodies?|sweatshirts?|knitwear|denim|"
     r"dress(?:es)?|skirts?|pants?|trousers?|jeans|shorts?|leggings?|jumpsuits?|rompers?|gowns?|bottoms?|"
-    r"jackets?|coats?|trench(?:es)?|blazers?|suits?|outerwear|puffers?|vests?|"
+    r"jackets?|coats?|trench(?:es)?|blazers?|suits?|outerwear|puffers?|vests?|bombers?|"
     r"robes?|kimonos?|cami(?:sole)?s?|bodysuits?|tunics?|polos?|jumpers?|overalls?|tanks?|sets?|"
+    r"jerseys?|thermals?|crewnecks?|sweatpants?|sweats|"
     r"lingerie|bras?|bralettes?|underwear|sleepwear|pajamas?|swim(?:wear|suits?)?|activewear|loungewear|"
-    r"shoes?|boots?|sneakers?|heels?|sandals?|flats?|loafers?|mules?|slippers?|espadrilles?|"
+    r"socks?|tights|hosiery|stockings?|"
+    r"footwear|shoes?|boots?|sneakers?|heels?|sandals?|flats?|loafers?|mules?|slippers?|espadrilles?|"
+    r"pumps?|flatforms?|platforms?|clogs?|"
     r"bags?|totes?|handbags?|clutch(?:es)?|crossbody|backpacks?|purses?|satchels?|pouch(?:es)?|"
     r"pochettes?|wristlets?|wallets?|card[\s-]*(?:holder|case)s?|belts?|scarves|scarf|hats?|"
-    r"beanies?|caps?|gloves?|sunglasses|headbands?"
+    r"beanies?|caps?|gloves?|mittens?|earmuffs?|sunglasses|headbands?"
     r")\b",
     re.IGNORECASE,
 )

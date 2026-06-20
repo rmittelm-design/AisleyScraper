@@ -44,6 +44,19 @@ def test_toy_and_footwear_collisions_protect_apparel() -> None:
     ) is False
 
 
+# Messy-data collisions found in the full audit must all be protected.
+def test_audit_collision_classes_are_protected() -> None:
+    assert _clear("Argentina 24 Home Jersey", ptype="Apparel") is False         # 'home'
+    assert _clear("CROPPED BROAD BOMBER Oil", ptype="Apparel") is False          # 'oil'
+    assert _clear("Deadly Doll Thermal White", ptype="Apparel") is False         # brand 'doll'
+    assert _clear("Ari Verona Low Pump In Black Box Leather", ptype="Pump") is False     # 'box'
+    assert _clear("Dansko Professional Black Box Clog", ptype="Footwear") is False        # 'box'
+    assert _clear("Rounded Box Chain - 2.0mm", ptype="JWLNCK") is False           # 'box' on jewelry
+    assert _clear("Patterned High Waisted Fishnet Tights",
+                  ptype="Home > Accessories > Socks and Tights") is False         # 'home' breadcrumb
+    assert _clear("FREECITY Sweatpant - Makeup", ptype="Sweatpants") is False     # 'makeup' colorway
+
+
 def test_clear_nonfashion_protects_jewelry_and_apparel() -> None:
     # Jewelry caught by 'card'/'girl'/'glass' collisions must be protected.
     assert _clear("Enamel Tarot Card Necklace", ptype="Necklaces") is False
