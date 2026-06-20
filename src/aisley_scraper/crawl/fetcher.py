@@ -86,12 +86,24 @@ class Fetcher:
         self._disk_cache_enabled = bool(self._settings.fetcher_disk_cache_enabled)
         self._disk_cache_dir = Path(self._settings.fetcher_disk_cache_dir)
         self._disk_cache_max_bytes = max(0, int(self._settings.fetcher_disk_cache_max_mb)) * 1024 * 1024
+        # Running total of cached bytes so we don't stat the whole cache dir on
+        # every write. The old per-write O(files) scan ran synchronously on the
+        # event loop and stalled all concurrent downloads/uploads.
+        self._disk_cache_size = 0
         self._jitter_lock = asyncio.Lock()
         self._rate_limit_lock = asyncio.Lock()
         self._next_global_request_at = 0.0
         self._long_jitter_request_countdown = self._next_long_jitter_countdown()
         if self._disk_cache_enabled:
             self._disk_cache_dir.mkdir(parents=True, exist_ok=True)
+            # Seed the counter from whatever a previous run left behind, and trim
+            # down to the cap once at startup so we reclaim disk immediately.
+            self._disk_cache_size = self._current_disk_cache_size()
+            if (
+                self._disk_cache_max_bytes > 0
+                and self._disk_cache_size > self._disk_cache_max_bytes
+            ):
+                self._enforce_disk_cache_limit()
 
     def _reserve_global_request_delay(self, now: float) -> float:
         qps = max(0, int(self._settings.crawl_global_qps))
@@ -162,36 +174,72 @@ class Fetcher:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
         return self._disk_cache_dir / f"{digest}.img"
 
+    def _current_disk_cache_size(self) -> int:
+        total = 0
+        try:
+            for file_path in self._disk_cache_dir.glob("*.img"):
+                try:
+                    total += file_path.stat().st_size
+                except OSError:
+                    continue
+        except OSError:
+            return 0
+        return total
+
     def _write_disk_cache(self, url: str, content: bytes) -> None:
         if not self._disk_cache_enabled:
             return
         path = self._disk_cache_path_for_url(url)
         tmp = path.with_suffix(".tmp")
-        tmp.write_bytes(content)
-        tmp.replace(path)
-        self._enforce_disk_cache_limit()
+        try:
+            tmp.write_bytes(content)
+            tmp.replace(path)
+        except OSError as exc:
+            # Disk full / unwritable: skip the disk cache for this item instead of
+            # failing the fetch — the in-memory byte cache still serves it.
+            self._logger.warning("Disk cache write skipped for %s: %s", url, exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return
+        self._disk_cache_size += len(content)
+        # Only pay for the directory scan + eviction once we actually exceed the
+        # cap; then trim to a low-water mark so the scan amortizes over many writes
+        # instead of running on every single image.
+        if self._disk_cache_max_bytes > 0 and self._disk_cache_size > self._disk_cache_max_bytes:
+            self._enforce_disk_cache_limit()
 
     def _enforce_disk_cache_limit(self) -> None:
         if not self._disk_cache_enabled or self._disk_cache_max_bytes <= 0:
             return
 
-        files = [p for p in self._disk_cache_dir.glob("*.img") if p.is_file()]
-        total_size = sum(file_path.stat().st_size for file_path in files)
-        if total_size <= self._disk_cache_max_bytes:
-            return
-
-        files.sort(key=lambda p: p.stat().st_mtime)
-        for file_path in files:
-            if total_size <= self._disk_cache_max_bytes:
-                break
+        sized: list[tuple[Path, int, float]] = []
+        for file_path in self._disk_cache_dir.glob("*.img"):
             try:
-                file_size = file_path.stat().st_size
-                file_path.unlink()
-                total_size -= file_size
-            except FileNotFoundError:
+                stat = file_path.stat()
+            except OSError:
                 continue
-            except Exception:
-                continue
+            sized.append((file_path, stat.st_size, stat.st_mtime))
+        total_size = sum(size for _, size, _ in sized)
+
+        # Evict oldest-first down to 80% of the cap so the next write doesn't
+        # immediately trigger another full scan.
+        low_water = int(self._disk_cache_max_bytes * 0.8)
+        if total_size > self._disk_cache_max_bytes:
+            sized.sort(key=lambda item: item[2])  # oldest mtime first
+            for file_path, file_size, _ in sized:
+                if total_size <= low_water:
+                    break
+                try:
+                    file_path.unlink()
+                    total_size -= file_size
+                except FileNotFoundError:
+                    total_size -= file_size
+                except OSError:
+                    continue
+        # Resync the running counter to the authoritative on-disk total.
+        self._disk_cache_size = total_size
 
     def _read_disk_cache(self, url: str) -> bytes | None:
         if not self._disk_cache_enabled:
@@ -210,7 +258,9 @@ class Fetcher:
         path = self._disk_cache_path_for_url(url)
         try:
             if path.exists():
+                size = path.stat().st_size
                 path.unlink()
+                self._disk_cache_size = max(0, self._disk_cache_size - size)
         except Exception:
             pass
 
@@ -477,6 +527,7 @@ class Fetcher:
                         file_path.unlink()
                     except Exception:
                         pass
+                self._disk_cache_size = 0
             return
         for url in urls:
             existing = self._byte_cache.pop(url, None)

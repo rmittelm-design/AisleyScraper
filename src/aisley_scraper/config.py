@@ -94,13 +94,13 @@ class Settings(BaseSettings):
         default=3,
         alias="IMAGE_VALIDATION_QUEUE_MAX_RETRIES",
     )
-    phase2_upload_concurrency: int = Field(default=3, alias="PHASE2_UPLOAD_CONCURRENCY")
+    phase2_upload_concurrency: int = Field(default=8, alias="PHASE2_UPLOAD_CONCURRENCY")
     phase2_db_upsert_batch_size: int = Field(default=500, alias="PHASE2_DB_UPSERT_BATCH_SIZE")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
     fetcher_byte_cache_max_mb: int = Field(default=256, alias="FETCHER_BYTE_CACHE_MAX_MB")
     fetcher_disk_cache_enabled: bool = Field(default=True, alias="FETCHER_DISK_CACHE_ENABLED")
     fetcher_disk_cache_dir: str = Field(default=".aisley_image_cache", alias="FETCHER_DISK_CACHE_DIR")
-    fetcher_disk_cache_max_mb: int = Field(default=2048, alias="FETCHER_DISK_CACHE_MAX_MB")
+    fetcher_disk_cache_max_mb: int = Field(default=512, alias="FETCHER_DISK_CACHE_MAX_MB")
     image_min_width: int = Field(default=600, alias="IMAGE_MIN_WIDTH")
     image_min_height: int = Field(default=800, alias="IMAGE_MIN_HEIGHT")
     postprocess_product_chunk_size: int = Field(

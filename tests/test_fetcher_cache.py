@@ -42,6 +42,66 @@ def test_fetcher_preserves_disk_cache_on_memory_clear_and_close(tmp_path) -> Non
     assert list(cache_dir.glob("*.img"))
 
 
+def test_disk_cache_evicts_to_low_water_and_tracks_size(tmp_path) -> None:
+    cache_dir = tmp_path / "cache"
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        FETCHER_DISK_CACHE_ENABLED=True,
+        FETCHER_DISK_CACHE_DIR=str(cache_dir),
+        FETCHER_BYTE_CACHE_MAX_MB=10,
+    )
+
+    fetcher = Fetcher(settings)
+    # Shrink the cap to byte scale so we can exercise eviction cheaply.
+    fetcher._disk_cache_max_bytes = 1000
+    payload = b"x" * 200
+
+    for i in range(20):
+        fetcher._write_disk_cache(f"https://cdn.example.com/{i}.jpg", payload)
+
+    on_disk = sum(p.stat().st_size for p in cache_dir.glob("*.img"))
+    # Never exceeds the cap, and eviction trims down to ~80% (the low-water mark)
+    # rather than scanning + deleting on every single write.
+    assert on_disk <= 1000
+    assert on_disk <= int(1000 * 0.8) + len(payload)
+    # The running counter stays in sync with what is actually on disk.
+    assert fetcher._disk_cache_size == on_disk
+
+
+def test_disk_cache_write_survives_full_disk(tmp_path, monkeypatch) -> None:
+    cache_dir = tmp_path / "cache"
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        FETCHER_DISK_CACHE_ENABLED=True,
+        FETCHER_DISK_CACHE_DIR=str(cache_dir),
+        FETCHER_BYTE_CACHE_MAX_MB=10,
+    )
+    fetcher = Fetcher(settings)
+
+    from pathlib import Path
+
+    def _raise_enospc(self, _data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", _raise_enospc)
+
+    # Must not raise — a full disk should degrade to memory-only caching.
+    fetcher._write_disk_cache("https://cdn.example.com/a.jpg", b"data")
+    assert fetcher._disk_cache_size == 0
+
+
 def test_fetcher_defaults_to_browser_user_agent_when_user_agent_is_empty() -> None:
     settings = Settings(
         LOG_LEVEL="INFO",
