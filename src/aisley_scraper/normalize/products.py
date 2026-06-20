@@ -142,13 +142,16 @@ _FASHION_TYPE_GUARD = re.compile(
 
 # Explicitly requested removals that OVERRIDE the fashion guard — these are
 # apparel-shaped (babydoll) or toy-shaped but the user wants them gone regardless.
-# "toy" is NOT force-listed: it rides on apparel names ("Sand Toys Cropped Tee"),
-# so it stays a normal term that the apparel guard can veto. Real toys with a
-# non-fashion name/type ("Travel Toy" / type Baby) are still caught by it.
-_FORCE_DELETE_PATTERN = re.compile(
+# Hard removals OVERRIDE the apparel guard (these are apparel-shaped but unwanted).
+# Checked on NAME + TYPE only — NOT url/handle, whose hyphen tokenization invents
+# word boundaries (e.g. a "larroude-l131-doll-plat-dolly-sandal" shoe handle would
+# otherwise trip "doll"). The soft toy/doll terms (doll, teddy bear, plushie, toy)
+# live in _NON_APPAREL_PATTERN and DO yield to the guard, so a "Doll Plat" sandal
+# or "Teddy" coat survives while real dolls/toys (non-fashion type) are removed.
+_HARD_DELETE_PATTERN = re.compile(
     r"\b(?:"
-    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|"
-    r"nipple[\s-]*covers?|pasties|breast[\s-]*petals?|(?:boob|body|breast|fashion)[\s-]*tape"
+    r"babydolls?|nipple[\s-]*covers?|pasties|breast[\s-]*petals?|"
+    r"(?:boob|body|breast|fashion)[\s-]*tape"
     r")\b",
     re.IGNORECASE,
 )
@@ -168,24 +171,25 @@ def matches_clear_nonfashion(
     words (vintage/beauty/glasses) so brand+style names don't trigger a delete.
     """
     pt = (product_type or "").strip()
-    full_haystack = " ".join(
-        part for part in (item_name, product_url, product_handle, product_type) if part
-    )
-    # Explicit user-requested removals win even over the fashion guard
-    # (e.g. babydoll dresses, dolls/toys, nipple covers).
-    if _FORCE_DELETE_PATTERN.search(full_haystack):
+    # Hard removals + the guard look at NAME + TYPE only (url/handle tokenization
+    # is too noisy — see _HARD_DELETE_PATTERN).
+    name_type = " ".join(part for part in (item_name, product_type) if part)
+    # Hard removals win even over the fashion guard (babydoll dresses, nipple covers).
+    if _HARD_DELETE_PATTERN.search(name_type):
         return True
     # Guard: anything NAMED or TYPED as jewelry/apparel/bags stays, period —
-    # protects coats/cardigans/robes/sets/clutches caught by word collisions or
-    # mislabeled product_types.
-    guard_haystack = " ".join(part for part in (item_name, product_type) if part)
-    if _FASHION_TYPE_GUARD.search(guard_haystack):
+    # protects coats/cardigans/robes/sets/clutches/shoes caught by word collisions
+    # or mislabeled product_types.
+    if _FASHION_TYPE_GUARD.search(name_type):
         return False
     # Beauty/cosmetics by product_type (Beauty / Nail Polish / Fragrance / ...).
     if _BEAUTY_PRODUCT_TYPE_PATTERN.search(pt):
         return True
-    # Clear non-apparel categories by keyword, with collision words removed and
-    # the kids substrings NOT applied.
+    # Clear non-apparel categories by keyword (full text, collision words removed,
+    # kids substrings NOT applied). The guard above already vetoed fashion items.
+    full_haystack = " ".join(
+        part for part in (item_name, product_url, product_handle, product_type) if part
+    )
     return bool(_NON_APPAREL_PATTERN.search(_CLEAR_COLLISION_STRIP.sub(" ", full_haystack)))
 
 

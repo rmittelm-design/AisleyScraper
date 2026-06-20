@@ -36,6 +36,12 @@ def test_toy_and_footwear_collisions_protect_apparel() -> None:
     # footwear caught by a mislabeled "Gift & Home" type stays.
     assert _clear("Bow Slippers Pink", ptype="Gift & Home") is False
     assert _clear("Dolly Sandal", ptype="Heels") is False
+    # a shoe whose HANDLE contains "doll" as a token must not be force-deleted.
+    assert _clear(
+        "Dolly Sandal - Gold Metallic Leather",
+        handle="larroude-l131-doll-plat-dolly-sandal-metallic-leather",
+        ptype="Heels",
+    ) is False
 
 
 def test_clear_nonfashion_protects_jewelry_and_apparel() -> None:
