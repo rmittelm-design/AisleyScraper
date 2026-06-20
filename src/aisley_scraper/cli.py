@@ -911,6 +911,10 @@ def run_crawl(
                 return
             if store.lat is not None and store.long is not None:
                 return
+            if not getattr(settings, "geocoding_enabled", True):
+                # Geocoding disabled: leave coords null; the upsert's coalesce
+                # preserves any existing lat/long for this branch.
+                return
 
             cache_key = store.address.strip().lower()
             if not cache_key:

@@ -139,6 +139,11 @@ class Settings(BaseSettings):
 
     classify_require_ecom_signal: bool = Field(default=True, alias="CLASSIFY_REQUIRE_ECOM_SIGNAL")
 
+    # Set GEOCODING_ENABLED=false to skip branch-address geocoding (e.g. when
+    # re-running a store whose branches already have coordinates — the upsert
+    # preserves existing lat/long via coalesce, so no geocode call is needed).
+    geocoding_enabled: bool = Field(default=True, alias="GEOCODING_ENABLED")
+
     @field_validator(
         "crawl_global_concurrency",
         "crawl_store_batch_size",
