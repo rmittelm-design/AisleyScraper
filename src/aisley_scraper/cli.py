@@ -691,7 +691,12 @@ def run_crawl(
     cleared_disk_cache_files, disk_cache_dir = _clear_fetcher_disk_cache(settings)
 
     repo = Repository(settings)
-    upload_images = not skip_image_upload
+    # The scraper no longer re-hosts product images to Supabase Storage: the app
+    # reads the original Shopify CDN URLs from the `images` column, and nothing
+    # consumes `supabase_images`. Uploads are off unconditionally (the
+    # --skip-image-upload flag is retained as a no-op for compatibility).
+    upload_images = False
+    _ = skip_image_upload
 
     try:
         repo.ensure_schema()
@@ -960,7 +965,6 @@ def run_crawl(
                 return True
 
             chunk_size = max(1, int(settings.postprocess_product_chunk_size))
-            image_bytes_by_url: dict[str, bytes] = {}
 
             def _chunk_products(products: list) -> list[list]:
                 return [products[i : i + chunk_size] for i in range(0, len(products), chunk_size)]
@@ -973,14 +977,6 @@ def run_crawl(
                         fetcher=postprocess_fetcher,
                         settings=settings,
                     )
-                    for product in products:
-                        for image_url in product.images:
-                            normalized_url = image_url.strip()
-                            if not normalized_url:
-                                continue
-                            cached = postprocess_fetcher.get_cached_bytes(normalized_url)
-                            if cached is not None:
-                                image_bytes_by_url[normalized_url] = cached
                 finally:
                     clear_cached_bytes = getattr(postprocess_fetcher, "clear_cached_bytes", None)
                     if callable(clear_cached_bytes):
@@ -996,78 +992,17 @@ def run_crawl(
                 return
 
             def _safe_upload_new_product_images(product) -> list[str]:
-                if not upload_images:
-                    return list(product.supabase_images or [])
-                if not product.images:
-                    return []
-                try:
-                    upload_from_cache = getattr(uploader, "upload_product_images_from_cache", None)
-                    cached_for_product = {
-                        image_url.strip(): image_bytes_by_url[image_url.strip()]
-                        for image_url in product.images
-                        if image_url and image_url.strip() and image_url.strip() in image_bytes_by_url
-                    }
-                    if callable(upload_from_cache) and cached_for_product:
-                        return upload_from_cache(
-                            product.images,
-                            store_id,
-                            product.product_id,
-                            cached_for_product,
-                        )
-                    return uploader.upload_product_images(
-                        product.images,
-                        store_id=store_id,
-                        product_id=product.product_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Image upload failed for store=%s product=%s: %s",
-                        store_id,
-                        product.product_id,
-                        exc,
-                    )
-                    return []
+                # Uploads removed: never re-host to Supabase. Preserve any storage
+                # URLs the product already had; new products get none.
+                return list(product.supabase_images or [])
 
             def _safe_sync_existing_product_images(
                 product,
                 existing_images: list[str],
                 existing_supabase_images: list[str],
             ) -> list[str]:
-                if not upload_images:
-                    return list(existing_supabase_images)
-                try:
-                    sync_from_cache = getattr(uploader, "sync_product_images_from_cache", None)
-                    cached_for_product = {
-                        image_url.strip(): image_bytes_by_url[image_url.strip()]
-                        for image_url in product.images
-                        if image_url and image_url.strip() and image_url.strip() in image_bytes_by_url
-                    }
-                    if callable(sync_from_cache) and cached_for_product:
-                        return sync_from_cache(
-                            current_source_urls=product.images,
-                            existing_source_urls=existing_images,
-                            existing_supabase_urls=existing_supabase_images,
-                            store_id=store_id,
-                            product_id=product.product_id,
-                            image_bytes_by_url=cached_for_product,
-                            delete_stale=False,
-                        )
-                    return uploader.sync_product_images(
-                        current_source_urls=product.images,
-                        existing_source_urls=existing_images,
-                        existing_supabase_urls=existing_supabase_images,
-                        store_id=store_id,
-                        product_id=product.product_id,
-                        delete_stale=False,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Image sync failed for store=%s product=%s: %s",
-                        store_id,
-                        product.product_id,
-                        exc,
-                    )
-                    return existing_supabase_images
+                # Uploads removed: keep whatever storage URLs already exist, unchanged.
+                return list(existing_supabase_images)
 
             def _safe_upsert_product(product) -> None:
                 images_incomplete = upload_images and (
@@ -1495,7 +1430,6 @@ def run_crawl(
                 fetcher = Fetcher(settings)
                 try:
                     io_sem = asyncio.Semaphore(settings.crawl_global_concurrency)
-                    upload_sem = asyncio.Semaphore(settings.phase2_upload_concurrency)
                     stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
                     progress_lock = asyncio.Lock()
                     completed_count = 0
@@ -1569,88 +1503,11 @@ def run_crawl(
                         if not product.images:
                             return True, None
 
-                        existing_imgs = list(existing[0]) if existing else []
+                        # Uploads removed: never re-host to Supabase. Preserve any
+                        # existing storage URLs; new products get none — they are
+                        # written with their Shopify CDN URLs in `images`.
                         existing_supa = list(existing[1]) if existing else []
-                        images_unchanged = bool(
-                            existing
-                            and _norm(product.images) == _norm(existing_imgs)
-                            and len(existing_supa) == len(product.images)
-                        )
-
-                        if not upload_images:
-                            # Preserve existing storage URLs when uploads are disabled.
-                            product.supabase_images = existing_supa if existing else []
-                        elif existing is None:
-                            # Ensure every image URL that needs uploading has its bytes
-                            # loaded through the shared Fetcher (hits cache for URLs already
-                            # processed in stage 2; fetches unconditionally otherwise).
-                            image_bytes_by_url = {
-                                image_url: cached
-                                for image_url in _norm(product.images)
-                                if (cached := fetcher.get_cached_bytes(image_url)) is not None
-                            }
-                            async with upload_sem:
-                                try:
-                                    product.supabase_images = await asyncio.to_thread(
-                                        uploader.upload_product_images_from_cache,
-                                        product.images,
-                                        store_id,
-                                        product.product_id,
-                                        image_bytes_by_url,
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "Upload failed store_id=%s product=%s: %s",
-                                        store_id, product.product_id, exc,
-                                    )
-                                    return False, None
-                        elif images_unchanged:
-                            # Images and upload count match: reuse existing Supabase URLs.
-                            product.supabase_images = existing_supa
-                        else:
-                            for image_url in _norm(product.images):
-                                if fetcher.get_cached_bytes(image_url) is None:
-                                    try:
-                                        await fetcher.get_bytes(image_url)
-                                    except Exception as exc:
-                                        logger.warning(
-                                            "Pre-upload fetch failed store_id=%s url=%s: %s",
-                                            store_id, image_url, exc,
-                                        )
-
-                            image_bytes_by_url = {
-                                image_url: cached
-                                for image_url in _norm(product.images)
-                                if (cached := fetcher.get_cached_bytes(image_url)) is not None
-                            }
-                            async with upload_sem:
-                                try:
-                                    product.supabase_images = await asyncio.to_thread(
-                                        uploader.sync_product_images_from_cache,
-                                        current_source_urls=product.images,
-                                        existing_source_urls=existing_imgs,
-                                        existing_supabase_urls=existing_supa,
-                                        store_id=store_id,
-                                        product_id=product.product_id,
-                                        image_bytes_by_url=image_bytes_by_url,
-                                        delete_stale=False,
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "Image sync failed store_id=%s product=%s: %s",
-                                        store_id, product.product_id, exc,
-                                    )
-                                    product.supabase_images = existing_supa or []
-
-                        images_incomplete = upload_images and (
-                            len(product.supabase_images) != len(product.images)
-                        )
-                        if images_incomplete:
-                            logger.warning(
-                                "Skipping upsert: incomplete required fields store_id=%s product=%s",
-                                store_id, product.product_id,
-                            )
-                            return False, None
+                        product.supabase_images = existing_supa if existing else []
 
                         if allow_null_gender_probs:
                             product.gender_probs_csv = None
