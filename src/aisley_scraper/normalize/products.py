@@ -132,7 +132,7 @@ _FASHION_TYPE_GUARD = re.compile(
     r"jackets?|coats?|trench(?:es)?|blazers?|suits?|outerwear|puffers?|vests?|"
     r"robes?|kimonos?|cami(?:sole)?s?|bodysuits?|tunics?|polos?|jumpers?|overalls?|tanks?|sets?|"
     r"lingerie|bras?|bralettes?|underwear|sleepwear|pajamas?|swim(?:wear|suits?)?|activewear|loungewear|"
-    r"shoes?|boots?|sneakers?|heels?|sandals?|flats?|loafers?|mules?|"
+    r"shoes?|boots?|sneakers?|heels?|sandals?|flats?|loafers?|mules?|slippers?|espadrilles?|"
     r"bags?|totes?|handbags?|clutch(?:es)?|crossbody|backpacks?|purses?|satchels?|pouch(?:es)?|"
     r"pochettes?|wristlets?|wallets?|card[\s-]*(?:holder|case)s?|belts?|scarves|scarf|hats?|"
     r"beanies?|caps?|gloves?|sunglasses|headbands?"
@@ -142,9 +142,12 @@ _FASHION_TYPE_GUARD = re.compile(
 
 # Explicitly requested removals that OVERRIDE the fashion guard — these are
 # apparel-shaped (babydoll) or toy-shaped but the user wants them gone regardless.
+# "toy" is NOT force-listed: it rides on apparel names ("Sand Toys Cropped Tee"),
+# so it stays a normal term that the apparel guard can veto. Real toys with a
+# non-fashion name/type ("Travel Toy" / type Baby) are still caught by it.
 _FORCE_DELETE_PATTERN = re.compile(
     r"\b(?:"
-    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|toys?|"
+    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|"
     r"nipple[\s-]*covers?|pasties|breast[\s-]*petals?|(?:boob|body|breast|fashion)[\s-]*tape"
     r")\b",
     re.IGNORECASE,

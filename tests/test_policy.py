@@ -24,8 +24,18 @@ def test_clear_nonfashion_deletes_unambiguous_nonfashion() -> None:
     # Explicit force-deletes win even over the apparel/jewelry guard.
     assert _clear("Gingham Babydoll Dress") is True
     assert _clear("Hot Shot Babydoll Tank", ptype="102 Tanks") is True
-    assert _clear("Chewy Vuiton Handbag Dog Toy", ptype="Home Accents") is True
     assert _clear("Nood No-Show Nipple Cover", ptype="Nipple covers") is True
+    # A real toy with a non-fashion name/type is still removed...
+    assert _clear("Itzy Travel Toy", ptype="Baby") is True
+
+
+def test_toy_and_footwear_collisions_protect_apparel() -> None:
+    # "toy" rides on apparel names — must not delete a tee; bag-named toys stay too.
+    assert _clear("Sand Toys Cropped Tee", ptype="Tops") is False
+    assert _clear("Chewy Vuiton Handbag Dog Toy", ptype="Home Accents") is False
+    # footwear caught by a mislabeled "Gift & Home" type stays.
+    assert _clear("Bow Slippers Pink", ptype="Gift & Home") is False
+    assert _clear("Dolly Sandal", ptype="Heels") is False
 
 
 def test_clear_nonfashion_protects_jewelry_and_apparel() -> None:
