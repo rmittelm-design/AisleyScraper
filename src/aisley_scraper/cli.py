@@ -6,8 +6,10 @@ from collections import Counter
 from dataclasses import replace
 import errno
 import gc
+import hashlib
 import logging
 from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
 import sys
 from uuid import uuid4
@@ -188,6 +190,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "both=standard single-phase run (default)"
         ),
     )
+    crawl.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help=(
+            "0-based shard for parallel Phase 2: this worker processes only the "
+            "staged stores where hash(website) %% shard-count == shard-index. "
+            "Defaults to $CLOUD_RUN_TASK_INDEX."
+        ),
+    )
+    crawl.add_argument(
+        "--shard-count",
+        type=int,
+        default=None,
+        help=(
+            "Total number of parallel Phase 2 shards/workers. "
+            "Defaults to $CLOUD_RUN_TASK_COUNT (1 = no sharding)."
+        ),
+    )
 
     rebuild = sub.add_parser(
         "rebuild-branches",
@@ -330,6 +351,25 @@ def _resolve_existing_run_id(state_path: str, run_id: str | None) -> str:
     raise RuntimeError(
         "Phase 2 requires an existing run ID. Pass --run-id or ensure .aisley_active_run_id exists."
     )
+
+
+def _select_shard(websites: list[str], shard_index: int, shard_count: int) -> list[str]:
+    """Keep only the websites that belong to this shard.
+
+    Uses a stable SHA-256 hash (NOT the built-in ``hash()``, which is
+    randomized per process via PYTHONHASHSEED) so every worker computes the same
+    partition — the shards are disjoint and together cover every website. This
+    lets N Cloud Run tasks each enrich a slice of the same staged run with no
+    coordination: task k processes the websites where hash(website) % N == k.
+    """
+    if shard_count <= 1:
+        return websites
+    selected: list[str] = []
+    for website in websites:
+        digest = hashlib.sha256(website.encode("utf-8")).hexdigest()
+        if int(digest, 16) % shard_count == shard_index:
+            selected.append(website)
+    return selected
 
 
 def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
@@ -618,6 +658,8 @@ def run_crawl(
     phase: str = "both",
     skip_image_upload: bool = False,
     csv_path: str | None = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
 ) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
@@ -1955,6 +1997,27 @@ def run_crawl(
                     )
                 return 0
 
+            # Parallel sharding: each worker keeps only its slice of the staged
+            # websites (e.g. one Cloud Run task per shard). Applied after the
+            # global emptiness check so the diagnostics above reflect the whole
+            # run, not just this shard.
+            if shard_count > 1:
+                total_staged = len(scraped_websites)
+                scraped_websites = _select_shard(scraped_websites, shard_index, shard_count)
+                logger.info(
+                    "Phase 2 shard %s/%s: %s of %s staged websites",
+                    shard_index, shard_count, len(scraped_websites), total_staged,
+                )
+                print(
+                    f"Phase 2 shard {shard_index}/{shard_count}: "
+                    f"{len(scraped_websites)}/{total_staged} staged stores in this shard"
+                )
+                if not scraped_websites:
+                    print(
+                        f"Phase 2 shard {shard_index}/{shard_count}: no stores in this shard — nothing to do."
+                    )
+                    return 0
+
             logger.info("Phase 2: enriching %s staged websites", len(scraped_websites))
             print(
                 f"Phase 2: enriching {len(scraped_websites)} staged websites "
@@ -2382,6 +2445,21 @@ def main() -> int:
             dry_run=getattr(args, "dry_run", False),
         )
     if args.command == "crawl-stores":
+        # Shard from CLI flags, falling back to Cloud Run Jobs' per-task env vars
+        # so `--tasks N` automatically fans Phase 2 out into N disjoint shards.
+        shard_index = args.shard_index
+        if shard_index is None:
+            shard_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0") or 0)
+        shard_count = args.shard_count
+        if shard_count is None:
+            shard_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1") or 1)
+        if shard_count < 1:
+            shard_count = 1
+        if not (0 <= shard_index < shard_count):
+            raise SystemExit(
+                f"Invalid shard: index={shard_index} count={shard_count} "
+                f"(need 0 <= index < count)."
+            )
         return run_crawl(
             args.limit,
             run_id=args.run_id,
@@ -2389,6 +2467,8 @@ def main() -> int:
             phase=args.phase,
             skip_image_upload=args.skip_image_upload,
             csv_path=getattr(args, "csv", None),
+            shard_index=shard_index,
+            shard_count=shard_count,
         )
     if args.command == "rebuild-branches":
         return run_rebuild_branches(

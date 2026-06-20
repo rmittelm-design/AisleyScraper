@@ -1,0 +1,27 @@
+# Keep the build context tiny + never ship secrets or local scratch.
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Secrets / local state
+.env
+.env.*
+.aisley_active_run_id
+.aisley_scraper.log*
+.aisley_image_cache/
+
+# Big local data we don't need in the image (only data/stores is COPYed)
+data/*.numbers
+data/*.tsv
+data/stores/.DS_Store
+out/
+
+# OS cruft
+.DS_Store
+**/.DS_Store
+.vscode/
