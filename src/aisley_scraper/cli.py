@@ -1457,10 +1457,10 @@ def run_crawl(
                     stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
                     progress_lock = asyncio.Lock()
                     completed_count = 0
-                    phase2_store_batch_size = max(
-                        1,
-                        min(settings.crawl_store_batch_size, settings.crawl_global_concurrency),
-                    )
+                    # Decoupled from crawl concurrency: image bytes are bounded by
+                    # the chunk size + byte cache, not the store batch, so we can
+                    # pool several stores per batch to keep validation/upload busy.
+                    phase2_store_batch_size = max(1, settings.phase2_store_batch_size)
                     phase2_product_chunk_size = max(1, settings.postprocess_product_chunk_size)
                     phase2_unique_url_budget = max(
                         1,

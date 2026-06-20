@@ -95,6 +95,10 @@ class Settings(BaseSettings):
         alias="IMAGE_VALIDATION_QUEUE_MAX_RETRIES",
     )
     phase2_upload_concurrency: int = Field(default=8, alias="PHASE2_UPLOAD_CONCURRENCY")
+    # How many staged stores Phase 2 pools per batch. Image bytes are bounded by
+    # the chunk size + byte cache (not the batch), so a larger batch mainly keeps
+    # validation/upload saturated across store boundaries at a small metadata cost.
+    phase2_store_batch_size: int = Field(default=6, alias="PHASE2_STORE_BATCH_SIZE")
     phase2_db_upsert_batch_size: int = Field(default=500, alias="PHASE2_DB_UPSERT_BATCH_SIZE")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
     fetcher_byte_cache_max_mb: int = Field(default=256, alias="FETCHER_BYTE_CACHE_MAX_MB")
@@ -144,6 +148,7 @@ class Settings(BaseSettings):
         "crawl_http_max_keepalive_connections",
         "image_validation_concurrency",
         "phase2_upload_concurrency",
+        "phase2_store_batch_size",
         "phase2_db_upsert_batch_size",
         "product_validation_max_images",
     )
