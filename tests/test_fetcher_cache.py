@@ -8,9 +8,8 @@ from aisley_scraper.config import Settings
 from aisley_scraper.crawl.fetcher import Fetcher
 
 
-def test_fetcher_preserves_disk_cache_on_memory_clear_and_close(tmp_path) -> None:
-    cache_dir = tmp_path / "cache"
-    settings = Settings(
+def _disk_cache_settings(cache_dir) -> Settings:
+    return Settings(
         LOG_LEVEL="INFO",
         SUPABASE_URL="https://x.supabase.co",
         SUPABASE_SERVICE_ROLE_KEY="key",
@@ -24,7 +23,10 @@ def test_fetcher_preserves_disk_cache_on_memory_clear_and_close(tmp_path) -> Non
         FETCHER_BYTE_CACHE_MAX_MB=10,
     )
 
-    fetcher = Fetcher(settings)
+
+def test_fetcher_can_preserve_disk_cache_on_close_when_requested(tmp_path) -> None:
+    cache_dir = tmp_path / "cache"
+    fetcher = Fetcher(_disk_cache_settings(cache_dir))
     url = "https://cdn.example.com/example.jpg"
     content = b"example-bytes"
 
@@ -37,9 +39,25 @@ def test_fetcher_preserves_disk_cache_on_memory_clear_and_close(tmp_path) -> Non
     assert cached == content
     assert list(cache_dir.glob("*.img"))
 
-    asyncio.run(fetcher.close())
+    # Opt-out keeps the disk cache for a subsequent fetcher in the same process.
+    asyncio.run(fetcher.close(clear_disk_cache=False))
 
     assert list(cache_dir.glob("*.img"))
+
+
+def test_fetcher_clears_disk_cache_on_close_by_default(tmp_path) -> None:
+    cache_dir = tmp_path / "cache"
+    fetcher = Fetcher(_disk_cache_settings(cache_dir))
+
+    fetcher._write_disk_cache("https://cdn.example.com/a.jpg", b"aaaa")
+    fetcher._write_disk_cache("https://cdn.example.com/b.jpg", b"bbbb")
+    assert list(cache_dir.glob("*.img"))
+
+    # Default teardown reclaims the disk so the cache doesn't linger between runs.
+    asyncio.run(fetcher.close())
+
+    assert not list(cache_dir.glob("*.img"))
+    assert fetcher._disk_cache_size == 0
 
 
 def test_disk_cache_evicts_to_low_water_and_tracks_size(tmp_path) -> None:

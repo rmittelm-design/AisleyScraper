@@ -48,7 +48,7 @@ class Fetcher:
                 follow_redirects=True,
                 headers={"User-Agent": self._request_user_agent},
             )
-        except ImportError as exc:
+        except ImportError:
             if not http2_enabled:
                 raise
             self._logger.warning(
@@ -283,8 +283,11 @@ class Fetcher:
             _, evicted = self._byte_cache.popitem(last=False)
             self._byte_cache_size -= len(evicted)
 
-    async def close(self) -> None:
-        self.clear_cached_bytes(clear_disk_cache=False)
+    async def close(self, *, clear_disk_cache: bool = True) -> None:
+        # The disk cache is run-scoped scratch; drop it on teardown so it doesn't
+        # sit on disk between runs. Pass clear_disk_cache=False to keep it for a
+        # subsequent fetcher in the same process.
+        self.clear_cached_bytes(clear_disk_cache=clear_disk_cache)
         await self._image_fallback_client.aclose()
         await self._client.aclose()
 
