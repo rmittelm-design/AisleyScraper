@@ -131,6 +131,29 @@ def test_cosmetic_color_names_do_not_drop_apparel() -> None:
     assert should_exclude_product(_p("Nailhead Studded Belt", ptype="Belts")) is False
 
 
+# Body accessories + shoe care/accessories (not garments or shoes themselves).
+def test_should_exclude_body_and_shoe_accessories() -> None:
+    assert should_exclude_product(_p("Nipple Covers")) is True
+    assert should_exclude_product(_p("Reusable Breast Petals")) is True
+    assert should_exclude_product(_p("Pasties")) is True
+    assert should_exclude_product(_p("Boob Tape")) is True
+    assert should_exclude_product(_p("Fashion Tape")) is True
+    assert should_exclude_product(_p("Gel Insoles")) is True
+    assert should_exclude_product(_p("Waxed Shoe Laces")) is True
+    assert should_exclude_product(_p("Shoelaces")) is True
+    assert should_exclude_product(_p("Leather Shoe Patch Kit")) is True
+
+
+# These apparel terms collide with the accessory words above and must be KEPT.
+def test_accessory_terms_do_not_drop_apparel() -> None:
+    assert should_exclude_product(_p("Lace Midi Dress", ptype="Dresses")) is False
+    assert should_exclude_product(_p("Lace-Up Boots", ptype="Boots")) is False
+    assert should_exclude_product(_p("Patch Pocket Blazer", ptype="Blazers")) is False
+    assert should_exclude_product(_p("Petal Sleeve Top", ptype="Tops")) is False
+    assert should_exclude_product(_p("Bralette", ptype="Lingerie")) is False
+    assert should_exclude_product(_p("Tape Detail Track Pants", ptype="Pants")) is False
+
+
 # Non-apparel categories — whole-word / phrase match (name/url/handle/type).
 def test_should_exclude_non_apparel_categories() -> None:
     drops = [

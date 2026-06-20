@@ -54,7 +54,12 @@ _NON_APPAREL_PATTERN = re.compile(
     # like blush, foundation, bronze are deliberately excluded to protect apparel.
     r"nail[\s-]*polish(?:es)?|nail[\s-]*lacquers?|lacquers?|manicures?|pedicures?|"
     r"cuticles?|make[\s-]*up|cosmetics?|mascaras?|lipsticks?|lip[\s-]*gloss(?:es)?|"
-    r"concealers?|eye[\s-]*liners?|eye[\s-]*shadows?|bronzers?|fragrances?|skin[\s-]*care"
+    r"concealers?|eye[\s-]*liners?|eye[\s-]*shadows?|bronzers?|fragrances?|skin[\s-]*care|"
+    # Body accessories + shoe care/accessories (not garments or shoes themselves).
+    # Matched as phrases — bare "lace"/"patch"/"petal"/"tape" are NOT matched
+    # because they collide with apparel (lace dress, patch pocket, petal sleeve).
+    r"nipple[\s-]*covers?|pasties|breast[\s-]*petals?|(?:boob|body|breast|fashion)[\s-]*tape|"
+    r"insoles?|shoe[\s-]*laces?|shoelaces?|shoe[\s-]*patch(?:es)?"
     r")\b",
     re.IGNORECASE,
 )
