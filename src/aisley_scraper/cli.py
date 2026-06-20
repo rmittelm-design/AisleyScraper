@@ -12,6 +12,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import sys
+import time
 from uuid import uuid4
 
 from aisley_scraper.config import get_settings
@@ -381,6 +382,40 @@ def _resolve_existing_run_id(state_path: str, run_id: str | None) -> str:
     raise RuntimeError(
         "Phase 2 requires an existing run ID. Pass --run-id or ensure .aisley_active_run_id exists."
     )
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+class _ProgressEta:
+    """Live progress + ETA for a phase: elapsed time, throughput, time remaining.
+
+    Printed to stdout so it's visible in `tail`/terminal and in Cloud Run logs.
+    """
+
+    def __init__(self, total: int, label: str) -> None:
+        self.total = max(1, int(total))
+        self.label = label
+        self._start = time.monotonic()
+
+    def line(self, done: int) -> str:
+        elapsed = time.monotonic() - self._start
+        rate = (done / elapsed) if (elapsed > 0 and done > 0) else 0.0
+        eta = ((self.total - done) / rate) if rate > 0 else 0.0
+        pct = (done / self.total) * 100.0
+        return (
+            f"{self.label}: {done}/{self.total} ({pct:.1f}%) | "
+            f"elapsed {_fmt_duration(elapsed)} | ~{_fmt_duration(eta)} left | "
+            f"{rate * 60.0:.1f}/min"
+        )
 
 
 def _select_shard(websites: list[str], shard_index: int, shard_count: int) -> list[str]:
@@ -852,15 +887,33 @@ def run_crawl(
                 # TSV is the source of truth: remove stores whose domain is not in
                 # any TSV file (products cascade). Only on a full-directory crawl
                 # (never on a --csv subset) and never against an empty TSV set.
+                # Gated by PRUNE_NONTSV_STORES (default on) so a re-scrape can be
+                # run with PRUNE_NONTSV_STORES=false to GUARANTEE no store deletion.
                 prune_fn = getattr(repo, "delete_stores_not_in_domains", None)
-                if callable(prune_fn):
+                if not getattr(settings, "prune_nontsv_stores", True):
+                    logger.warning("PRUNE_NONTSV_STORES=false: skipping non-TSV store prune")
+                elif callable(prune_fn):
                     keep_domains = _tsv_domains(settings)
                     if keep_domains:
-                        pruned, _removed = prune_fn(keep_domains)
-                        if pruned:
-                            logger.warning(
-                                "Pruned %s stores not present in the TSV files", pruned
+                        # Safety valve: refuse a mass prune (e.g. an incomplete TSV
+                        # that would wipe most of the catalog). Require the operator
+                        # to opt in via PRUNE_MAX_STORES if they really mean it.
+                        prod_domains = {_domain_key(p.website) for p in repo.list_all_store_profiles()}
+                        to_prune = [d for d in prod_domains if d and d not in keep_domains]
+                        cap = int(getattr(settings, "prune_max_stores", 25))
+                        if len(to_prune) > cap:
+                            logger.error(
+                                "Refusing to prune %s stores (> PRUNE_MAX_STORES=%s) — "
+                                "TSV may be incomplete. Run `prune-stores --execute` "
+                                "intentionally if this is correct.",
+                                len(to_prune), cap,
                             )
+                        else:
+                            pruned, _removed = prune_fn(keep_domains)
+                            if pruned:
+                                logger.warning(
+                                    "Pruned %s stores not present in the TSV files", pruned
+                                )
             all_seeds = _dedupe_seeds_by_domain(all_seeds)
             if limit is not None:
                 all_seeds = all_seeds[:limit]
@@ -1499,6 +1552,7 @@ def run_crawl(
                 stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
                 success = 0
                 done = 0
+                _p1 = _ProgressEta(len(seeds), "Phase 1 (scrape)")
 
                 # scrape_many_stream with include_postprocess=False: pure JSON fetch,
                 # no image validation, no CLIP.  Semaphore concurrency is
@@ -1550,7 +1604,7 @@ def run_crawl(
 
                     if ok:
                         success += 1
-                    print(f"Phase 1 progress: {done}/{len(seeds)}")
+                    print(_p1.line(done), flush=True)
 
                 return success
 
@@ -1575,6 +1629,7 @@ def run_crawl(
                     stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
                     progress_lock = asyncio.Lock()
                     completed_count = 0
+                    _p2 = _ProgressEta(len(scraped_websites), "Phase 2 (enrich)")
                     # Decoupled from crawl concurrency: image bytes are bounded by
                     # the chunk size + byte cache, not the store batch, so we can
                     # pool several stores per batch to keep validation/upload busy.
@@ -1714,11 +1769,7 @@ def run_crawl(
                         nonlocal completed_count
                         async with progress_lock:
                             completed_count += 1
-                            pct = (completed_count / len(scraped_websites)) * 100.0
-                            print(
-                                f"Phase 2 progress: {completed_count}/{len(scraped_websites)} "
-                                f"({pct:.1f}%)"
-                            )
+                            print(_p2.line(completed_count), flush=True)
 
                         return True
 

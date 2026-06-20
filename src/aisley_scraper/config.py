@@ -144,6 +144,13 @@ class Settings(BaseSettings):
     # preserves existing lat/long via coalesce, so no geocode call is needed).
     geocoding_enabled: bool = Field(default=True, alias="GEOCODING_ENABLED")
 
+    # TSV-source-of-truth prune of stores not in any TSV (products cascade).
+    # Set PRUNE_NONTSV_STORES=false to never delete stores on a full crawl (e.g.
+    # a recovery re-scrape). PRUNE_MAX_STORES caps how many a single crawl may
+    # prune before it refuses — a guard against an incomplete TSV wiping the catalog.
+    prune_nontsv_stores: bool = Field(default=True, alias="PRUNE_NONTSV_STORES")
+    prune_max_stores: int = Field(default=25, alias="PRUNE_MAX_STORES")
+
     @field_validator(
         "crawl_global_concurrency",
         "crawl_store_batch_size",
