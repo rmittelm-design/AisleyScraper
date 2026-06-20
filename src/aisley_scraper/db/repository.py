@@ -799,6 +799,42 @@ class Repository:
             )
         return out
 
+    def list_products_for_category_scan(
+        self, *, limit: int, after_id: int | None = None
+    ) -> list[dict[str, object]]:
+        """Page through saved products with the fields needed to re-apply the
+        non-apparel / cosmetics keyword filter (``prune-nonfashion``)."""
+        cols = (
+            "id, store_id, product_id, item_name, product_url, product_handle, "
+            "product_type, item_uuid, supabase_images"
+        )
+        if after_id is None:
+            sql = f"select {cols} from shopify_products order by id asc limit %s;"
+            params: tuple[object, ...] = (max(1, limit),)
+        else:
+            sql = f"select {cols} from shopify_products where id > %s order by id asc limit %s;"
+            params = (max(0, after_id), max(1, limit))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        out: list[dict[str, object]] = []
+        for row in rows:
+            out.append(
+                {
+                    "id": row[0],
+                    "store_id": row[1],
+                    "product_id": row[2],
+                    "item_name": row[3],
+                    "product_url": row[4],
+                    "product_handle": row[5],
+                    "product_type": row[6],
+                    "item_uuid": str(row[7]) if row[7] is not None else None,
+                    "supabase_images": list(row[8] or []),
+                }
+            )
+        return out
+
     def delete_item_embeddings_for_item_uuid(self, item_uuid: str) -> None:
         sql = "delete from item_embeddings where item_uuid = %s;"
         with self._connect() as conn:

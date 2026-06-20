@@ -35,7 +35,7 @@ from aisley_scraper.ingest.csv_loader import (
 )
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreProfile, StoreSeed
-from aisley_scraper.normalize.products import normalize_product
+from aisley_scraper.normalize.products import matches_excluded_category, normalize_product
 from aisley_scraper.storage import StorageUploader
 from aisley_scraper.storage_integrity import (
     delete_orphan_storage_objects,
@@ -242,6 +242,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     prune.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply deletions (default: dry-run preview)",
+    )
+
+    prune_nf = sub.add_parser(
+        "prune-nonfashion",
+        help=(
+            "Scan saved shopify_products and remove non-apparel / cosmetics items "
+            "(nail polish, makeup, home goods, kids, etc.) using the same keyword "
+            "rules as the scraper. Deletes the row, its item_embeddings, and its "
+            "/scraped Supabase images. Dry-run unless --execute."
+        ),
+    )
+    prune_nf.add_argument("--limit", type=int, default=None, help="Max rows to scan")
+    prune_nf.add_argument("--batch-size", type=int, default=500, help="Scan page size")
+    prune_nf.add_argument(
         "--execute",
         action="store_true",
         help="Apply deletions (default: dry-run preview)",
@@ -633,6 +650,91 @@ def run_prune_stores(execute: bool = False) -> int:
 
     deleted, removed = repo.delete_stores_not_in_domains(keep_domains)
     print(f"Deleted {deleted} store rows across {len(removed)} domains not in the TSV (products cascaded).")
+    return 0
+
+
+def run_prune_nonfashion(
+    *, limit: int | None = None, batch_size: int = 500, execute: bool = False
+) -> int:
+    """Re-apply the non-apparel / cosmetics keyword filter to already-saved
+    products and remove the ones that should never have been kept (nail polish,
+    makeup, home goods, kids, etc.). For each match it deletes the
+    shopify_products row, its item_embeddings, and its /scraped Supabase images.
+
+    Dry-run by default — prints what it WOULD remove. Pass execute=True to delete.
+    """
+    settings = get_settings()
+    _setup_logging(settings.log_level)
+    repo = Repository(settings)
+    uploader = StorageUploader(settings)
+
+    scanned = 0
+    matched = 0
+    deleted_rows = 0
+    deleted_images = 0
+    samples: list[str] = []
+    after_id: int | None = None
+    page = max(1, int(batch_size))
+    deleted_uuids: set[str] = set()
+
+    while True:
+        rows = repo.list_products_for_category_scan(limit=page, after_id=after_id)
+        if not rows:
+            break
+        for row in rows:
+            after_id = int(row["id"])
+            scanned += 1
+            if matches_excluded_category(
+                item_name=row["item_name"],
+                product_url=row["product_url"],
+                product_handle=row["product_handle"],
+                product_type=row["product_type"],
+            ):
+                matched += 1
+                store_id = row["store_id"]
+                product_id = row["product_id"]
+                if len(samples) < 40:
+                    samples.append(
+                        f"  store={store_id} product={product_id} "
+                        f"type={row['product_type']!r} name={row['item_name']!r}"
+                    )
+                if execute:
+                    supa = row.get("supabase_images") or []
+                    if supa:
+                        try:
+                            uploader.delete_images(supa)
+                            deleted_images += len(supa)
+                        except Exception as exc:
+                            logger.warning(
+                                "Storage delete failed store=%s product=%s: %s",
+                                store_id, product_id, exc,
+                            )
+                    item_uuid = row.get("item_uuid")
+                    if item_uuid and item_uuid not in deleted_uuids:
+                        try:
+                            repo.delete_item_embeddings_for_item_uuid(item_uuid)
+                        except Exception as exc:
+                            logger.warning("Embedding delete failed uuid=%s: %s", item_uuid, exc)
+                        deleted_uuids.add(item_uuid)
+                    repo.delete_product(store_id, product_id)
+                    deleted_rows += 1
+            if limit is not None and scanned >= limit:
+                break
+        if (limit is not None and scanned >= limit) or len(rows) < page:
+            break
+
+    print(f"Scanned {scanned} saved products; {matched} match the non-fashion rules.")
+    for line in samples:
+        print(line)
+    if matched > len(samples):
+        print(f"  … and {matched - len(samples)} more.")
+    if execute:
+        print(
+            f"DELETED {deleted_rows} products, {deleted_images} /scraped images, "
+            f"and {len(deleted_uuids)} item_embeddings."
+        )
+    else:
+        print("DRY RUN — nothing deleted. Re-run with --execute to remove these.")
     return 0
 
 
@@ -2335,6 +2437,12 @@ def main() -> int:
         )
     if args.command == "prune-stores":
         return run_prune_stores(execute=getattr(args, "execute", False))
+    if args.command == "prune-nonfashion":
+        return run_prune_nonfashion(
+            limit=getattr(args, "limit", None),
+            batch_size=getattr(args, "batch_size", 500),
+            execute=getattr(args, "execute", False),
+        )
 
     return 1
 

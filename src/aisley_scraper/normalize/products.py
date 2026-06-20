@@ -48,10 +48,57 @@ _NON_APPAREL_PATTERN = re.compile(
     r"d[eé]cor|picture\s+frames?|serveware|soaps?|diffusers?|towels?|"
     r"station[ae]ry|homes?|cans?|glass(?:es)?|tumblers?|mugs?|cups?|pouch(?:es)?|"
     r"tanners?|mirrors?|perfumes?|hair\s*pins?|rollerballs?|scrunch(?:ies|ie|y)|"
-    r"oils?|sponges?|cleansers?|deodorants?|balms?|conditioners?|shampoos?|serums?"
+    r"oils?|sponges?|cleansers?|deodorants?|balms?|conditioners?|shampoos?|serums?|"
+    # Nail care + makeup + fragrance/skincare (cosmetics that previously slipped
+    # through, e.g. nail polish). High-precision terms only — color/material names
+    # like blush, foundation, bronze are deliberately excluded to protect apparel.
+    r"nail[\s-]*polish(?:es)?|nail[\s-]*lacquers?|lacquers?|manicures?|pedicures?|"
+    r"cuticles?|make[\s-]*up|cosmetics?|mascaras?|lipsticks?|lip[\s-]*gloss(?:es)?|"
+    r"concealers?|eye[\s-]*liners?|eye[\s-]*shadows?|bronzers?|fragrances?|skin[\s-]*care"
     r")\b",
     re.IGNORECASE,
 )
+
+
+# product_type is a controlled category label (not a free-text style name), so we
+# match beauty/cosmetics categories more aggressively here without the apparel
+# collision risk that bare substrings carry in item names.
+_BEAUTY_PRODUCT_TYPE_PATTERN = re.compile(
+    r"\b(?:cosmetics?|beauty|make[\s-]*up|nails?|nail[\s-]*polish|fragrances?|"
+    r"perfumes?|skin[\s-]*care|grooming)\b",
+    re.IGNORECASE,
+)
+
+
+def matches_excluded_category(
+    *,
+    item_name: str | None,
+    product_url: str | None,
+    product_handle: str | None,
+    product_type: str | None,
+) -> bool:
+    """True when an item is a non-apparel / excluded category (cosmetics, nail care,
+    kids, home goods, etc.) by keyword — independent of image count.
+
+    Shared by the scrape-time filter and the ``prune-nonfashion`` cleanup so saved
+    items are judged by exactly the same rules as freshly scraped ones.
+    """
+    # Beauty/cosmetics by product_type (controlled category field).
+    if _BEAUTY_PRODUCT_TYPE_PATTERN.search((product_type or "").strip()):
+        return True
+
+    # Kids/children: aggressive substring match (name/url/handle).
+    kids_haystack = " ".join(
+        part for part in (item_name, product_url, product_handle) if part
+    ).lower()
+    if any(token in kids_haystack for token in _KIDS_SUBSTRINGS):
+        return True
+
+    # Non-apparel categories: whole-word/phrase match (name/url/handle/type).
+    category_haystack = " ".join(
+        part for part in (item_name, product_url, product_handle, product_type) if part
+    )
+    return bool(_NON_APPAREL_PATTERN.search(category_haystack))
 
 
 def should_exclude_product(product: ProductRecord) -> bool:
@@ -60,31 +107,12 @@ def should_exclude_product(product: ProductRecord) -> bool:
     if len(product.images or []) < MIN_PRODUCT_IMAGES:
         return True
 
-    product_type = (product.product_type or "").strip().lower()
-    if product_type == "cosmetics":
-        return True
-
-    # Kids/children: aggressive substring match (name/url/handle).
-    kids_haystack = " ".join(
-        part
-        for part in (product.item_name, product.product_url, product.product_handle)
-        if part
-    ).lower()
-    if any(token in kids_haystack for token in _KIDS_SUBSTRINGS):
-        return True
-
-    # Non-apparel categories: whole-word/phrase match (name/url/handle/type).
-    category_haystack = " ".join(
-        part
-        for part in (
-            product.item_name,
-            product.product_url,
-            product.product_handle,
-            product.product_type,
-        )
-        if part
+    return matches_excluded_category(
+        item_name=product.item_name,
+        product_url=product.product_url,
+        product_handle=product.product_handle,
+        product_type=product.product_type,
     )
-    return bool(_NON_APPAREL_PATTERN.search(category_haystack))
 
 
 def normalize_product(product: ProductRecord) -> ProductRecord | None:

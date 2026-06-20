@@ -109,6 +109,28 @@ def test_should_exclude_kids_items() -> None:
     assert should_exclude_product(_p("Babydoll Dress")) is True
 
 
+# Cosmetics / nail / makeup that previously slipped through (e.g. J.Hannah polish).
+def test_should_exclude_cosmetics_and_nail_and_makeup() -> None:
+    # product_type-driven (title is just a shade name) — the J.Hannah case.
+    assert should_exclude_product(_p("Sycamore", ptype="Nail Polish")) is True
+    assert should_exclude_product(_p("Salt", ptype="Beauty")) is True
+    assert should_exclude_product(_p("Noir", ptype="Makeup")) is True
+    assert should_exclude_product(_p("No. 5", ptype="Fragrance")) is True
+    # name/handle-driven.
+    assert should_exclude_product(_p("Cuticle Oil")) is True
+    assert should_exclude_product(_p("Rich Red", handle="rich-red-nail-polish")) is True
+    assert should_exclude_product(_p("Velvet Mascara")) is True
+    assert should_exclude_product(_p("Lip Gloss")) is True
+
+
+# Apparel whose names contain cosmetic *color* words must be KEPT.
+def test_cosmetic_color_names_do_not_drop_apparel() -> None:
+    assert should_exclude_product(_p("Blush Pink Silk Dress", ptype="Dresses")) is False
+    assert should_exclude_product(_p("Foundation Trench Coat", ptype="Coats")) is False
+    assert should_exclude_product(_p("Bronze Sequin Gown", ptype="Gowns")) is False
+    assert should_exclude_product(_p("Nailhead Studded Belt", ptype="Belts")) is False
+
+
 # Non-apparel categories — whole-word / phrase match (name/url/handle/type).
 def test_should_exclude_non_apparel_categories() -> None:
     drops = [
