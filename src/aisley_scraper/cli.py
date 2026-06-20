@@ -35,7 +35,11 @@ from aisley_scraper.ingest.csv_loader import (
 )
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreProfile, StoreSeed
-from aisley_scraper.normalize.products import matches_excluded_category, normalize_product
+from aisley_scraper.normalize.products import (
+    matches_clear_nonfashion,
+    matches_excluded_category,
+    normalize_product,
+)
 from aisley_scraper.storage import StorageUploader
 from aisley_scraper.storage_integrity import (
     delete_orphan_storage_objects,
@@ -262,6 +266,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--execute",
         action="store_true",
         help="Apply deletions (default: dry-run preview)",
+    )
+    prune_nf.add_argument(
+        "--aggressive",
+        action="store_true",
+        help=(
+            "Use the full scrape-time rules (also removes vintage/beauty/boyfriend/"
+            "girl-named apparel and jewelry caught by word collisions). Default is "
+            "the safe mode: only unambiguous non-fashion, never jewelry/apparel."
+        ),
     )
 
     return parser
@@ -654,7 +667,8 @@ def run_prune_stores(execute: bool = False) -> int:
 
 
 def run_prune_nonfashion(
-    *, limit: int | None = None, batch_size: int = 500, execute: bool = False
+    *, limit: int | None = None, batch_size: int = 500, execute: bool = False,
+    aggressive: bool = False,
 ) -> int:
     """Re-apply the non-apparel / cosmetics keyword filter to already-saved
     products and remove the ones that should never have been kept (nail polish,
@@ -667,6 +681,9 @@ def run_prune_nonfashion(
     _setup_logging(settings.log_level)
     repo = Repository(settings)
     uploader = StorageUploader(settings)
+
+    detect = matches_excluded_category if aggressive else matches_clear_nonfashion
+    print(f"prune-nonfashion mode={'aggressive' if aggressive else 'safe'} execute={execute}", flush=True)
 
     scanned = 0
     matched = 0
@@ -695,7 +712,7 @@ def run_prune_nonfashion(
         for row in rows:
             after_id = int(row["id"])
             scanned += 1
-            if matches_excluded_category(
+            if detect(
                 item_name=row["item_name"],
                 product_url=row["product_url"],
                 product_handle=row["product_handle"],
@@ -2461,6 +2478,7 @@ def main() -> int:
             limit=getattr(args, "limit", None),
             batch_size=getattr(args, "batch_size", 500),
             execute=getattr(args, "execute", False),
+            aggressive=getattr(args, "aggressive", False),
         )
 
     return 1

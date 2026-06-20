@@ -1,5 +1,41 @@
 from aisley_scraper.models import ProductRecord
-from aisley_scraper.normalize.products import enforce_attribute_policy, normalize_product, should_exclude_product
+from aisley_scraper.normalize.products import (
+    enforce_attribute_policy,
+    matches_clear_nonfashion,
+    normalize_product,
+    should_exclude_product,
+)
+
+
+def _clear(name, *, url=None, handle=None, ptype=None) -> bool:
+    return matches_clear_nonfashion(
+        item_name=name, product_url=url, product_handle=handle, product_type=ptype
+    )
+
+
+def test_clear_nonfashion_deletes_unambiguous_nonfashion() -> None:
+    assert _clear("Weekend Candle", ptype="Candle") is True
+    assert _clear("Liquid Body Wash", ptype="Soap") is True
+    assert _clear("Birthday Card", ptype="Greeting Cards") is True
+    assert _clear("Sycamore", ptype="Nail Polish") is True
+    assert _clear("Cuticle Oil", ptype="Beauty") is True
+    assert _clear("Gel Insoles") is True
+    assert _clear("Porcelain Doll", ptype="Toys") is True
+
+
+def test_clear_nonfashion_protects_jewelry_and_apparel() -> None:
+    # Jewelry caught by 'card'/'girl'/'glass' collisions must be protected.
+    assert _clear("Enamel Tarot Card Necklace", ptype="Necklaces") is False
+    assert _clear("egirl Cross Bead Bracelet", ptype="Bracelets") is False
+    assert _clear("Glass Bead Bracelet", ptype="Bracelets") is False
+    assert _clear("Sequin & Glass Wing Earrings", ptype="Earrings") is False
+    # Apparel collisions must be protected.
+    assert _clear("Babydoll Top", ptype="tops") is False
+    assert _clear("Boyfriend Cardigan", ptype="tops") is False
+    assert _clear("It Girl Pants", ptype="Pants") is False
+    assert _clear("Vintage Havana Henley", ptype="tops") is False
+    assert _clear("Gilded Beauty Blouse", ptype="Tops") is False
+    assert _clear("Straw Cowboy Hat", ptype="accessories") is False
 
 
 def test_policy_clears_attributes_without_images() -> None:

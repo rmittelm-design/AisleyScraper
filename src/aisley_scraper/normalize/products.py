@@ -111,6 +111,62 @@ def matches_excluded_category(
     return bool(_NON_APPAREL_PATTERN.search(category_haystack))
 
 
+# --- Conservative cleanup of already-saved items (prune-nonfashion --safe) -----
+# The scrape-time filter above is intentionally aggressive (it drops vintage /
+# beauty / boyfriend / girl-named apparel). Re-applying that to the saved catalog
+# would delete thousands of real garments AND jewelry caught by word collisions.
+# The "clear" detector below only removes UNAMBIGUOUS non-fashion and never
+# touches anything typed as jewelry or apparel.
+
+# Collision-prone words stripped before testing — they ride on real apparel /
+# brand names (Vintage Havana, Gilded Beauty, glass-bead jewelry).
+_CLEAR_COLLISION_STRIP = re.compile(r"\bvintage\b|\bbeaut(?:y|ies)\b|\bglass(?:es)?\b", re.IGNORECASE)
+
+# product_type values that mark a real fashion category — never delete these,
+# even if a keyword (e.g. "card" in "Tarot Card Necklace") matches the name.
+_FASHION_TYPE_GUARD = re.compile(
+    r"\b(?:"
+    r"jewel(?:le)?ry|necklaces?|bracelets?|earrings?|rings?|anklets?|pendants?|charms?|brooch(?:es)?|cuffs?|"
+    r"tops?|tees?|t-shirts?|shirts?|blouses?|sweaters?|cardigans?|hoodies?|sweatshirts?|knitwear|denim|"
+    r"dress(?:es)?|skirts?|pants?|trousers?|jeans|shorts?|leggings?|jumpsuits?|rompers?|gowns?|bottoms?|"
+    r"jackets?|coats?|blazers?|suits?|outerwear|puffers?|"
+    r"lingerie|bras?|bralettes?|underwear|sleepwear|pajamas?|swim(?:wear|suits?)?|activewear|loungewear|"
+    r"shoes?|boots?|sneakers?|heels?|sandals?|flats?|loafers?|mules?|"
+    r"bags?|totes?|handbags?|clutch(?:es)?|crossbody|backpacks?|purses?|belts?|scarves|scarf|hats?|"
+    r"beanies?|caps?|gloves?|sunglasses"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def matches_clear_nonfashion(
+    *,
+    item_name: str | None,
+    product_url: str | None,
+    product_handle: str | None,
+    product_type: str | None,
+) -> bool:
+    """Conservative cleanup test: True only for UNAMBIGUOUS non-fashion items.
+
+    Differs from ``matches_excluded_category``: it never deletes anything typed
+    as jewelry/apparel, ignores the kids substrings, and strips the collision-prone
+    words (vintage/beauty/glasses) so brand+style names don't trigger a delete.
+    """
+    pt = (product_type or "").strip()
+    # Guard: anything typed as a real fashion category stays, period.
+    if _FASHION_TYPE_GUARD.search(pt):
+        return False
+    # Beauty/cosmetics by product_type (Beauty / Nail Polish / Fragrance / ...).
+    if _BEAUTY_PRODUCT_TYPE_PATTERN.search(pt):
+        return True
+    # Clear non-apparel categories by keyword, with collision words removed and
+    # the kids substrings NOT applied.
+    haystack = " ".join(
+        part for part in (item_name, product_url, product_handle, product_type) if part
+    )
+    return bool(_NON_APPAREL_PATTERN.search(_CLEAR_COLLISION_STRIP.sub(" ", haystack)))
+
+
 def should_exclude_product(product: ProductRecord) -> bool:
     # Require at least MIN_PRODUCT_IMAGES scraped images — drop image-poor items.
     # Checked on the raw scraped image list (before CLIP validation trims it).
