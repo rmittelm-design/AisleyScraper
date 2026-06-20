@@ -702,6 +702,30 @@ class Repository:
                 cur.execute(sql, (store_id, product_id))
             conn.commit()
 
+    def delete_products_batch(self, pairs: list[tuple[int, str]]) -> int:
+        """Delete many products in one statement. ``pairs`` are exact
+        (store_id, product_id) tuples — only those rows are removed."""
+        if not pairs:
+            return 0
+        sql = "delete from shopify_products where (store_id, product_id) in %s;"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (tuple((int(s), str(p)) for s, p in pairs),))
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
+
+    def delete_item_embeddings_batch(self, item_uuids: list[str]) -> int:
+        if not item_uuids:
+            return 0
+        sql = "delete from item_embeddings where item_uuid = any(%s::uuid[]);"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, ([str(u) for u in item_uuids],))
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
+
     def iter_linked_supabase_image_paths(self, public_prefix: str) -> set[str]:
         """Return every storage object path referenced by shopify_products.supabase_images.
 

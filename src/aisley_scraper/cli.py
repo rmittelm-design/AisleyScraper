@@ -669,13 +669,12 @@ def run_prune_nonfashion(
     uploader = StorageUploader(settings)
 
     scanned = 0
-    matched = 0
-    deleted_rows = 0
-    deleted_images = 0
     samples: list[str] = []
+    matched_pairs: list[tuple[int, str]] = []
+    matched_uuids: set[str] = set()
+    matched_image_urls: list[str] = []
     after_id: int | None = None
     page = max(1, int(batch_size))
-    deleted_uuids: set[str] = set()
 
     while True:
         rows = repo.list_products_for_category_scan(limit=page, after_id=after_id)
@@ -690,51 +689,63 @@ def run_prune_nonfashion(
                 product_handle=row["product_handle"],
                 product_type=row["product_type"],
             ):
-                matched += 1
-                store_id = row["store_id"]
-                product_id = row["product_id"]
+                store_id = int(row["store_id"])
+                product_id = str(row["product_id"])
+                matched_pairs.append((store_id, product_id))
+                uuid = row.get("item_uuid")
+                if uuid:
+                    matched_uuids.add(str(uuid))
+                matched_image_urls.extend(row.get("supabase_images") or [])
                 if len(samples) < 40:
                     samples.append(
                         f"  store={store_id} product={product_id} "
                         f"type={row['product_type']!r} name={row['item_name']!r}"
                     )
-                if execute:
-                    supa = row.get("supabase_images") or []
-                    if supa:
-                        try:
-                            uploader.delete_images(supa)
-                            deleted_images += len(supa)
-                        except Exception as exc:
-                            logger.warning(
-                                "Storage delete failed store=%s product=%s: %s",
-                                store_id, product_id, exc,
-                            )
-                    item_uuid = row.get("item_uuid")
-                    if item_uuid and item_uuid not in deleted_uuids:
-                        try:
-                            repo.delete_item_embeddings_for_item_uuid(item_uuid)
-                        except Exception as exc:
-                            logger.warning("Embedding delete failed uuid=%s: %s", item_uuid, exc)
-                        deleted_uuids.add(item_uuid)
-                    repo.delete_product(store_id, product_id)
-                    deleted_rows += 1
             if limit is not None and scanned >= limit:
                 break
         if (limit is not None and scanned >= limit) or len(rows) < page:
             break
 
-    print(f"Scanned {scanned} saved products; {matched} match the non-fashion rules.")
+    matched = len(matched_pairs)
+    print(f"Scanned {scanned} saved products; {matched} match the non-fashion rules.", flush=True)
     for line in samples:
         print(line)
     if matched > len(samples):
-        print(f"  … and {matched - len(samples)} more.")
-    if execute:
-        print(
-            f"DELETED {deleted_rows} products, {deleted_images} /scraped images, "
-            f"and {len(deleted_uuids)} item_embeddings."
-        )
-    else:
+        print(f"  … and {matched - len(samples)} more.", flush=True)
+
+    if not execute:
         print("DRY RUN — nothing deleted. Re-run with --execute to remove these.")
+        return 0
+
+    def _chunks(seq: list, n: int):
+        for i in range(0, len(seq), n):
+            yield seq[i : i + n]
+
+    # 1) Delete the product ROWS first (the user-facing catalog) — one batched
+    #    statement per 1000 rows, so this finishes in seconds, not hours.
+    deleted_rows = 0
+    for chunk in _chunks(matched_pairs, 1000):
+        deleted_rows += repo.delete_products_batch(chunk)
+    print(f"Deleted {deleted_rows} shopify_products rows.", flush=True)
+
+    # 2) Their item_embeddings — batched.
+    deleted_emb = 0
+    for chunk in _chunks(list(matched_uuids), 1000):
+        try:
+            deleted_emb += repo.delete_item_embeddings_batch(chunk)
+        except Exception as exc:
+            logger.warning("Embedding batch delete failed (%s items): %s", len(chunk), exc)
+    print(f"Deleted {deleted_emb} item_embeddings.", flush=True)
+
+    # 3) Their /scraped Supabase images (slower HTTP; rows are already gone).
+    deleted_images = 0
+    for chunk in _chunks(matched_image_urls, 200):
+        try:
+            uploader.delete_images(chunk)
+            deleted_images += len(chunk)
+        except Exception as exc:
+            logger.warning("Storage delete batch failed (%s urls): %s", len(chunk), exc)
+    print(f"Deleted {deleted_images} /scraped images.", flush=True)
     return 0
 
 
