@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Run artifacts
+.aisley_active_run_id
+.aisley_scraper.log*
+.aisley_image_cache/
