@@ -56,12 +56,31 @@ async def _fetch_all_products(
 
     for page in range(1, max_pages + 1):
         products_url = f"{base}/products.json?limit={page_limit}&page={page}"
-        payload = await fetcher.get_json(products_url)
+        try:
+            payload = await fetcher.get_json(products_url)
+        except Exception as exc:  # noqa: BLE001 - end-of-catalog, keep what we have
+            # Some stores return a 4xx (or non-JSON) PAST their last page instead of
+            # an empty list, and a few rate-limit deep pagination. Treat that as the
+            # end of the catalog and keep whatever we've already scraped rather than
+            # failing the entire store (which previously dropped big shops like
+            # kith/feature/charmingcharlie that 400'd at a deep page).
+            if page == 1:
+                raise  # genuine failure on the first page -> let the store fail
+            logger.warning(
+                "Stopping pagination for %s at page %s (%s); keeping %s products so far",
+                base,
+                page,
+                exc,
+                len(kept),
+            )
+            break
         extracted = extract_products_from_products_json(payload, settings, base_url=base)
 
+        new_this_page = 0
         for product in extracted:
             if product.product_id in seen_product_ids:
                 continue
+            new_this_page += 1
             seen_product_ids.add(product.product_id)
             normalized = normalize_product(product)
             if normalized is None:
@@ -79,6 +98,16 @@ async def _fetch_all_products(
 
         products_raw = payload.get("products", []) if isinstance(payload, dict) else []
         if not isinstance(products_raw, list) or not products_raw:
+            break
+        # Some stores ignore the ?page param and return the SAME products on every
+        # page; without this guard they'd paginate to max_pages (or until a 4xx).
+        # Stop once a page contributes no new product ids.
+        if new_this_page == 0:
+            logger.warning(
+                "No new products on page %s for %s; stopping (store repeats pages)",
+                page,
+                base,
+            )
             break
 
     return kept

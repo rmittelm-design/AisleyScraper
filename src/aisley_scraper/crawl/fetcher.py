@@ -42,12 +42,18 @@ class Fetcher:
             max_keepalive_connections=max(1, settings.crawl_http_max_keepalive_connections),
         )
         http2_enabled = bool(settings.crawl_http2_enabled)
+        ssl_verify = bool(settings.crawl_ssl_verify)
+        if not ssl_verify:
+            self._logger.warning(
+                "TLS certificate verification is DISABLED (CRAWL_SSL_VERIFY=false) for this crawl"
+            )
         try:
             self._client = httpx.AsyncClient(
                 timeout=timeout,
                 limits=limits,
                 http2=http2_enabled,
                 follow_redirects=True,
+                verify=ssl_verify,
                 headers={"User-Agent": self._request_user_agent},
             )
         except ImportError:
@@ -61,6 +67,7 @@ class Fetcher:
                 limits=limits,
                 http2=False,
                 follow_redirects=True,
+                verify=ssl_verify,
                 headers={"User-Agent": self._request_user_agent},
             )
         # Secondary client with HTTP/1.1 and browser-like headers for image fallback fetches.
@@ -69,6 +76,7 @@ class Fetcher:
             limits=limits,
             http2=False,
             follow_redirects=True,
+            verify=ssl_verify,
             headers={"User-Agent": _BROWSER_USER_AGENT},
         )
         self._domain_semaphores: dict[str, asyncio.Semaphore] = defaultdict(
@@ -321,6 +329,8 @@ class Fetcher:
             "-A",
             effective_user_agent,
         ]
+        if not self._settings.crawl_ssl_verify:
+            args.append("-k")  # --insecure: match the httpx clients for broken-cert stores
         if referer:
             args.extend(["-e", referer])
         if accept:
@@ -348,6 +358,7 @@ class Fetcher:
                 timeout=max(1, self._settings.crawl_request_timeout_sec),
                 headers=headers,
                 allow_redirects=True,
+                verify=self._settings.crawl_ssl_verify,
             )
             response.raise_for_status()
             payload = response.json()

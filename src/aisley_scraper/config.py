@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     crawl_request_timeout_sec: int = Field(default=25, alias="CRAWL_REQUEST_TIMEOUT_SEC")
     crawl_connect_timeout_sec: int = Field(default=10, alias="CRAWL_CONNECT_TIMEOUT_SEC")
     crawl_http2_enabled: bool = Field(default=True, alias="CRAWL_HTTP2_ENABLED")
+    # Verify TLS certs on crawl fetches. Default True (secure); set CRAWL_SSL_VERIFY=false
+    # ONLY to scrape stores with broken/expired certs (skips MITM protection).
+    crawl_ssl_verify: bool = Field(default=True, alias="CRAWL_SSL_VERIFY")
     crawl_http_max_connections: int = Field(default=100, alias="CRAWL_HTTP_MAX_CONNECTIONS")
     crawl_http_max_keepalive_connections: int = Field(
         default=20,
