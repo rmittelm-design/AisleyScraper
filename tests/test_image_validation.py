@@ -79,6 +79,10 @@ class _FakeTorch:
     def stack(tensors: tuple[_FakeTensor, ...], dim: int = 0) -> _FakeTensor:
         return _FakeTensor(np.stack([tensor.values for tensor in tensors], axis=dim))
 
+    @staticmethod
+    def cat(tensors, dim: int = 0) -> _FakeTensor:
+        return _FakeTensor(np.concatenate([tensor.values for tensor in tensors], axis=dim))
+
 
 class _FakeLogitScale:
     def __init__(self, value: float) -> None:

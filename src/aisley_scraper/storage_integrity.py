@@ -7,6 +7,7 @@ import time
 import httpx
 
 from aisley_scraper.config import Settings
+from aisley_scraper.db.repository import Repository
 from aisley_scraper.storage import StorageUploader
 
 
@@ -59,47 +60,6 @@ def _response_text(response: httpx.Response) -> str:
     if len(text) > 500:
         return text[:497] + "..."
     return text
-
-
-def iter_linked_object_paths(base: str, headers: dict[str, str], public_prefix: str) -> set[str]:
-    linked: set[str] = set()
-    offset = 0
-    page_size = 1000
-
-    with httpx.Client(timeout=60.0) as client:
-        while True:
-            resp = _request_with_retries(
-                client,
-                "GET",
-                f"{base}/shopify_products",
-                params={
-                    "select": "supabase_images",
-                    "limit": str(page_size),
-                    "offset": str(offset),
-                },
-                headers=headers,
-            )
-            rows = resp.json()
-            if not isinstance(rows, list) or not rows:
-                break
-
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                urls = row.get("supabase_images") or []
-                if not isinstance(urls, list):
-                    continue
-                for url in urls:
-                    if not isinstance(url, str):
-                        continue
-                    if url.startswith(public_prefix):
-                        linked.add(url[len(public_prefix) :])
-
-            if len(rows) < page_size:
-                break
-            offset += page_size
-
-    return linked
 
 
 def list_all_storage_objects(base_url: str, bucket: str, headers: dict[str, str], root_prefix: str) -> set[str]:
@@ -162,7 +122,8 @@ def list_all_storage_objects(base_url: str, bucket: str, headers: dict[str, str]
 
 
 def detect_orphan_storage_objects(settings: Settings) -> dict[str, object]:
-    base = f"{settings.supabase_url.rstrip('/')}/rest/v1"
+    # Storage object listing still uses the Supabase Storage API (object storage
+    # is not in Postgres); the linked-image set is read directly from Postgres.
     headers = {
         "Authorization": f"Bearer {settings.supabase_service_role_key}",
         "apikey": settings.supabase_service_role_key,
@@ -173,7 +134,7 @@ def detect_orphan_storage_objects(settings: Settings) -> dict[str, object]:
     )
     root_prefix = settings.supabase_storage_path.strip("/")
 
-    linked_paths = iter_linked_object_paths(base, headers, public_prefix)
+    linked_paths = Repository(settings).iter_linked_supabase_image_paths(public_prefix)
     stored_paths = list_all_storage_objects(
         base_url=settings.supabase_url.rstrip("/"),
         bucket=settings.supabase_storage_bucket,

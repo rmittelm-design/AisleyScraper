@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import queue as _queue
 import threading
 import time
 import warnings
@@ -437,8 +438,113 @@ _CLIP_MODEL = None
 _CLIP_PREPROCESS = None
 _CLIP_TOKENIZER = None
 _CLIP_DEVICE = "cpu"
+_INFER_SINCE_EMPTY = 0
+
+
+def _maybe_empty_device_cache(every: int = 24) -> None:
+    """Periodically release cached device memory. The MPS/CUDA allocator keeps
+    freed blocks in its own pool rather than returning them to the OS, so without
+    this the resident set climbs across thousands of inferences and forces swap on
+    small-RAM machines. Batched every ``every`` calls to keep the sync cost low."""
+    global _INFER_SINCE_EMPTY
+    _INFER_SINCE_EMPTY += 1
+    if _INFER_SINCE_EMPTY < every:
+        return
+    _INFER_SINCE_EMPTY = 0
+    try:
+        import torch  # torch is imported lazily throughout this module
+        if _CLIP_DEVICE == "mps":
+            torch.mps.empty_cache()
+        elif _CLIP_DEVICE == "cuda":
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - cache clearing is best-effort
+        pass
 _CLIP_TEXT_PROMPTS: Optional[list[str]] = None
 _CLIP_TEXT_FEATURES = None
+
+
+# --- Dynamic micro-batching for CLIP image scoring ---------------------------
+# Serialized single-image inference underutilizes the GPU and is the Phase-2
+# throughput bottleneck. A single batcher thread pulls preprocessed image tensors
+# from the concurrent validation workers, runs encode_image + the prompt softmax
+# on a BATCH, and hands each image back its prompt-probability list (on the host).
+# Every device op runs on this one thread, which also sidesteps MPS thread-safety;
+# workers only do CPU preprocess + read back a Python list.
+_ENCODE_QUEUE: "_queue.Queue" = _queue.Queue()
+_BATCHER_THREAD = None
+_BATCHER_LOCK = threading.Lock()
+_ENCODE_BATCH_SIZE = 16
+_ENCODE_BATCH_WAIT_S = 0.03
+
+
+class _ScoreReq:
+    __slots__ = ("tensor", "event", "probs", "error")
+
+    def __init__(self, tensor) -> None:
+        self.tensor = tensor
+        self.event = threading.Event()
+        self.probs: Optional[list[float]] = None
+        self.error: Optional[BaseException] = None
+
+
+def _ensure_batcher() -> None:
+    global _BATCHER_THREAD
+    if _BATCHER_THREAD is not None:
+        return
+    with _BATCHER_LOCK:
+        if _BATCHER_THREAD is not None:
+            return
+        t = threading.Thread(target=_batcher_loop, name="clip-batcher", daemon=True)
+        t.start()
+        _BATCHER_THREAD = t
+
+
+def _batcher_loop() -> None:
+    import time as _time
+    while True:
+        reqs = [_ENCODE_QUEUE.get()]
+        deadline = _time.monotonic() + _ENCODE_BATCH_WAIT_S
+        while len(reqs) < _ENCODE_BATCH_SIZE:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                reqs.append(_ENCODE_QUEUE.get(timeout=remaining))
+            except _queue.Empty:
+                break
+        try:
+            import torch  # resolve current torch (real in prod, mock under tests)
+            model = _get_clip()[0]
+            text_features = _CLIP_TEXT_FEATURES
+            batch = torch.cat([r.tensor for r in reqs], dim=0)
+            with torch.no_grad():
+                feats = model.encode_image(batch)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                logit_scale = _clip_logit_scale(model)
+                logits = logit_scale * (feats @ text_features.T)
+                probs = torch.softmax(logits, dim=-1)
+            probs_cpu = probs.detach().to("cpu").tolist()
+            for r, row in zip(reqs, probs_cpu):
+                r.probs = row
+                r.event.set()
+            del feats, logits, probs, batch
+            _maybe_empty_device_cache()
+        except Exception as exc:  # noqa: BLE001 - propagate to every waiter
+            for r in reqs:
+                r.error = exc
+                r.event.set()
+
+
+def _score_image_batched(image_input) -> list[float]:
+    """Submit one preprocessed image tensor to the batcher and block for its
+    prompt-probability list."""
+    _ensure_batcher()
+    req = _ScoreReq(image_input)
+    _ENCODE_QUEUE.put(req)
+    req.event.wait()
+    if req.error is not None:
+        raise req.error
+    return req.probs or []
 
 
 def _get_clip():
@@ -599,18 +705,16 @@ def product_probability_clip(pil_img) -> dict[str, Any]:
     else:
         text_features = cached_features
 
-    with torch.no_grad(), _CLIP_INFER_LOCK:
-        image_features = model.encode_image(image_input)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        logit_scale = _clip_logit_scale(model)
-        prompt_logits = (logit_scale * (image_features @ text_features.T)).squeeze(0)
-        prompt_probs = torch.softmax(prompt_logits, dim=-1)
+    # Make the cached globals reflect the prompts the batcher will score against
+    # (the batcher thread reads _CLIP_TEXT_FEATURES).
+    _CLIP_TEXT_PROMPTS = prompts
+    _CLIP_TEXT_FEATURES = text_features
 
-    # Pull the probabilities to host memory ONCE, then do all argmax/indexing on
-    # the Python list. Reading individual tensor elements (.item()) each force a
-    # device->host sync; on MPS/CUDA ~55 of them per image would erase the GPU
-    # speedup, so we do a single transfer here.
-    probs_list = prompt_probs.detach().to("cpu").tolist()
+    # Batched inference: a single batcher thread runs encode_image + the prompt
+    # softmax across many images at once (large throughput win) and returns this
+    # image's prompt-probability list on the host — no per-image device sync, and
+    # all MPS/CUDA work stays on that one thread.
+    probs_list = _score_image_batched(image_input)
 
     best_positive_idx = max(range(positive_count), key=lambda i: probs_list[i])
     best_negative_idx = positive_count + max(

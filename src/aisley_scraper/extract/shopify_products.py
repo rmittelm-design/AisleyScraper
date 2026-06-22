@@ -102,49 +102,6 @@ def _extract_explicit_gender_label(prod: dict[str, Any]) -> str | None:
     return None
 
 
-def _extract_gender_from_item_name(item_name: Any) -> str | None:
-    if not isinstance(item_name, str):
-        return None
-    return _normalize_gender_token(item_name)
-
-
-def _normalize_product_type_and_gender(value: Any) -> tuple[str | None, str | None]:
-    if value is None:
-        return None, None
-
-    product_type = str(value).strip()
-    if not product_type:
-        return None, None
-
-    detected_gender = _normalize_gender_token(product_type)
-
-    category = product_type
-    gender_patterns = [
-        r"\bmen'?s\b",
-        r"\bmens\b",
-        r"\bmen\b",
-        r"\bman\b",
-        r"\bmale\b",
-        r"\bboys?\b",
-        r"\bwomen'?s\b",
-        r"\bwomens\b",
-        r"\bwomen\b",
-        r"\bwoman\b",
-        r"\bfemale\b",
-        r"\bgirls?\b",
-        r"\bunisex\b",
-        r"\ball[-\s]?genders?\b",
-        r"\bgender[-\s]?neutral\b",
-    ]
-    for pattern in gender_patterns:
-        category = re.sub(pattern, " ", category, flags=re.IGNORECASE)
-
-    category = re.sub(r"[\\/_|]+", " ", category)
-    category = re.sub(r"\s*[-:]+\s*", " ", category)
-    category = re.sub(r"\s+", " ", category).strip(" -_/|:")
-    normalized_category = category or None
-
-    return normalized_category, detected_gender
 
 
 def _to_cents(value: Any) -> int | None:
@@ -306,10 +263,20 @@ def extract_products_from_products_json(
                 if any(ch.isdigit() for ch in val) or val.upper() in {"XS", "S", "M", "L", "XL", "XXL"}:
                     sizes.add(val)
 
-        product_type, gender_from_product_type = _normalize_product_type_and_gender(prod.get("product_type"))
-        explicit_gender = _extract_explicit_gender_label(prod)
-        gender_from_item_name = _extract_gender_from_item_name(prod.get("title"))
-        gender_label = explicit_gender or gender_from_product_type or gender_from_item_name
+        # product_type is the raw scraped value (no gender-stripping/normalization).
+        raw_product_type = prod.get("product_type")
+        product_type = (
+            raw_product_type.strip() or None
+            if isinstance(raw_product_type, str)
+            else None
+        )
+        # gender_label is inferred from the scraped data only: explicit gender
+        # field/option/tags, else the scraped product_type, else the item name.
+        gender_label = (
+            _extract_explicit_gender_label(prod)
+            or _normalize_gender_token(product_type or "")
+            or _normalize_gender_token(prod.get("title") or "")
+        )
 
         out.append(
             ProductRecord(

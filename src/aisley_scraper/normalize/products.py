@@ -6,13 +6,14 @@ from aisley_scraper.models import ProductRecord
 
 
 # Minimum number of scraped images an item must have to be kept.
-MIN_PRODUCT_IMAGES = 3
+MIN_PRODUCT_IMAGES = 2
 
 
 # Substrings that mark an item as kids/children/baby apparel. Matched
 # aggressively (anywhere in the item name, url, or handle) per product
 # requirements — this intentionally also drops items like "boyfriend jeans"
-# or "babydoll dress" whose names contain these tokens.
+# whose names contain these tokens. ("babydoll" is stripped before this check —
+# see matches_excluded_category — so babydoll apparel is kept.)
 _KIDS_SUBSTRINGS: tuple[str, ...] = (
     "kid",
     "child",
@@ -42,13 +43,27 @@ _KIDS_SUBSTRINGS: tuple[str, ...] = (
 _NON_APPAREL_PATTERN = re.compile(
     r"\b(?:"
     r"vintage|beaut(?:y|ies)|"
-    r"furniture|box(?:es)?|"
+    # "storage box" only — bare "box" collides with apparel/jewelry/caps
+    # (Box Leather, Box Chain, "Box Logo" New Era, Box Claw, boxy, boxer).
+    r"furniture|storage[\s-]*box(?:es)?|"
     r"petwear|pets?|gift\s+cards?|gifts?|cards?|puzzles?|sundries|sundry|"
     r"bar\s+goodies?|candles?|lighters?|catchalls?|coffee\s+table\s+books?|books?|"
     r"d[eé]cor|picture\s+frames?|serveware|soaps?|diffusers?|towels?|"
     r"station[ae]ry|homes?|cans?|glass(?:es)?|tumblers?|mugs?|cups?|pouch(?:es)?|"
-    r"tanners?|mirrors?|perfumes?|hair\s*pins?|rollerballs?|scrunch(?:ies|ie|y)|"
-    r"oils?|sponges?|cleansers?|deodorants?|balms?|conditioners?|shampoos?|serums?|"
+    r"tanners?|mirrors?|perfumes?|rollerballs?|"
+    # Hair accessories (user-requested removal). Type "Hair Accessories" plus
+    # high-precision name terms; bare "bow"/"clip"/"claw"/"tie"/"bonnet" are
+    # avoided as they collide with apparel (bow blouse, clip-on earring, lobster-
+    # claw clasp, French "bonnet" = winter beanie). Hair bonnets are caught by the
+    # "Hair Accessories" product_type instead.
+    r"hair[\s-]*accessor(?:y|ies)|scrunch(?:ies|ie|y)|hair[\s-]*pins?|"
+    r"claw[\s-]*clips?|hair[\s-]*claws?|hair[\s-]*clips?|hair[\s-]*bows?|"
+    r"hair[\s-]*ties?|barrettes?|"
+    # "oil" only in a cosmetic/food context — bare "oil" collides with footwear
+    # finishes ("Oil Suede", "oiled leather", "...-oil-lea" shoe handles).
+    r"(?:fragrance|perfume|body|facial|face|hair|beard|massage|bath|essential|"
+    r"olive|seed|cuticle|tanning|cleansing)[\s-]*oils?|"
+    r"sponges?|cleansers?|deodorants?|balms?|conditioners?|shampoos?|serums?|"
     # Nail care + makeup + fragrance/skincare (cosmetics that previously slipped
     # through, e.g. nail polish). High-precision terms only — color/material names
     # like blush, foundation, bronze are deliberately excluded to protect apparel.
@@ -62,8 +77,10 @@ _NON_APPAREL_PATTERN = re.compile(
     r"insoles?|shoe[\s-]*laces?|shoelaces?|shoe[\s-]*patch(?:es)?|"
     # Toys / dolls. Bare "plush" (a fabric) and bare "teddy" (lingerie) are NOT
     # matched — we match "plushie" and "teddy bear". "doll" won't match "babydoll"
-    # (no word boundary), so "babydoll" is listed explicitly per request.
-    r"babydolls?|dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|"
+    # (no word boundary): "babydoll" is a garment silhouette (babydoll dress/top/
+    # romper) and is intentionally NOT filtered, so real dolls are caught by "doll"
+    # while babydoll apparel is kept.
+    r"dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|"
     r"toys?"
     r")\b",
     re.IGNORECASE,
@@ -97,10 +114,12 @@ def matches_excluded_category(
     if _BEAUTY_PRODUCT_TYPE_PATTERN.search((product_type or "").strip()):
         return True
 
-    # Kids/children: aggressive substring match (name/url/handle).
+    # Kids/children: aggressive substring match (name/url/handle). Strip
+    # "babydoll" first — it's a women's garment silhouette, not a kids item, and
+    # the "baby" substring would otherwise drop every babydoll dress/top/romper.
     kids_haystack = " ".join(
         part for part in (item_name, product_url, product_handle) if part
-    ).lower()
+    ).lower().replace("babydoll", " ")
     if any(token in kids_haystack for token in _KIDS_SUBSTRINGS):
         return True
 
@@ -139,22 +158,26 @@ _FASHION_TYPE_GUARD = re.compile(
     r"pumps?|flatforms?|platforms?|clogs?|"
     r"bags?|totes?|handbags?|clutch(?:es)?|crossbody|backpacks?|purses?|satchels?|pouch(?:es)?|"
     r"pochettes?|wristlets?|wallets?|card[\s-]*(?:holder|case)s?|belts?|scarves|scarf|hats?|"
-    r"beanies?|caps?|gloves?|mittens?|earmuffs?|sunglasses|headbands?"
+    r"beanies?|caps?|gloves?|mittens?|earmuffs?|sunglasses|headbands?|"
+    # eyewear (often typed "Accessories" with "...Frame with Mirror Lens")
+    r"eyewear|lens(?:es)?|polarized|polarised|readers?|"
+    # kids/demographic clothing (typed under "Home > Kids" breadcrumbs)
+    r"kids?|children|youth|boys?|girls?|toddlers?"
     r")\b",
     re.IGNORECASE,
 )
 
-# Explicitly requested removals that OVERRIDE the fashion guard — these are
-# apparel-shaped (babydoll) or toy-shaped but the user wants them gone regardless.
-# Hard removals OVERRIDE the apparel guard (these are apparel-shaped but unwanted).
-# Checked on NAME + TYPE only — NOT url/handle, whose hyphen tokenization invents
-# word boundaries (e.g. a "larroude-l131-doll-plat-dolly-sandal" shoe handle would
-# otherwise trip "doll"). The soft toy/doll terms (doll, teddy bear, plushie, toy)
-# live in _NON_APPAREL_PATTERN and DO yield to the guard, so a "Doll Plat" sandal
-# or "Teddy" coat survives while real dolls/toys (non-fashion type) are removed.
+# Explicitly requested removals that OVERRIDE the fashion guard — body
+# accessories (nipple covers, pasties, breast petals, body/boob tape) that are
+# never garments even when named/typed like apparel. Checked on NAME + TYPE only
+# — NOT url/handle, whose hyphen tokenization invents word boundaries (e.g. a
+# "larroude-l131-doll-plat-dolly-sandal" shoe handle). NOTE: "babydoll" is
+# deliberately NOT here — it's a garment silhouette (babydoll dress/top/romper),
+# so it stays protected by the fashion guard. Soft toy/doll terms (doll, teddy
+# bear, plushie, toy) live in _NON_APPAREL_PATTERN and DO yield to the guard.
 _HARD_DELETE_PATTERN = re.compile(
     r"\b(?:"
-    r"babydolls?|nipple[\s-]*covers?|pasties|breast[\s-]*petals?|"
+    r"nipple[\s-]*covers?|pasties|breast[\s-]*petals?|"
     r"(?:boob|body|breast|fashion)[\s-]*tape"
     r")\b",
     re.IGNORECASE,

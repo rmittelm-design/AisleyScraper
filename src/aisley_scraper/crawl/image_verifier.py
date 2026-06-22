@@ -38,46 +38,46 @@ def _filename_from_url(image_url: str) -> str:
     return "image.jpg"
 
 
-async def evaluate_first_image_product_validation(
+# Deterministic per-image failures that count as "this image is not a product"
+# (as opposed to transient network/timeout failures, which are inconclusive).
+_DETERMINISTIC_DROP_CODES = {
+    "not_a_product_photo",
+    "unsupported_file_type",
+    "invalid_image",
+    "resolution_too_low",
+    "image_too_blurry",
+}
+
+
+async def _score_single_image(
+    image_url: str,
     *,
-    image_urls: list[str],
     fetcher: Fetcher,
     settings: Settings,
-    semaphore: asyncio.Semaphore | None = None,
-) -> tuple[bool, str | None, float | None]:
-    """Return (keep_product, reason, product_prob) using the Phase-2 first-image rules."""
-    first_image_url = next(
-        (
-            image_url.strip()
-            for image_url in image_urls
-            if image_url and image_url.strip()
-        ),
-        "",
-    )
-    if not first_image_url:
-        return False, "missing_image", None
-
-    threshold = float(settings.phase2_first_image_product_prob_threshold)
-    per_image_timeout_sec = float(settings.image_validation_attempt_timeout_sec)
-
+    threshold: float,
+    per_image_timeout_sec: float,
+    semaphore: asyncio.Semaphore | None,
+) -> tuple[str, str | None, float | None]:
+    """Score one image. Returns (outcome, reason, product_prob) where outcome is
+    'pass' (product), 'drop' (deterministically not a product), or 'transient'."""
     try:
         if semaphore is None:
             content = await asyncio.wait_for(
-                fetcher.get_bytes(first_image_url),
-                timeout=per_image_timeout_sec,
+                fetcher.get_bytes(image_url), timeout=per_image_timeout_sec
             )
         else:
             async with semaphore:
                 content = await asyncio.wait_for(
-                    fetcher.get_bytes(first_image_url),
-                    timeout=per_image_timeout_sec,
+                    fetcher.get_bytes(image_url), timeout=per_image_timeout_sec
                 )
         result = await asyncio.wait_for(
             asyncio.to_thread(
                 validate_product_photo_only,
                 content=content,
-                filename=_filename_from_url(first_image_url),
+                filename=_filename_from_url(image_url),
                 min_product_prob=threshold,
+                min_width=int(settings.image_min_width),
+                min_height=int(settings.image_min_height),
             ),
             timeout=per_image_timeout_sec,
         )
@@ -87,23 +87,76 @@ async def evaluate_first_image_product_validation(
             prob = product_payload.get("product_prob")
             if isinstance(prob, (int, float)):
                 product_prob = float(prob)
-        return True, None, product_prob
+        return "pass", None, product_prob
     except asyncio.TimeoutError:
-        return True, "timeout", None
+        return "transient", "timeout", None
     except ImageValidationFailure as exc:
-        if exc.code in {"not_a_product_photo", "unsupported_file_type", "invalid_image"}:
+        if exc.code in _DETERMINISTIC_DROP_CODES:
             product_prob = None
             details = exc.details or {}
             if isinstance(details, dict):
                 prob = details.get("product_prob")
                 if isinstance(prob, (int, float)):
                     product_prob = float(prob)
-            return False, exc.code, product_prob
-        return True, exc.code, None
+            return "drop", exc.code, product_prob
+        return "transient", exc.code, None
     except (httpx.HTTPError, TimeoutError):
-        return True, "fetch_error", None
+        return "transient", "fetch_error", None
     except Exception:
-        return True, "task_error", None
+        return "transient", "task_error", None
+
+
+async def evaluate_first_image_product_validation(
+    *,
+    image_urls: list[str],
+    fetcher: Fetcher,
+    settings: Settings,
+    semaphore: asyncio.Semaphore | None = None,
+) -> tuple[bool, str | None, float | None]:
+    """Classify a product as fashion/non-fashion across its first K images.
+
+    Keep the product if ANY of the first ``PRODUCT_VALIDATION_MAX_IMAGES`` images
+    scores as a product photo (max over images). Only drop when every sampled
+    image deterministically fails; transient (network/timeout) failures are
+    inconclusive and preserve the product. For a drop, the returned product_prob
+    is the best (max) score seen, so logging shows how close it came.
+    """
+    urls = [image_url.strip() for image_url in image_urls if image_url and image_url.strip()]
+    if not urls:
+        return False, "missing_image", None
+
+    k = max(1, int(settings.product_validation_max_images))
+    sample = urls[:k]
+    threshold = float(settings.phase2_first_image_product_prob_threshold)
+    per_image_timeout_sec = float(settings.image_validation_attempt_timeout_sec)
+
+    best_prob: float | None = None
+    last_drop_reason: str | None = None
+    transient_reason: str | None = None
+
+    for image_url in sample:
+        outcome, reason, product_prob = await _score_single_image(
+            image_url,
+            fetcher=fetcher,
+            settings=settings,
+            threshold=threshold,
+            per_image_timeout_sec=per_image_timeout_sec,
+            semaphore=semaphore,
+        )
+        if outcome == "pass":
+            return True, None, product_prob  # any product image keeps the item
+        if outcome == "drop":
+            last_drop_reason = reason
+            if product_prob is not None:
+                best_prob = product_prob if best_prob is None else max(best_prob, product_prob)
+        else:  # transient
+            transient_reason = reason or transient_reason
+
+    # No image passed. Preserve on any inconclusive (transient) failure;
+    # otherwise every sampled image was deterministically not a product → drop.
+    if transient_reason is not None:
+        return True, transient_reason, None
+    return False, last_drop_reason or "not_a_product_photo", best_prob
 
 
 async def _verify_single_image_url(
@@ -414,25 +467,27 @@ async def verify_first_image_product_validation(
         return
 
     threshold = float(settings.phase2_first_image_product_prob_threshold)
-    per_image_timeout_sec = float(settings.image_validation_attempt_timeout_sec)
     concurrency = max(1, int(settings.image_validation_concurrency))
     semaphore = asyncio.Semaphore(concurrency)
     failure_reasons: Counter[str] = Counter()
     network_preserved_products = 0
+    dropped_probs: list[float] = []
 
-    async def _validate_product(product: ProductRecord) -> tuple[ProductRecord, bool, str | None]:
-        keep, reason, _product_prob = await evaluate_first_image_product_validation(
+    async def _validate_product(
+        product: ProductRecord,
+    ) -> tuple[ProductRecord, bool, str | None, float | None]:
+        keep, reason, product_prob = await evaluate_first_image_product_validation(
             image_urls=product.images,
             fetcher=fetcher,
             settings=settings,
             semaphore=semaphore,
         )
-        return product, keep, reason
+        return product, keep, reason, product_prob
 
     results = await asyncio.gather(*(_validate_product(product) for product in products))
 
     kept_products: list[ProductRecord] = []
-    for product, keep, reason in results:
+    for product, keep, reason, product_prob in results:
         if keep:
             kept_products.append(product)
             if reason is not None:
@@ -441,15 +496,29 @@ async def verify_first_image_product_validation(
             continue
         if reason is not None:
             failure_reasons[reason] += 1
+        if reason == "not_a_product_photo" and product_prob is not None:
+            dropped_probs.append(product_prob)
 
     dropped = len(products) - len(kept_products)
     if dropped:
+        # Surface the score distribution of CLIP-rejected products so the
+        # threshold can be tuned (how many drops sit just under it).
+        prob_stats = ""
+        if dropped_probs:
+            ordered = sorted(dropped_probs)
+            near_miss = sum(1 for p in ordered if p >= threshold - 0.1)
+            prob_stats = (
+                f" clip_drop_probs(min={ordered[0]:.3f} "
+                f"median={ordered[len(ordered) // 2]:.3f} max={ordered[-1]:.3f} "
+                f"n={len(ordered)} within_0.1_of_threshold={near_miss})"
+            )
         logger.info(
-            "First-image product validation complete: dropped=%s/%s threshold=%.2f failure_reasons=%s",
+            "First-image product validation complete: dropped=%s/%s threshold=%.2f failure_reasons=%s%s",
             dropped,
             len(products),
             threshold,
             dict(failure_reasons),
+            prob_stats,
         )
     else:
         logger.info(

@@ -21,10 +21,13 @@ def test_clear_nonfashion_deletes_unambiguous_nonfashion() -> None:
     assert _clear("Cuticle Oil", ptype="Beauty") is True
     assert _clear("Gel Insoles") is True
     assert _clear("Porcelain Doll", ptype="Toys") is True
-    # Explicit force-deletes win even over the apparel/jewelry guard.
-    assert _clear("Gingham Babydoll Dress") is True
-    assert _clear("Hot Shot Babydoll Tank", ptype="102 Tanks") is True
+    # Body-accessory force-delete wins even over the apparel/jewelry guard.
     assert _clear("Nood No-Show Nipple Cover", ptype="Nipple covers") is True
+    # Hair accessories (user-requested removal): type + high-precision names.
+    assert _clear("Smiley Face Scrunchie", ptype="Accessories") is True
+    assert _clear("Manus Hair Pin", ptype="Hair Accessories") is True
+    assert _clear("Jumbo Box Claw in Caramel Plaid", ptype="Hair Accessories") is True
+    assert _clear("Satin Bonnet", ptype="Hair Accessories") is True
     # A real toy with a non-fashion name/type is still removed...
     assert _clear("Itzy Travel Toy", ptype="Baby") is True
 
@@ -73,6 +76,15 @@ def test_clear_nonfashion_protects_jewelry_and_apparel() -> None:
     assert _clear("Marina Color Block Cardigan", ptype="Gift Card") is False
     assert _clear("Sweet Heart Spa Robe", ptype="244 Other Gifts") is False
     assert _clear("JOH BOX SEAM SET", ptype="Sets") is False
+    # Babydoll is a garment silhouette (dress/top/romper), not lingerie — keep it.
+    assert _clear("Gingham Babydoll Dress") is False
+    assert _clear("Hot Shot Babydoll Tank", ptype="102 Tanks") is False
+    assert _clear("Cream Floral Off-The-Shoulder Babydoll Romper") is False
+    assert _clear("Plus Size Flutter Sleeve Smocked Babydoll Top",
+                  ptype="Home > Plus Size Clothing > Plus Size Tops") is False
+    # "Box Logo" caps / boxy bags are apparel-accessories, not boxes.
+    assert _clear('MLB Box Logo New Era "Marlins"', ptype="Accessories") is False
+    assert _clear("Boxy Tote Bag", ptype="Bags") is False
     # Bags / small accessories protected.
     assert _clear("Vida Card Case", ptype="Accessories") is False
     assert _clear("Vida Small Pouch", ptype="Accessories") is False
@@ -147,17 +159,19 @@ def test_normalize_product_keeps_non_cosmetics() -> None:
     assert out.product_id == "4"
 
 
-def test_should_exclude_items_with_fewer_than_three_images() -> None:
-    for n in (0, 1, 2):
+def test_should_exclude_items_with_fewer_than_min_images() -> None:
+    # MIN_PRODUCT_IMAGES == 2: 0 or 1 image is excluded.
+    for n in (0, 1):
         p = _p("Plain Dress")
         p.images = [f"https://example.com/{i}.jpg" for i in range(n)]
         assert should_exclude_product(p) is True, f"{n} images should be excluded"
         assert normalize_product(p) is None
-    # Exactly 3 images is kept.
-    p3 = _p("Plain Dress")
-    p3.images = [f"https://example.com/{i}.jpg" for i in range(3)]
-    assert should_exclude_product(p3) is False
-    assert normalize_product(p3) is not None
+    # 2 or more images is kept.
+    for n in (2, 3):
+        pk = _p("Plain Dress")
+        pk.images = [f"https://example.com/{i}.jpg" for i in range(n)]
+        assert should_exclude_product(pk) is False, f"{n} images should be kept"
+        assert normalize_product(pk) is not None
 
 
 _FOUR_IMAGES = [f"https://example.com/{i}.jpg" for i in range(4)]
@@ -182,7 +196,9 @@ def test_should_exclude_kids_items() -> None:
     assert should_exclude_product(_p("Dress", url="https://x.com/collections/kids/abc")) is True
     # Known intentional aggressive casualties:
     assert should_exclude_product(_p("Boyfriend Jeans")) is True
-    assert should_exclude_product(_p("Babydoll Dress")) is True
+    # Babydoll is a garment silhouette, not a kids item — "baby" must NOT drop it.
+    assert should_exclude_product(_p("Babydoll Dress")) is False
+    assert should_exclude_product(_p("Plaid Babydoll Tie Front Top")) is False
 
 
 # Cosmetics / nail / makeup that previously slipped through (e.g. J.Hannah polish).
@@ -220,11 +236,10 @@ def test_should_exclude_body_and_shoe_accessories() -> None:
     assert should_exclude_product(_p("Leather Shoe Patch Kit")) is True
 
 
-# Toys / dolls (incl. babydoll, which is filtered per request).
+# Toys / dolls. Babydoll is NOT a toy (garment silhouette) — kept, see above.
 def test_should_exclude_toys_and_dolls() -> None:
     assert should_exclude_product(_p("Porcelain Doll")) is True
     assert should_exclude_product(_p("Plush Teddy Bear")) is True
-    assert should_exclude_product(_p("Babydoll Top")) is True
     assert should_exclude_product(_p("Llama Plushie")) is True
     assert should_exclude_product(_p("Stuffed Animal Bunny")) is True
     assert should_exclude_product(_p("Wooden Toy Truck")) is True
