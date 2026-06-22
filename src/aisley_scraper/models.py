@@ -10,7 +10,14 @@ class StoreSeed:
     source_id: str | None = None
     notes: str | None = None
     store_name: str | None = None
-    address: str | None = None
+    # One entry per branch (TSV columns 3+). The first entry is the primary
+    # branch that scraped products are associated with.
+    addresses: list[str] = field(default_factory=list)
+
+    @property
+    def address(self) -> str | None:
+        """Primary (first) branch address, or None for online/address-less stores."""
+        return self.addresses[0] if self.addresses else None
 
 
 @dataclass(slots=True)
@@ -22,6 +29,8 @@ class StoreProfile:
     address: str | None = None
     lat: float | None = None
     long: float | None = None
+    shipping_returns: str | None = None
+    shipping_returns_url: str | None = None
 
 
 @dataclass(slots=True)

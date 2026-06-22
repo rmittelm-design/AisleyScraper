@@ -55,6 +55,17 @@ class Repository:
             force_ipv4_conninfo(self._dsn),
             prepare_threshold=None,
             connect_timeout=self._connect_timeout,
+            # Cross-region (residential -> Supabase pooler) connections can freeze
+            # mid-scan: the socket stays "open" but no data flows and the read
+            # blocks forever (0% CPU). TCP keepalives + tcp_user_timeout make the
+            # OS surface a frozen/dead path as an OperationalError within ~30s, so
+            # callers can reconnect and resume instead of wedging. These fire only
+            # on an unresponsive path, never on a slow-but-live query.
+            keepalives=1,
+            keepalives_idle=15,
+            keepalives_interval=5,
+            keepalives_count=3,
+            tcp_user_timeout=30000,
         )
 
     # ── Schema ────────────────────────────────────────────────────────────────

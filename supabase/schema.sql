@@ -2,18 +2,28 @@ create extension if not exists pgcrypto;
 
 create table if not exists public.shopify_stores (
   id bigserial primary key,
-  website text unique not null,
+  website text not null,
   store_name text not null,
   store_type text not null check (store_type in ('online','offline')),
   instagram_handle text,
   address text,
   lat double precision,
   long double precision,
+  shipping_returns text,
+  shipping_returns_url text,
   scraped boolean not null default true,
   raw jsonb,
   first_seen_at timestamptz default now(),
   last_seen_at timestamptz default now()
 );
+
+-- One store row per branch: unique on (website, address) instead of website.
+-- NULLS NOT DISTINCT keeps online (address-less) stores singular.
+alter table public.shopify_stores add column if not exists shipping_returns text;
+alter table public.shopify_stores add column if not exists shipping_returns_url text;
+alter table public.shopify_stores drop constraint if exists shopify_stores_website_key;
+create unique index if not exists shopify_stores_website_address_key
+  on public.shopify_stores (website, address) nulls not distinct;
 
 create table if not exists public.shopify_products (
   id bigserial primary key,
@@ -57,10 +67,14 @@ create table if not exists public.shopify_stores_staging (
   address          text,
   lat              double precision,
   long             double precision,
+  shipping_returns text,
+  shipping_returns_url text,
   raw              jsonb,
   scraped_at       timestamptz not null default now(),
   unique (run_id, website)
 );
+alter table public.shopify_stores_staging add column if not exists shipping_returns text;
+alter table public.shopify_stores_staging add column if not exists shipping_returns_url text;
 
 create table if not exists public.shopify_products_staging (
   id             bigserial primary key,

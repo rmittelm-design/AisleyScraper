@@ -25,18 +25,20 @@ def _clean_optional(value: str | None) -> str | None:
     return cleaned or None
 
 
-def _extract_address(row_values: list[str], store_address_idx: int) -> str | None:
-    if store_address_idx < len(row_values):
-        address = _clean_optional(row_values[store_address_idx])
-        if address is not None:
-            return address
-
-    # Recover malformed rows where an extra empty tab shifts the address one cell right.
-    shifted_idx = store_address_idx + 1
-    if shifted_idx < len(row_values):
-        return _clean_optional(row_values[shifted_idx])
-
-    return None
+def _extract_addresses(row_values: list[str], start_idx: int) -> list[str]:
+    """Collect every non-empty branch address from start_idx onward, in order."""
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for value in row_values[start_idx:]:
+        address = _clean_optional(value)
+        if address is None:
+            continue
+        key = address.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        addresses.append(address)
+    return addresses
 
 
 def _looks_like_header(row_values: list[str]) -> bool:
@@ -60,18 +62,20 @@ def _parse_headerless_row(row_values: list[str]) -> StoreSeed | None:
     if not row_values:
         return None
 
+    # Skip blank/padding rows (e.g. trailing tab-only lines in exported TSVs).
+    if not any(_clean_optional(value) for value in row_values):
+        return None
+
     first = _clean_optional(row_values[0])
     second = _clean_optional(row_values[1]) if len(row_values) > 1 else None
-    third = _clean_optional(row_values[2]) if len(row_values) > 2 else None
-    fourth = _clean_optional(row_values[3]) if len(row_values) > 3 else None
-    address = third or fourth
+    addresses = _extract_addresses(row_values, 2)
 
     if first is not None:
         try:
             return StoreSeed(
                 store_url=_normalize_url(first),
                 store_name=second,
-                address=address,
+                addresses=addresses,
             )
         except ValueError:
             pass
@@ -81,7 +85,7 @@ def _parse_headerless_row(row_values: list[str]) -> StoreSeed | None:
             return StoreSeed(
                 store_url=_normalize_url(second),
                 store_name=first,
-                address=address,
+                addresses=addresses,
             )
         except ValueError:
             pass
@@ -126,6 +130,8 @@ def load_store_seeds(csv_path: str, settings: Settings) -> list[StoreSeed]:
                     continue
                 if len(row_values) <= url_idx:
                     continue
+                if not _clean_optional(row_values[url_idx]):
+                    continue
 
                 store_url = _normalize_url(row_values[url_idx])
                 seeds.append(
@@ -136,7 +142,7 @@ def load_store_seeds(csv_path: str, settings: Settings) -> list[StoreSeed]:
                             if store_name_idx < len(row_values)
                             else None
                         ),
-                        address=_extract_address(row_values, store_address_idx),
+                        addresses=_extract_addresses(row_values, store_address_idx),
                     )
                 )
         else:
@@ -149,3 +155,55 @@ def load_store_seeds(csv_path: str, settings: Settings) -> list[StoreSeed]:
                     seeds.append(parsed)
 
     return seeds
+
+
+def _domain_key(store_url: str) -> str:
+    """Scheme- and www-insensitive domain key (e.g. http://www.x.com -> x.com)."""
+    netloc = urlparse(store_url).netloc.strip().lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+
+def dedupe_seeds_by_domain(seeds: list[StoreSeed]) -> list[StoreSeed]:
+    """Keep one seed per domain (ignoring scheme and a leading ``www.``).
+
+    When several rows share a domain, keep the one with the MOST branch
+    addresses (ties keep the first seen). Output preserves first-seen domain
+    order. The winning row is taken as-is (its url, name, and addresses) — rows
+    for the same domain are not merged.
+    """
+    best: dict[str, StoreSeed] = {}
+    order: list[str] = []
+    for seed in seeds:
+        key = _domain_key(seed.store_url)
+        if not key:
+            continue
+        existing = best.get(key)
+        if existing is None:
+            order.append(key)
+            best[key] = seed
+        elif len(seed.addresses) > len(existing.addresses):
+            best[key] = seed
+    return [best[key] for key in order]
+
+
+def load_store_seeds_from_dir(dir_path: str, settings: Settings) -> list[StoreSeed]:
+    """Parse every ``*.tsv`` file in ``dir_path`` and dedupe by domain.
+
+    This is the primary seed source: all store TSV files live in one folder
+    (``INPUT_TSV_DIR``). Across every file, store URLs are deduped by domain
+    (scheme- and ``www.``-insensitive); when a domain appears more than once the
+    row with the most branch addresses wins.
+    """
+    directory = Path(dir_path)
+    if not directory.exists() or not directory.is_dir():
+        raise FileNotFoundError(f"TSV directory not found: {dir_path}")
+
+    all_seeds: list[StoreSeed] = []
+    for tsv_path in sorted(directory.glob("*.tsv")):
+        if not tsv_path.is_file():
+            continue
+        all_seeds.extend(load_store_seeds(str(tsv_path), settings))
+
+    return dedupe_seeds_by_domain(all_seeds)

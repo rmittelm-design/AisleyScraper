@@ -23,9 +23,9 @@ def test_build_db_first_seeds_backfills_existing_missing_address_and_keeps_domai
         StoreSeed(
             store_url="https://existing.com",
             store_name="Existing TSV",
-            address="123 Main St, New York, NY",
+            addresses=["123 Main St, New York, NY"],
         ),
-        StoreSeed(store_url="https://newstore.com", store_name="New TSV", address=None),
+        StoreSeed(store_url="https://newstore.com", store_name="New TSV", addresses=[]),
     ]
 
     existing_profile = StoreProfile(
@@ -48,7 +48,7 @@ def test_build_db_first_seeds_backfills_existing_missing_address_and_keeps_domai
             self.upserts.append(store)
             return 1
 
-    monkeypatch.setattr(cli, "load_store_seeds", lambda _path, _settings: csv_seeds)
+    monkeypatch.setattr(cli, "load_store_seeds_from_dir", lambda _path, _settings: csv_seeds)
     monkeypatch.setattr(cli, "geocode_address", lambda *_args, **_kwargs: (40.7128, -74.0060))
 
     repo = _FakeRepo()

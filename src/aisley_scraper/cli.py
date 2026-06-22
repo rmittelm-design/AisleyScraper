@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import errno
 import gc
@@ -775,10 +776,12 @@ def run_prune_nonfashion(
                     deleted_emb += repo.delete_item_embeddings_batch(list(page_uuids))
                 except Exception as exc:
                     logger.warning("Embedding batch delete failed (%s): %s", len(page_uuids), exc)
-            print(
-                f"progress: scanned={scanned} matched={matched} deleted_rows={deleted_rows}",
-                flush=True,
-            )
+        # Heartbeat every page (both dry-run and execute) so a long cross-region
+        # scan is visible and a stall is obvious (count stops advancing).
+        print(
+            f"progress: scanned={scanned} matched={matched} deleted_rows={deleted_rows}",
+            flush=True,
+        )
 
         if reached_limit or len(rows) < page:
             break
@@ -1292,8 +1295,9 @@ def run_crawl(
                 existing_images, existing_supabase_images, existing_gender_probs = _split_existing_state(
                     existing_image_state
                 )
-                if len(existing_images) != len(existing_supabase_images):
-                    return True
+                # NOTE: image uploads were removed -> supabase_images is always
+                # empty/stale, so the old len(images)!=len(supabase) check forced
+                # re-processing of the whole catalog. Dropped (see _needs_enrichment).
 
                 current_images = _normalize_source_urls(product.images)
                 stored_images = _normalize_source_urls(existing_images)
@@ -1647,25 +1651,61 @@ def run_crawl(
                         return [u.strip() for u in (urls or []) if u.strip()]
 
                     # ── Stage 1: load staged data + upsert stores in parallel ─────
+                    # The cross-region Supabase pooler intermittently FREEZES a read
+                    # (socket alive, no data flows). It is NOT catchable by TCP
+                    # keepalives, nor by server statement_timeout (the stall is at
+                    # pool checkout, before the server sees the query). So bound each
+                    # read with a client wall-clock timeout and retry on a fresh
+                    # connection (every repo read opens its own). A frozen attempt
+                    # leaks its worker thread (it never returns); a dedicated pool
+                    # keeps those leaks from starving CLIP's thread pool.
+                    _db_read_pool = ThreadPoolExecutor(
+                        max_workers=16, thread_name_prefix="p2dbread"
+                    )
+
+                    async def _resilient_read(
+                        fn, *args, what: str, attempts: int = 6, timeout: float = 25.0
+                    ):
+                        loop = asyncio.get_running_loop()
+                        last_exc: BaseException | None = None
+                        for attempt in range(1, attempts + 1):
+                            fut = loop.run_in_executor(_db_read_pool, fn, *args)
+                            try:
+                                return await asyncio.wait_for(fut, timeout=timeout)
+                            except asyncio.TimeoutError:
+                                last_exc = TimeoutError(f"{what} froze (>{timeout:.0f}s)")
+                                logger.warning(
+                                    "Pooler froze on %s (attempt %s/%s) — retrying on a fresh connection",
+                                    what,
+                                    attempt,
+                                    attempts,
+                                )
+                                await asyncio.sleep(min(6.0, 1.5 * attempt))
+                        raise last_exc or RuntimeError(f"{what} failed")
+
                     async def _load_one(website: str):
                         async with io_sem:
-                            staged_store = await asyncio.to_thread(
-                                repo.get_staged_store, resolved_run_id, website
+                            staged_store = await _resilient_read(
+                                repo.get_staged_store, resolved_run_id, website,
+                                what=f"get_staged_store[{website}]",
                             )
                             if staged_store is None:
                                 raise RuntimeError("staging store row missing")
-                            staged_products = await asyncio.to_thread(
-                                repo.get_staged_products, resolved_run_id, website
+                            staged_products = await _resilient_read(
+                                repo.get_staged_products, resolved_run_id, website,
+                                what=f"get_staged_products[{website}]",
                             )
                             # One store row per branch; products link to first branch.
+                            # (A write — pooler writes don't exhibit the read freeze.)
                             store_id = await asyncio.to_thread(
                                 _upsert_store_with_branches, staged_store
                             )
                             product_ids = [p.product_id for p in staged_products if p.product_id]
                             existing_states: dict = {}
                             if product_ids:
-                                existing_states = await asyncio.to_thread(
-                                    repo.get_product_image_states, store_id, product_ids
+                                existing_states = await _resilient_read(
+                                    repo.get_product_image_states, store_id, product_ids,
+                                    what=f"get_product_image_states[{website}]",
                                 )
                             return store_id, staged_products, existing_states
 
@@ -1678,9 +1718,12 @@ def run_crawl(
                         if existing is None:
                             return True
                         existing_imgs, existing_supa, existing_probs = existing
-                        # Previous upload was incomplete: re-process.
-                        if len(existing_imgs) != len(existing_supa):
-                            return True
+                        # NOTE: image uploads were removed, so supabase_images is now
+                        # always empty/stale. The old len(images)!=len(supabase)
+                        # "incomplete upload" check therefore fired for every product
+                        # and re-enriched the ENTIRE catalog (defeating skip-existing
+                        # and making the run take hours). Dropped — only re-enrich when
+                        # the source images actually changed.
                         if _norm(product.images) != _norm(existing_imgs):
                             return True
                         if allow_null_gender_probs:
