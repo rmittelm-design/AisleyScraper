@@ -226,6 +226,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rebuild.add_argument("--limit", type=int, default=None, help="Max domains to process")
     rebuild.add_argument(
+        "--domain",
+        type=str,
+        default=None,
+        help=(
+            "Only reconcile this one store (www/scheme-insensitive domain, e.g. "
+            "colehaan.com or https://www.colehaan.com/). Leaves every other store "
+            "untouched."
+        ),
+    )
+    rebuild.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Geocode and print the planned branch rows without writing to the database",
+    )
+    rebuild.add_argument(
         "--skip-geocode",
         action="store_true",
         help="Don't geocode new branch addresses (leave lat/long NULL; fill on a later run)",
@@ -549,6 +564,8 @@ def run_rebuild_branches(
     limit: int | None = None,
     skip_geocode: bool = False,
     include_missing: bool = False,
+    domain_filter: str | None = None,
+    dry_run: bool = False,
 ) -> int:
     """Materialize/reconcile branch store rows from the TSV branch addresses —
     no re-scrape, no image work.
@@ -563,11 +580,24 @@ def run_rebuild_branches(
     With ``include_missing=True`` the stores table is made to fully mirror the
     TSVs: stores not yet in the table get rows from a TSV-derived profile (no
     products), and address-less TSV stores get a single online row.
+
+    With ``domain_filter`` set, only that one domain (www/scheme-insensitive) is
+    reconciled; every other store is left untouched. ``dry_run`` geocodes and
+    prints the planned branch rows without writing.
     """
     settings = get_settings()
     _setup_logging(settings.log_level)
     repo = Repository(settings)
     repo.ensure_schema()
+
+    # Accept a bare domain ("colehaan.com"), a www host, or a full URL. Prepend a
+    # scheme when absent so urlparse populates netloc for _domain_key.
+    only_domain = None
+    if domain_filter:
+        raw = domain_filter.strip()
+        if "://" not in raw:
+            raw = f"https://{raw}"
+        only_domain = _domain_key(raw)
 
     # One seed per domain from the TSVs (dedup, preserve order).
     seed_by_domain: dict[str, StoreSeed] = {}
@@ -575,6 +605,15 @@ def run_rebuild_branches(
         domain = _domain_key(seed.store_url)
         if domain and domain not in seed_by_domain:
             seed_by_domain[domain] = seed
+
+    if only_domain is not None:
+        if only_domain not in seed_by_domain:
+            print(
+                f"No TSV branch addresses found for domain={only_domain} in "
+                f"{settings.input_tsv_dir}; nothing to do."
+            )
+            return 1
+        seed_by_domain = {only_domain: seed_by_domain[only_domain]}
 
     # One base profile per existing domain — prefer the row that already carries
     # an address (the live, products-bearing row).
@@ -636,22 +675,42 @@ def run_rebuild_branches(
                     if coords is not None:
                         branch.lat, branch.long = coords
                     branches.append(branch)
-                ids = repo.sync_store_branches(base.website, branches)
-                total_rows += len(ids)
+                if dry_run:
+                    print(
+                        f"[dry-run] {domain}: {len(branches)} branch(es) planned "
+                        f"(website={base.website}, store_name={base.store_name!r}, "
+                        f"store_type={base.store_type!r}); primary reuses the existing "
+                        f"lowest store id, the rest get new ids:"
+                    )
+                    for idx, branch in enumerate(branches):
+                        tag = "primary" if idx == 0 else "new"
+                        print(
+                            f"    [{idx}] ({tag}) address={branch.address!r} "
+                            f"lat={branch.lat} long={branch.long}"
+                        )
+                    total_rows += len(branches)
+                else:
+                    ids = repo.sync_store_branches(base.website, branches)
+                    total_rows += len(ids)
             else:
                 # Address-less store: ensure a single online row exists. Only
                 # actively created in include_missing mode.
                 if not include_missing:
                     continue
-                repo.upsert_store(base)
-                total_rows += 1
+                if dry_run:
+                    print(f"[dry-run] {domain}: 1 online row (no branch addresses)")
+                    total_rows += 1
+                else:
+                    repo.upsert_store(base)
+                    total_rows += 1
         except Exception as exc:
             logger.warning("rebuild-branches failed for domain=%s: %s", domain, exc)
             continue
         reconciled += 1
 
+    verb = "Would rebuild" if dry_run else "Rebuilt"
     print(
-        f"Rebuilt {reconciled} store(s) ({total_rows} rows; "
+        f"{verb} {reconciled} store(s) ({total_rows} rows; "
         f"{created} newly created from the TSV)."
     )
     return 0
@@ -2568,6 +2627,8 @@ def main() -> int:
             limit=getattr(args, "limit", None),
             skip_geocode=getattr(args, "skip_geocode", False),
             include_missing=getattr(args, "include_missing", False),
+            domain_filter=getattr(args, "domain", None),
+            dry_run=getattr(args, "dry_run", False),
         )
     if args.command == "prune-stores":
         return run_prune_stores(execute=getattr(args, "execute", False))
