@@ -667,6 +667,14 @@ def run_rebuild_branches(
             created += 1
 
         try:
+            # Prefer the curated TSV name over the scraped page title (often an
+            # SEO string like "Brand | Shop New Arrivals"), matching
+            # _apply_seed_store_metadata() on the crawl path. Applied to the base
+            # so every branch row and the address-less path inherit it.
+            seed_name = (seed.store_name or "").strip()
+            if seed_name:
+                base = replace(base, store_name=seed_name)
+
             if seed.addresses:
                 branches: list[StoreProfile] = []
                 for address in seed.addresses:
