@@ -37,11 +37,60 @@ _COMBINED_PATHS: tuple[str, ...] = (
     "/pages/shipping-and-returns",
     "/pages/returns-shipping",
     "/pages/shipping-returns-policy",
+    # Generically-named policy pages: many stores put shipping AND returns on a
+    # single page whose slug says neither (e.g. a tempo's /pages/online-store-policy).
+    "/pages/online-store-policy",
+    "/pages/store-policy",
+    "/pages/store-policies",
+    "/pages/policies",
+    "/pages/our-policies",
+    "/pages/customer-care",
+    "/pages/customer-service",
+    "/pages/faq",
+    "/pages/help",
 )
 
 _RETURNS_KW = re.compile(r"return|refund|exchange", re.IGNORECASE)
 _SHIPPING_KW = re.compile(r"shipping|delivery|dispatch", re.IGNORECASE)
-_ANY_KW = re.compile(r"return|refund|exchange|shipping|delivery|dispatch", re.IGNORECASE)
+
+# Generically-named policy links ("Online Store Policy", "Customer Care",
+# "Terms"). Such a page usually covers BOTH shipping and returns, so it is a
+# candidate for either category; the per-category text check below still
+# decides whether the page actually covers that category.
+_GENERIC_POLICY_KW = re.compile(
+    r"polic(?:y|ies)|customer (?:care|service)|\bfaq\b|help", re.IGNORECASE
+)
+
+# Legal/compliance pages that a generic "…policy" match otherwise drags in.
+# A privacy notice or T&C page is not a shipping/returns policy, but it clears
+# the phrasing gate (it mentions "30 days", "receipt", ...), so exclude by name.
+_EXCLUDE_KW = re.compile(
+    r"privacy|cookie|gdpr|ccpa|accessibility|legal|imprint|"
+    r"terms[\s\-_]*(?:of[\s\-_]*(?:service|use)|and[\s\-_]*conditions)|"
+    r"do[\s\-_]*not[\s\-_]*sell",
+    re.IGNORECASE,
+)
+
+# A genuine policy leads with returns/shipping wording. Used to avoid excluding
+# a real refund policy that merely *mentions* "Terms" or links to a /legal/ URL.
+_POLICY_LEAD = re.compile(
+    r"^\W*(refund|return|shipping|delivery|exchange|order|store polic)", re.IGNORECASE
+)
+
+
+def _is_legal_page_text(text: str) -> bool:
+    """True when text reads as a privacy/T&C/accessibility page, not a policy."""
+    head = re.sub(r"^[A-Z][A-Z &]+:\s*", "", (text or "").lstrip())
+    if _POLICY_LEAD.match(head):
+        return False
+    return bool(_EXCLUDE_KW.search(head[:200]))
+# Link discovery must be broader than the category keywords, or a page named
+# only "…-policy" is never even considered.
+_ANY_KW = re.compile(
+    r"return|refund|exchange|shipping|delivery|dispatch|"
+    r"polic(?:y|ies)|terms|customer (?:care|service)|\bfaq\b|help",
+    re.IGNORECASE,
+)
 
 # (category, dedicated paths, keyword matcher) — we capture one page per category.
 _CATEGORIES: tuple[tuple[str, tuple[str, ...], re.Pattern[str]], ...] = (
@@ -184,6 +233,11 @@ def stored_policy_is_weak(text: str | None, *, min_score: float = 2.0) -> bool:
     """
     if not text or not text.strip():
         return True
+    # Wrong content type: a privacy notice / T&C page can be dense in policy
+    # phrasing yet is not a shipping or returns policy. Strip the section label
+    # first so "RETURNS:\nPRIVACY POLICY ..." is still detected.
+    if _is_legal_page_text(text):
+        return True
     signals = _policy_signal_count(text)
     if signals < 2:
         return True
@@ -260,6 +314,10 @@ def _homepage_policy_links(homepage_html: str, base_url: str) -> list[tuple[str,
         match_text = f"{href} {label}"
         if not _ANY_KW.search(match_text):
             continue
+        # Never follow privacy/T&C/legal links — they read like policies but
+        # are not shipping or returns policies.
+        if _EXCLUDE_KW.search(match_text):
+            continue
         absolute = urljoin(base_url + "/", href)
         parsed = urlparse(absolute)
         if parsed.scheme not in ("http", "https"):
@@ -318,7 +376,14 @@ async def fetch_shipping_returns(
     for category, paths, keyword in _CATEGORIES:
         candidates: list[str] = [f"{base}{p}" for p in paths]
         candidates += [f"{base}{p}" for p in _COMBINED_PATHS]
+        # Category-specific links first, then generically-named policy pages
+        # ("Online Store Policy"), which often carry both policies.
         candidates += [url for url, match_text in homepage_links if keyword.search(match_text)]
+        candidates += [
+            url
+            for url, match_text in homepage_links
+            if not keyword.search(match_text) and _GENERIC_POLICY_KW.search(match_text)
+        ]
 
         seen: set[str] = set()
         for url in candidates:
@@ -334,6 +399,11 @@ async def fetch_shipping_returns(
             # the keyword check alone accepts menus. Require real policy phrasing.
             if not _looks_like_policy(text):
                 logger.debug("Skipping %s for %s: no policy phrasing (likely nav)", url, category)
+                continue
+            # A privacy notice / T&C page clears the phrasing gate ("30 days",
+            # "receipt") but is not a shipping or returns policy.
+            if _is_legal_page_text(text):
+                logger.debug("Skipping %s for %s: reads as privacy/legal page", url, category)
                 continue
             found[category] = (url, text[:_MAX_CHARS_PER_POLICY])
             break

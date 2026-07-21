@@ -165,6 +165,85 @@ def test_navigation_only_page_is_not_accepted_as_policy():
     assert text is None and url is None
 
 
+def test_finds_generically_named_policy_page_via_homepage_link():
+    """A page whose slug says neither 'shipping' nor 'returns' must still be found.
+
+    Regression: atemponewyork.com keeps both policies at /pages/online-store-policy.
+    It matched no canonical path, and link discovery ignored it because the old
+    keyword only matched shipping/returns words — so the store stored nothing.
+    """
+    base = "https://shop.example.com"
+    homepage = (
+        "<html><body><a href='/pages/online-store-policy'>Online Store Policy</a>"
+        "</body></html>"
+    )
+    policy = (
+        "<html><body><main>Online store policy SHIPPING All orders ship within 2 "
+        "business days with a tracking number. RETURNS Items may be returned within "
+        "30 days for a refund if unworn and in original packaging."
+        "</main></body></html>"
+    )
+    fetcher = _FakeFetcher({f"{base}/pages/online-store-policy": policy})
+    text, url = asyncio.run(
+        policies.fetch_shipping_returns(base, fetcher, _settings(), homepage_html=homepage)
+    )
+    assert text is not None, "generically-named policy page was not discovered"
+    assert "30 days" in text and "business days" in text
+    assert "online-store-policy" in url
+
+
+def test_generic_policy_path_is_a_canonical_candidate():
+    """Even with no homepage, common generic policy slugs are probed."""
+    base = "https://shop.example.com"
+    policy = (
+        "<html><body><main>Store policy: orders ship within 3 business days. "
+        "Returns accepted within 30 days for a refund on unworn items."
+        "</main></body></html>"
+    )
+    fetcher = _FakeFetcher({f"{base}/pages/store-policy": policy})
+    text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is not None
+    assert "store-policy" in url
+
+
+def test_privacy_and_terms_pages_are_not_stored_as_policies():
+    """Privacy/T&C pages clear the phrasing gate but are not shipping/returns.
+
+    Regression: broadening link discovery to generic '...policy' links made
+    nostandingnyc store its PRIVACY POLICY and dansonjewelers its TERMS AND
+    CONDITIONS as shipping_returns.
+    """
+    base = "https://shop.example.com"
+    homepage = (
+        "<html><body>"
+        "<a href='/pages/privacy-policy'>Privacy Policy</a>"
+        "<a href='/pages/terms-and-conditions'>Terms and Conditions</a>"
+        "</body></html>"
+    )
+    privacy = (
+        "<html><body><main>PRIVACY POLICY Last updated February 28, 2023. This "
+        "privacy notice explains what information we collect. You may request a "
+        "receipt of your data within 30 days of your request."
+        "</main></body></html>"
+    )
+    terms = (
+        "<html><body><main>PLEASE READ OUR TERMS AND CONDITIONS CAREFULLY BEFORE "
+        "USING OUR SITE. These terms govern your use. Refund of fees may be "
+        "requested within 30 days subject to a restocking review."
+        "</main></body></html>"
+    )
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/pages/privacy-policy": privacy,
+            f"{base}/pages/terms-and-conditions": terms,
+        }
+    )
+    text, url = asyncio.run(
+        policies.fetch_shipping_returns(base, fetcher, _settings(), homepage_html=homepage)
+    )
+    assert text is None and url is None, f"legal page stored as policy: {text!r}"
+
+
 def test_looks_like_policy_requires_substantive_phrasing():
     assert not policies._looks_like_policy("Shipping Returns Cart Account Menu")
     assert policies._looks_like_policy(

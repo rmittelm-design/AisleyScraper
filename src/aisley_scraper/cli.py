@@ -27,7 +27,6 @@ from aisley_scraper.crawl.image_verifier import (
 from aisley_scraper.db.repository import Repository
 from aisley_scraper.diagnostics import diagnose_staged_runs
 from aisley_scraper.extract.policies import (
-    _looks_like_policy,
     fetch_shipping_returns,
     stored_policy_is_weak,
 )
@@ -816,13 +815,25 @@ def run_recapture_policies(
             for index, profile in enumerate(profiles, start=1):
                 base = profile.website.rstrip("/")
                 try:
-                    text, url = await fetch_shipping_returns(base, fetcher, settings)
+                    # Fetch the homepage so link discovery can find policy pages
+                    # whose slug matches none of the canonical paths (e.g.
+                    # /pages/online-store-policy). Best-effort: canonical paths
+                    # still work if the homepage is unreachable.
+                    try:
+                        homepage_html = await fetcher.get_text(base)
+                    except Exception:
+                        homepage_html = None
+                    text, url = await fetch_shipping_returns(
+                        base, fetcher, settings, homepage_html=homepage_html
+                    )
                 except Exception as exc:
                     logger.warning("recapture-policies failed for %s: %s", base, exc)
                     failed += 1
                     continue
 
-                before_ok = _looks_like_policy(profile.shipping_returns or "")
+                # Consistent with --only-broken: 'ok' means genuinely good,
+                # not merely containing policy words (privacy/T&C text does).
+                before_ok = not stored_policy_is_weak(profile.shipping_returns)
                 if text:
                     status = "policy" if not before_ok else "policy (refreshed)"
                     repaired += 1
