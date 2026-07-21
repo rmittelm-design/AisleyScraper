@@ -440,7 +440,9 @@ async def fetch_shipping_returns(
             if _is_legal_page_text(text):
                 logger.debug("Skipping %s for %s: reads as privacy/legal page", url, category)
                 continue
-            found[category] = (url, text[:_MAX_CHARS_PER_POLICY])
+            # Stored uncapped; the cap is applied at emit time so a combined
+            # page (which stands in for BOTH categories) gets both budgets.
+            found[category] = (url, text)
             break
 
         # Last resort: the policy may be published inline ON the homepage rather
@@ -455,7 +457,7 @@ async def fetch_shipping_returns(
                 and _looks_like_policy(text)
                 and not _is_legal_page_text(text)
             ):
-                found[category] = (base, text[:_MAX_CHARS_PER_POLICY])
+                found[category] = (base, text)
 
     returns = found.get("returns")
     shipping = found.get("shipping")
@@ -464,14 +466,15 @@ async def fetch_shipping_returns(
 
     # If both resolved to the same combined page, emit it once.
     if returns and shipping and returns[0] == shipping[0]:
-        return f"SHIPPING & RETURNS:\n{returns[1]}", returns[0]
+        combined = returns[1][: _MAX_CHARS_PER_POLICY * 2]
+        return f"SHIPPING & RETURNS:\n{combined}", returns[0]
 
     parts: list[str] = []
     urls: list[str] = []
     if returns:
-        parts.append(f"RETURNS:\n{returns[1]}")
+        parts.append(f"RETURNS:\n{returns[1][:_MAX_CHARS_PER_POLICY]}")
         urls.append(returns[0])
     if shipping:
-        parts.append(f"SHIPPING:\n{shipping[1]}")
+        parts.append(f"SHIPPING:\n{shipping[1][:_MAX_CHARS_PER_POLICY]}")
         urls.append(shipping[0])
     return "\n\n".join(parts), " | ".join(urls)
