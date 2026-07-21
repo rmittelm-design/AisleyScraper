@@ -335,3 +335,52 @@ def test_ui_boilerplate_is_not_a_terse_policy():
     )
     assert not policies._looks_like_policy(junk)
     assert policies.stored_policy_is_weak(junk)
+
+
+def test_verbose_real_policy_is_not_flagged_weak():
+    """Low signal density alone must not condemn a wordy but genuine policy.
+
+    Regression: pookieandsebastian's real policy (11 signals over ~8000 chars)
+    scored 1.37 density and was reported as boilerplate.
+    """
+    verbose = (
+        "QUESTIONS ABOUT YOUR ORDER & RETURNS ORDER FULFILLMENT Once the order is "
+        "placed, processing begins. You can expect merchandise within 4 to 12 "
+        "business days. Returns accepted within 30 days for a refund on unworn "
+        "items in original packaging; final sale items are excluded. "
+    ) + ("We appreciate your patience while we prepare your order. " * 90)
+    assert not policies.stored_policy_is_weak(verbose)
+
+
+def test_navigation_padded_capture_is_still_weak():
+    """Low density WITH a navigation lead is what actually indicates padding."""
+    padded = (
+        "Skip to content Shop now pay later New Arrivals SALE HANDBAGS ACCESSORIES "
+        "Login Consign With Us Visit Our Store "
+    ) + ("Designer Brand Name " * 300) + " returns within 30 days for a refund"
+    assert policies.stored_policy_is_weak(padded)
+
+
+def test_best_scoring_policy_page_wins_over_first_match():
+    """A tighter page should beat an earlier-but-noisier one."""
+    base = "https://shop.example.com"
+    noisy = (
+        "<html><body><main>QUESTIONS ABOUT YOUR ORDER Once the order is placed "
+        "processing begins within 4 to 12 business days. Returns accepted within 30 "
+        "days for a refund. " + ("Assorted filler copy about our brand story. " * 60)
+        + "</main></body></html>"
+    )
+    tight = (
+        "<html><body><main>Return &amp; Exchange Policy Items may be returned within "
+        "30 days for a refund if unworn and in original packaging. Final sale items "
+        "are excluded and a restocking fee may apply.</main></body></html>"
+    )
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": noisy,   # tried first
+            f"{base}/pages/return-policy": tight,      # tried later, but better
+        }
+    )
+    text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is not None
+    assert "/pages/return-policy" in url, f"picked the noisier page: {url}"

@@ -107,6 +107,8 @@ _CATEGORIES: tuple[tuple[str, tuple[str, ...], re.Pattern[str]], ...] = (
 # policy ("All of our pieces are final sale."). Density is meaningless at
 # this size: the per-1000-char divisor is floored at 1.0.
 _TERSE_POLICY_MAX_CHARS = 800
+# How many accepted pages to score per category before settling on the best.
+_MAX_CANDIDATES_TO_SCORE = 3
 _MAX_CHARS_PER_POLICY = 4000
 _MIN_POLICY_CHARS = 80
 
@@ -274,7 +276,13 @@ def stored_policy_is_weak(text: str | None, *, min_score: float = 2.0) -> bool:
     # value is long enough for navigation padding to be the explanation.
     if len(text) <= _TERSE_POLICY_MAX_CHARS:
         return False
-    return _policy_signal_count(text) / (len(text) / 1000.0) < min_score
+    density = _policy_signal_count(text) / (len(text) / 1000.0)
+    if density >= min_score:
+        return False
+    # Low density on its own does NOT mean junk: a wordy, genuine policy
+    # (pookieandsebastian: 11 signals over 8000 chars) scores low. What low
+    # density plus a NAVIGATION lead indicates is menu padding.
+    return bool(_NAV_MARKERS.search(text[:400]))
 
 
 def _clean_text(html: str) -> str:
@@ -421,6 +429,7 @@ async def fetch_shipping_returns(
         ]
 
         seen: set[str] = set()
+        scored: list[tuple[float, str, str]] = []
         for url in candidates:
             if url in seen:
                 continue
@@ -440,10 +449,19 @@ async def fetch_shipping_returns(
             if _is_legal_page_text(text):
                 logger.debug("Skipping %s for %s: reads as privacy/legal page", url, category)
                 continue
+            # Score accepted candidates and keep the best rather than the
+            # first: a store may expose the same policy on several pages of
+            # differing quality (pookieandsebastian's /pages/return-policy is
+            # tighter than its /policies/refund-policy).
+            scored.append((_candidate_score(text), url, text))
+            if len(scored) >= _MAX_CANDIDATES_TO_SCORE:
+                break
+        if scored:
+            scored.sort(key=lambda item: -item[0])
+            best_score_, best_url, best_txt = scored[0]
             # Stored uncapped; the cap is applied at emit time so a combined
             # page (which stands in for BOTH categories) gets both budgets.
-            found[category] = (url, text)
-            break
+            found[category] = (best_url, best_txt)
 
         # Last resort: the policy may be published inline ON the homepage rather
         # than on any dedicated page — commonly a collapsible footer section
