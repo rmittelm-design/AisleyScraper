@@ -517,6 +517,37 @@ class Repository:
             )
         return profiles
 
+    def update_store_policies(
+        self, website: str, shipping_returns: str | None, shipping_returns_url: str | None
+    ) -> int:
+        """Set shipping_returns/url on EVERY row of this website's domain.
+
+        Branch rows share one store's policy, so all of a domain's rows are
+        written together. Matched by www/scheme-insensitive domain (like
+        ``sync_store_branches``) so http/https/www variants are all updated.
+        Returns the number of rows written.
+        """
+        domain = _domain_key(website)
+        if not domain:
+            return 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select id, website from shopify_stores where website ilike %s;",
+                    (f"%{domain}%",),
+                )
+                ids = [int(sid) for sid, site in cur.fetchall() if _domain_key(site) == domain]
+                if not ids:
+                    return 0
+                cur.execute(
+                    "update shopify_stores set shipping_returns = %s, "
+                    "shipping_returns_url = %s where id = any(%s);",
+                    (shipping_returns, shipping_returns_url, ids),
+                )
+                written = cur.rowcount
+            conn.commit()
+        return int(written)
+
     def delete_stores_not_in_domains(self, keep_domains: set[str]) -> tuple[int, list[str]]:
         """Delete every ``shopify_stores`` row whose www/scheme-insensitive domain
         is NOT in ``keep_domains`` (the TSV is the source of truth). Products

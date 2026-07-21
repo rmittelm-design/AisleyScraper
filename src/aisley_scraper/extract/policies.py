@@ -52,14 +52,168 @@ _CATEGORIES: tuple[tuple[str, tuple[str, ...], re.Pattern[str]], ...] = (
 _MAX_CHARS_PER_POLICY = 4000
 _MIN_POLICY_CHARS = 80
 
+# Containers that hold the real policy/page body on Shopify themes, best first.
+# Without this we fall back to <body> and a mega-nav can eat the whole char
+# budget before any policy text is reached.
+_CONTENT_SELECTORS: tuple[str, ...] = (
+    "div.shopify-policy__body",  # canonical Shopify /policies/* pages
+    "div.rte",                   # standard Shopify rich-text page body
+    "article",
+    "div.page-content",
+    "div.main-content",
+    "div.container.main",
+    "section.page",
+    "div.page",
+    "main",
+)
+
+# Non-content chrome to drop before extracting.
+_CHROME_TAGS = (
+    "script", "style", "noscript", "header", "nav", "svg",
+    "footer", "form", "aside", "iframe", "select",
+)
+# Substring class/id matches: themes name menus wildly (e.g. doors.nyc uses
+# `mega-menu-container`, which a plain `.mega-menu` selector does NOT match).
+_CHROME_SELECTORS = (
+    '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+    '[class*="mega-menu"]', '[class*="site-nav"]', '[class*="main-nav"]',
+    '[class*="navbar"]', '[class*="navigation"]', '[class*="dropdown-menu"]',
+    '[class*="site-header"]', '[class*="site-footer"]',
+    '[id*="mega-menu"]', '[id*="site-nav"]',
+    ".breadcrumb", ".cart", ".newsletter",
+)
+
+# Overlays/interstitials that leak in as "policy" text: cart drawers ("added to
+# your bag"), hero sliders ("Pause slideshow"), promo bars, cookie notices.
+# Stripped ONLY when they contain no policy phrasing — themes reuse these class
+# names for real content (e.g. a policy inside a `.banner` wrapper), and blanket
+# removal deleted legitimate policies.
+_SOFT_CHROME_SELECTORS = (
+    '[class*="modal"]', '[class*="popup"]', '[class*="drawer"]',
+    '[class*="slideshow"]', '[class*="slider"]', '[class*="carousel"]',
+    '[class*="announcement"]', '[class*="promo"]', '[class*="banner"]',
+    '[class*="cookie"]', '[class*="toast"]', '[class*="notification"]',
+    '[class*="skip-to"]', '[class*="skip-link"]',
+)
+
+# Storefront navigation/boilerplate — if this dominates the head of a candidate
+# it is a menu, not a policy.
+_NAV_MARKERS = re.compile(
+    r"\b(shop all|all clothing|new arrivals|best sellers|shopping cart|add to cart|"
+    r"my account|wish ?list|newsletter|subscribe|gift cards?|size guide|store locator|"
+    # UI chrome that leaks in when a theme renders overlays inline
+    r"skip to (?:content|main)|pause slideshow|play slideshow|close menu|"
+    r"added to your (?:bag|cart)|this modal|opens in a new window|"
+    r"your cart is empty|continue shopping)\b",
+    re.IGNORECASE,
+)
+
+# Substantive policy phrasing. Deliberately EXCLUDES bare "shipping"/"returns",
+# which appear as nav link labels on every page — requiring these prevents a
+# navigation menu from being mistaken for a policy body.
+_POLICY_SIGNALS = re.compile(
+    r"\b("
+    # timeframes
+    r"\d+\s*(?:business\s*|calendar\s*)?days?|business day|"
+    # returns / refunds
+    r"refund(?:ed|able)?|exchange[sd]?|restocking|store credit|original packaging|"
+    r"final sale|unworn|unused|return label|proof of purchase|receipt|"
+    # shipping (phrases, never the bare nav label "shipping"/"delivery")
+    r"free\s+(?:standard\s+|express\s+|ground\s+)?(?:shipping|delivery|returns?)|"
+    r"flat[\s-]?(?:rate|fee)|ships?\s+within|dispatch(?:ed)?|"
+    r"(?:calculated|shown|displayed)\s+at\s+checkout|"
+    r"international\s+(?:shipping|delivery|orders?)|"
+    r"orders?\s+over\s+\$?\d+|tracking\s+(?:number|information)|"
+    r"carrier|customs|duties"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize(node) -> str:
+    return re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+
+
+def _policy_signal_count(text: str) -> int:
+    """Number of DISTINCT substantive policy phrases present."""
+    return len({m.group(0).lower() for m in _POLICY_SIGNALS.finditer(text)})
+
+
+def _looks_like_policy(text: str) -> bool:
+    """True when text reads like an actual policy body, not a nav menu.
+
+    A storefront menu contains the words "Shipping" and "Returns" (link labels)
+    and easily clears a naive keyword check, so require at least two distinct
+    substantive policy phrases (e.g. "30 days" + "refund").
+    """
+    return _policy_signal_count(text) >= 2
+
+
+_MAX_CANDIDATE_CHARS = 8000
+
+
+def _candidate_score(text: str) -> float:
+    """Policy-signal DENSITY (distinct signals per 1000 chars), nav-penalised.
+
+    Density — not a raw count — is what separates a policy from a menu: a
+    sprawling nav blob accumulates a few incidental signals across thousands of
+    characters, while a real policy is short and signal-dense.
+    """
+    signals = _policy_signal_count(text)
+    if signals < 2:
+        return 0.0
+    density = signals / max(1.0, len(text) / 1000.0)
+    if _NAV_MARKERS.search(text[:400]):
+        density *= 0.1
+    return density
+
 
 def _clean_text(html: str) -> str:
+    """Extract the policy body, preferring the densest real content block.
+
+    Tries known content containers first, then (for unfamiliar themes) scans
+    block elements, picking the highest policy-signal density. This keeps a
+    page's mega-nav from crowding out the policy. Falls back to the full body
+    when nothing looks like a policy, so callers can still reject it.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "noscript", "header", "nav", "svg"]):
+    for tag in soup(list(_CHROME_TAGS)):
         tag.decompose()
-    main = soup.find("main") or soup.body or soup
-    text = main.get_text(" ", strip=True)
-    return re.sub(r"\s+", " ", text).strip()
+    for selector in _CHROME_SELECTORS:
+        for node in soup.select(selector):
+            node.decompose()
+    # Soft chrome: only remove when it carries no policy phrasing, so a policy
+    # wrapped in a themed `.banner`/`.promo` container survives.
+    for selector in _SOFT_CHROME_SELECTORS:
+        for node in soup.select(selector):
+            if _policy_signal_count(_normalize(node)) < 2:
+                node.decompose()
+
+    candidates: list[str] = []
+    for selector in _CONTENT_SELECTORS:
+        for node in soup.select(selector):
+            text = _normalize(node)
+            if len(text) >= _MIN_POLICY_CHARS:
+                candidates.append(text)
+
+    # Unknown theme: no known container scored — scan block elements instead.
+    if not any(_candidate_score(t) > 0 for t in candidates):
+        for node in soup.find_all(("div", "section", "article")):
+            text = _normalize(node)
+            if _MIN_POLICY_CHARS <= len(text) <= _MAX_CANDIDATE_CHARS:
+                candidates.append(text)
+
+    best_text = ""
+    best_score = 0.0
+    for text in candidates:
+        score = _candidate_score(text)
+        if score > best_score or (score == best_score > 0 and 0 < len(text) < len(best_text)):
+            best_text, best_score = text, score
+
+    if best_text and best_score > 0:
+        return best_text
+    body = soup.body or soup
+    return _normalize(body)
 
 
 def _homepage_policy_links(homepage_html: str, base_url: str) -> list[tuple[str, str]]:
@@ -152,6 +306,11 @@ async def fetch_shipping_returns(
             if not text or len(text) < _MIN_POLICY_CHARS:
                 continue
             if not keyword.search(text):
+                continue
+            # A storefront nav mentions "shipping"/"returns" on every page, so
+            # the keyword check alone accepts menus. Require real policy phrasing.
+            if not _looks_like_policy(text):
+                logger.debug("Skipping %s for %s: no policy phrasing (likely nav)", url, category)
                 continue
             found[category] = (url, text[:_MAX_CHARS_PER_POLICY])
             break

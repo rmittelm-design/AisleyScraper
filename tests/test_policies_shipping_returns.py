@@ -104,6 +104,74 @@ def test_returns_none_when_no_policy_pages():
     assert text is None and url is None
 
 
+# Regression: a storefront mega-nav wraps the policy. Before the content-container
+# fix, _clean_text returned <body> text and the menu ate the whole char budget,
+# so shipping_returns was stored as pure navigation (observed on doors.nyc).
+_NAV = (
+    "<nav>SHOP CLOTHING All Clothing Blouses Bodysuits Cardigans Coats Dresses "
+    "Hoodies Jackets Denim Knitwear SHOES All Shoes Boots Flats Heels Sneakers "
+    "BAGS All Bags Clutch bags Tote bags ACCESSORIES Belts Hats Scarves "
+    "New Arrivals Best Sellers Shopping Cart My Account</nav>"
+)
+_MENU_NOISE = "<div class='site-nav'>" + ("Designer Brand Name " * 400) + "</div>"
+
+
+def _nav_wrapped(policy_html: str) -> str:
+    return f"<html><body>{_NAV}{_MENU_NOISE}{policy_html}{_NAV}</body></html>"
+
+
+def test_policy_extracted_from_content_container_not_navigation():
+    base = "https://shop.example.com"
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": _nav_wrapped(
+                "<div class='shopify-policy__body'>Items may be returned within 30 "
+                "days for a full refund. Items must be unworn and in their original "
+                "packaging. Final sale items are non-returnable.</div>"
+            ),
+            f"{base}/policies/shipping-policy": _nav_wrapped(
+                "<div class='shopify-policy__body'>Orders ship within 2 business days. "
+                "Free shipping on orders over $100. A tracking number is emailed once "
+                "your order ships.</div>"
+            ),
+        }
+    )
+    text, _ = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is not None
+    # The real policy content is present...
+    assert "30 days" in text and "original packaging" in text
+    assert "business days" in text and "tracking number" in text.lower()
+    # ...and the navigation menu is not.
+    for junk in ("All Clothing", "Shopping Cart", "Designer Brand Name", "Best Sellers"):
+        assert junk not in text, f"navigation leaked into policy text: {junk!r}"
+
+
+def test_navigation_only_page_is_not_accepted_as_policy():
+    """A menu mentioning 'Shipping'/'Returns' must not be stored as a policy."""
+    base = "https://shop.example.com"
+    nav_only = (
+        "<html><body><main>SHOP All Clothing New Arrivals Best Sellers Shipping "
+        "Returns Shopping Cart My Account Gift Cards Store Locator About Us "
+        + ("Brand Name " * 300)
+        + "</main></body></html>"
+    )
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": nav_only,
+            f"{base}/policies/shipping-policy": nav_only,
+        }
+    )
+    text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is None and url is None
+
+
+def test_looks_like_policy_requires_substantive_phrasing():
+    assert not policies._looks_like_policy("Shipping Returns Cart Account Menu")
+    assert policies._looks_like_policy(
+        "Returns accepted within 30 days for a refund on unworn items."
+    )
+
+
 def test_finds_shipping_only_when_returns_missing():
     base = "https://shop.example.com"
     fetcher = _FakeFetcher({f"{base}/policies/shipping-policy": _SHIP_HTML})

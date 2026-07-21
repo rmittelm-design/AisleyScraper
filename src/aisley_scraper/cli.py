@@ -26,6 +26,7 @@ from aisley_scraper.crawl.image_verifier import (
 )
 from aisley_scraper.db.repository import Repository
 from aisley_scraper.diagnostics import diagnose_staged_runs
+from aisley_scraper.extract.policies import _looks_like_policy, fetch_shipping_returns
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.geocoding import geocode_address
@@ -252,6 +253,46 @@ def _build_parser() -> argparse.ArgumentParser:
             "Also create rows for TSV stores not yet in the table (TSV-derived, "
             "no products) and a single row for address-less TSV stores, so the "
             "stores table fully mirrors the TSVs"
+        ),
+    )
+
+    recapture = sub.add_parser(
+        "recapture-policies",
+        help=(
+            "Re-fetch each store's shipping/returns policy and rewrite "
+            "shipping_returns/_url (no product re-scrape). Repairs rows whose "
+            "stored text is navigation boilerplate rather than a real policy."
+        ),
+    )
+    recapture.add_argument("--limit", type=int, default=None, help="Max stores to process")
+    recapture.add_argument(
+        "--domain",
+        type=str,
+        default=None,
+        help=(
+            "Only this one store (www/scheme-insensitive domain, e.g. doors.nyc). "
+            "Leaves every other store untouched."
+        ),
+    )
+    recapture.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and print what would be written, without touching the database",
+    )
+    recapture.add_argument(
+        "--clear-unfixable",
+        action="store_true",
+        help=(
+            "Also NULL rows whose stored policy is boilerplate and for which no "
+            "real policy could be fetched (default: leave such rows unchanged)"
+        ),
+    )
+    recapture.add_argument(
+        "--only-broken",
+        action="store_true",
+        help=(
+            "Skip stores whose stored policy already reads like a real policy; "
+            "only re-capture NULL or navigation-boilerplate rows"
         ),
     )
 
@@ -720,6 +761,91 @@ def run_rebuild_branches(
     print(
         f"{verb} {reconciled} store(s) ({total_rows} rows; "
         f"{created} newly created from the TSV)."
+    )
+    return 0
+
+
+def run_recapture_policies(
+    limit: int | None = None,
+    *,
+    domain_filter: str | None = None,
+    dry_run: bool = False,
+    only_broken: bool = False,
+    clear_unfixable: bool = False,
+) -> int:
+    """Re-fetch shipping/returns policies for existing stores and rewrite them.
+
+    Uses the same extractor as the crawl (``fetch_shipping_returns``), which
+    prefers a real policy container over the page body — so stores previously
+    stored with navigation boilerplate get a correct policy (or NULL, which is
+    honest, when no policy page exposes one).
+    """
+    settings = get_settings()
+    repo = Repository(settings)
+
+    profiles = repo.list_all_store_profiles()
+    if domain_filter:
+        target = _domain_key(
+            domain_filter if "://" in domain_filter else f"https://{domain_filter}"
+        )
+        profiles = [p for p in profiles if _domain_key(p.website) == target]
+        if not profiles:
+            print(f"No store found for domain {domain_filter!r}.")
+            return 1
+
+    if only_broken:
+        profiles = [p for p in profiles if not _looks_like_policy(p.shipping_returns or "")]
+
+    if limit is not None:
+        profiles = profiles[:limit]
+
+    if not profiles:
+        print("Nothing to re-capture.")
+        return 0
+
+    print(f"Re-capturing policies for {len(profiles)} store(s)...")
+
+    async def _run() -> tuple[int, int, int, int]:
+        fetcher = Fetcher(settings)
+        repaired = cleared = failed = skipped = 0
+        try:
+            for index, profile in enumerate(profiles, start=1):
+                base = profile.website.rstrip("/")
+                try:
+                    text, url = await fetch_shipping_returns(base, fetcher, settings)
+                except Exception as exc:
+                    logger.warning("recapture-policies failed for %s: %s", base, exc)
+                    failed += 1
+                    continue
+
+                before_ok = _looks_like_policy(profile.shipping_returns or "")
+                if text:
+                    status = "policy" if not before_ok else "policy (refreshed)"
+                    repaired += 1
+                else:
+                    # Nothing usable found. Default to leaving the row alone: a
+                    # fetch can miss for transient reasons (bot-block, JS-only
+                    # page), and silently wiping hundreds of rows is worse than
+                    # leaving them. --clear-unfixable opts into NULLing junk.
+                    if before_ok or not clear_unfixable:
+                        skipped += 1
+                        continue
+                    status = "no policy found -> NULL"
+                    cleared += 1
+
+                preview = (text or "").replace("\n", " ")[:90]
+                print(f"  [{index}/{len(profiles)}] {_domain_key(base)}: {status} {preview}")
+                if not dry_run:
+                    repo.update_store_policies(base, text, url)
+        finally:
+            await fetcher.close()
+        return repaired, cleared, failed, skipped
+
+    repaired, cleared, failed, skipped = asyncio.run(_run())
+    verb = "Would update" if dry_run else "Updated"
+    print(
+        f"{verb} {repaired} store(s) with a real policy; {skipped} left unchanged "
+        f"(no policy found); {cleared} cleared to NULL; {failed} fetch failure(s)."
     )
     return 0
 
@@ -2637,6 +2763,14 @@ def main() -> int:
             include_missing=getattr(args, "include_missing", False),
             domain_filter=getattr(args, "domain", None),
             dry_run=getattr(args, "dry_run", False),
+        )
+    if args.command == "recapture-policies":
+        return run_recapture_policies(
+            limit=getattr(args, "limit", None),
+            domain_filter=getattr(args, "domain", None),
+            dry_run=getattr(args, "dry_run", False),
+            only_broken=getattr(args, "only_broken", False),
+            clear_unfixable=getattr(args, "clear_unfixable", False),
         )
     if args.command == "prune-stores":
         return run_prune_stores(execute=getattr(args, "execute", False))
