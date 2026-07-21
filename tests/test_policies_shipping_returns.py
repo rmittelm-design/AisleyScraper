@@ -206,6 +206,40 @@ def test_generic_policy_path_is_a_canonical_candidate():
     assert "store-policy" in url
 
 
+def test_policy_published_inline_in_the_homepage_footer():
+    """Some stores have no policy page — the policy lives in the footer.
+
+    Regression: greatlabels.com keeps its whole return policy in a collapsible
+    footer block. The homepage was never tried as a policy source, and the
+    footer was hard-stripped (via <footer> / [role=contentinfo]) before
+    extraction, so the store captured nothing.
+    """
+    base = "https://shop.example.com"
+    homepage = (
+        "<html><body>"
+        "<main>Shop Our Inventory Handbags Shoes Clothing Jacket Sale price $990.00</main>"
+        "<footer role='contentinfo' class='site-footer'>"
+        "  <div class='footer__item-padding'>"
+        "    <p class='footer__title'>Return Policy</p>"
+        "    <div class='collapsible-content'><div class='footer__collapsible'>"
+        "      <p>All sales are FINAL, however, if there is a discrepancy with the "
+        "      quality of your purchase we offer returns within 14 days of purchase. "
+        "      You can return your product for store credit. We do not provide the "
+        "      shipping label.</p>"
+        "    </div></div>"
+        "  </div>"
+        "</footer></body></html>"
+    )
+    fetcher = _FakeFetcher({})  # no policy pages exist at all
+    text, url = asyncio.run(
+        policies.fetch_shipping_returns(base, fetcher, _settings(), homepage_html=homepage)
+    )
+    assert text is not None, "footer-inline policy was not found"
+    assert "14 days" in text and "store credit" in text
+    # The storefront/product content must not be what got captured.
+    assert "Sale price" not in text
+
+
 def test_privacy_and_terms_pages_are_not_stored_as_policies():
     """Privacy/T&C pages clear the phrasing gate but are not shipping/returns.
 

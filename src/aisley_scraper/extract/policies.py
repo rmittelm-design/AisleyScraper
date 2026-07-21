@@ -119,15 +119,18 @@ _CONTENT_SELECTORS: tuple[str, ...] = (
 # Non-content chrome to drop before extracting.
 _CHROME_TAGS = (
     "script", "style", "noscript", "header", "nav", "svg",
-    "footer", "form", "aside", "iframe", "select",
+    "form", "aside", "iframe", "select",
 )
+# NOTE: <footer> is deliberately NOT hard-stripped. Some stores publish their
+# only policy in a collapsible footer section (greatlabels.com keeps its entire
+# return policy there), so footers are stripped conditionally below.
 # Substring class/id matches: themes name menus wildly (e.g. doors.nyc uses
 # `mega-menu-container`, which a plain `.mega-menu` selector does NOT match).
 _CHROME_SELECTORS = (
-    '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+    '[role="navigation"]', '[role="banner"]',
     '[class*="mega-menu"]', '[class*="site-nav"]', '[class*="main-nav"]',
     '[class*="navbar"]', '[class*="navigation"]', '[class*="dropdown-menu"]',
-    '[class*="site-header"]', '[class*="site-footer"]',
+    '[class*="site-header"]',
     '[id*="mega-menu"]', '[id*="site-nav"]',
     ".breadcrumb", ".cart", ".newsletter",
 )
@@ -138,6 +141,11 @@ _CHROME_SELECTORS = (
 # names for real content (e.g. a policy inside a `.banner` wrapper), and blanket
 # removal deleted legitimate policies.
 _SOFT_CHROME_SELECTORS = (
+    # Footer variants are conditional, never hard-stripped: a store may publish
+    # its only policy in a collapsible footer section. `[role="contentinfo"]`
+    # and `site-footer` used to be hard-stripped, which deleted greatlabels.com's
+    # entire return policy before extraction ever ran.
+    "footer", '[class*="footer"]', '[role="contentinfo"]', '[class*="site-footer"]',
     '[class*="modal"]', '[class*="popup"]', '[class*="drawer"]',
     '[class*="slideshow"]', '[class*="slider"]', '[class*="carousel"]',
     '[class*="announcement"]', '[class*="promo"]', '[class*="banner"]',
@@ -199,6 +207,9 @@ def _looks_like_policy(text: str) -> bool:
 
 
 _MAX_CANDIDATE_CHARS = 8000
+# A container scoring at least this is clearly the policy body; below it we
+# also scan loose blocks (cheap insurance for unusual layouts).
+_STRONG_CANDIDATE_SCORE = 4.0
 
 
 def _candidate_score(text: str) -> float:
@@ -273,8 +284,11 @@ def _clean_text(html: str) -> str:
             if len(text) >= _MIN_POLICY_CHARS:
                 candidates.append(text)
 
-    # Unknown theme: no known container scored — scan block elements instead.
-    if not any(_candidate_score(t) > 0 for t in candidates):
+    # Scan block elements when no known container scored *well*. A weak-but-
+    # nonzero container (e.g. a homepage <main>) previously suppressed this,
+    # hiding policies published outside the main content — such as a collapsible
+    # footer section.
+    if max((_candidate_score(t) for t in candidates), default=0.0) < _STRONG_CANDIDATE_SCORE:
         for node in soup.find_all(("div", "section", "article")):
             text = _normalize(node)
             if _MIN_POLICY_CHARS <= len(text) <= _MAX_CANDIDATE_CHARS:
@@ -407,6 +421,20 @@ async def fetch_shipping_returns(
                 continue
             found[category] = (url, text[:_MAX_CHARS_PER_POLICY])
             break
+
+        # Last resort: the policy may be published inline ON the homepage rather
+        # than on any dedicated page — commonly a collapsible footer section
+        # (greatlabels.com keeps its whole return policy there).
+        if category not in found and homepage_html:
+            text = _clean_text(homepage_html)
+            if (
+                text
+                and len(text) >= _MIN_POLICY_CHARS
+                and keyword.search(text)
+                and _looks_like_policy(text)
+                and not _is_legal_page_text(text)
+            ):
+                found[category] = (base, text[:_MAX_CHARS_PER_POLICY])
 
     returns = found.get("returns")
     shipping = found.get("shipping")
