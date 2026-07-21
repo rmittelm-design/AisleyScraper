@@ -50,7 +50,12 @@ _COMBINED_PATHS: tuple[str, ...] = (
     "/pages/help",
 )
 
-_RETURNS_KW = re.compile(r"return|refund|exchange", re.IGNORECASE)
+# "final sale" / "all sales are final" IS a returns policy — a store that
+# accepts no returns often never writes the word "return" (nostandingnyc.com).
+_RETURNS_KW = re.compile(
+    r"return|refund|exchange|final sale|all sales?[\s\w]{0,12}final|no returns",
+    re.IGNORECASE,
+)
 _SHIPPING_KW = re.compile(r"shipping|delivery|dispatch", re.IGNORECASE)
 
 # Generically-named policy links ("Online Store Policy", "Customer Care",
@@ -98,6 +103,10 @@ _CATEGORIES: tuple[tuple[str, tuple[str, ...], re.Pattern[str]], ...] = (
     ("shipping", _SHIPPING_PATHS, _SHIPPING_KW),
 )
 
+# At or below this length, a single policy phrase means a terse-but-real
+# policy ("All of our pieces are final sale."). Density is meaningless at
+# this size: the per-1000-char divisor is floored at 1.0.
+_TERSE_POLICY_MAX_CHARS = 800
 _MAX_CHARS_PER_POLICY = 4000
 _MIN_POLICY_CHARS = 80
 
@@ -161,7 +170,8 @@ _NAV_MARKERS = re.compile(
     # UI chrome that leaks in when a theme renders overlays inline
     r"skip to (?:content|main)|pause slideshow|play slideshow|close menu|"
     r"added to your (?:bag|cart)|this modal|opens in a new window|"
-    r"your cart is empty|continue shopping)\b",
+    r"your cart is empty|continue shopping|"
+    r"choosing a selection results in|full page refresh)\b",
     re.IGNORECASE,
 )
 
@@ -200,10 +210,19 @@ def _looks_like_policy(text: str) -> bool:
     """True when text reads like an actual policy body, not a nav menu.
 
     A storefront menu contains the words "Shipping" and "Returns" (link labels)
-    and easily clears a naive keyword check, so require at least two distinct
-    substantive policy phrases (e.g. "30 days" + "refund").
+    and easily clears a naive keyword check, so require two distinct substantive
+    phrases (e.g. "30 days" + "refund") — OR one phrase that dominates a short
+    text, which is how a terse policy reads ("All of our pieces are final sale.").
+    A long navigation blob can never satisfy the second case: its density is low.
     """
-    return _policy_signal_count(text) >= 2
+    signals = _policy_signal_count(text)
+    if signals >= 2:
+        return True
+    if signals == 1:
+        # A lone signal is only convincing in short text that isn't UI chrome
+        # ("Choosing a selection results in a full page refresh.").
+        return len(text) <= _TERSE_POLICY_MAX_CHARS and not _NAV_MARKERS.search(text)
+    return False
 
 
 _MAX_CANDIDATE_CHARS = 8000
@@ -249,11 +268,13 @@ def stored_policy_is_weak(text: str | None, *, min_score: float = 2.0) -> bool:
     # first so "RETURNS:\nPRIVACY POLICY ..." is still detected.
     if _is_legal_page_text(text):
         return True
-    signals = _policy_signal_count(text)
-    if signals < 2:
+    if not _looks_like_policy(text):
         return True
-    density = signals / max(1.0, len(text) / 1000.0)
-    return density < min_score
+    # Short policy-like text is fine as-is; density only discriminates once a
+    # value is long enough for navigation padding to be the explanation.
+    if len(text) <= _TERSE_POLICY_MAX_CHARS:
+        return False
+    return _policy_signal_count(text) / (len(text) / 1000.0) < min_score
 
 
 def _clean_text(html: str) -> str:

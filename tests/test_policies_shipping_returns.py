@@ -206,6 +206,32 @@ def test_generic_policy_path_is_a_canonical_candidate():
     assert "store-policy" in url
 
 
+def test_terse_final_sale_policy_is_captured():
+    """A no-returns store may never write the word "return".
+
+    Regression: nostandingnyc.com's whole policy is "All of our pieces are final
+    sale...". It failed the returns keyword (no return/refund/exchange) and the
+    two-signal rule, so the store captured nothing.
+    """
+    base = "https://shop.example.com"
+    terse = (
+        "<html><body><main>All of our pieces are final sale. If you experience any "
+        "problems with your order please email us at shop@example.com so we can "
+        "help solve the issue.</main></body></html>"
+    )
+    fetcher = _FakeFetcher({f"{base}/pages/returns-exchanges": terse})
+    text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is not None, "terse final-sale policy was rejected"
+    assert "final sale" in text.lower()
+
+
+def test_long_navigation_with_one_signal_is_still_rejected():
+    """The terse allowance must not let a nav blob through."""
+    nav_blob = "Shop All Clothing New Arrivals Best Sellers " * 120 + " final sale"
+    assert not policies._looks_like_policy(nav_blob)
+    assert policies.stored_policy_is_weak(nav_blob)
+
+
 def test_policy_published_inline_in_the_homepage_footer():
     """Some stores have no policy page — the policy lives in the footer.
 
@@ -294,3 +320,18 @@ def test_finds_shipping_only_when_returns_missing():
     assert text is not None
     assert "SHIPPING:" in text and "RETURNS:" not in text
     assert url == f"{base}/policies/shipping-policy"
+
+
+def test_ui_boilerplate_is_not_a_terse_policy():
+    """The terse allowance must not admit Shopify UI chrome.
+
+    Regression: dansonjewelers captured "Refund policy Choosing a selection
+    results in a full page refresh. Opens in a new window." — 98 chars of
+    variant-selector boilerplate that leads with "Refund policy".
+    """
+    junk = (
+        "Refund policy Choosing a selection results in a full page refresh. "
+        "Opens in a new window."
+    )
+    assert not policies._looks_like_policy(junk)
+    assert policies.stored_policy_is_weak(junk)
