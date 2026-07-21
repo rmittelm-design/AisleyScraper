@@ -168,6 +168,19 @@ def _candidate_score(text: str) -> float:
     return density
 
 
+def stored_policy_is_weak(text: str | None, *, min_score: float = 2.0) -> bool:
+    """True when an ALREADY-STORED shipping_returns value looks like boilerplate.
+
+    Uses signal density, not a raw count: a 4000-char navigation blob usually
+    contains two incidental policy words somewhere, so a presence check reports
+    it as fine. Density separates a menu (many chars, few signals) from a real
+    policy (few chars, many signals).
+    """
+    if not text or not text.strip():
+        return True
+    return _candidate_score(text) < min_score
+
+
 def _clean_text(html: str) -> str:
     """Extract the policy body, preferring the densest real content block.
 

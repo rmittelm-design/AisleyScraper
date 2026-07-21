@@ -26,7 +26,11 @@ from aisley_scraper.crawl.image_verifier import (
 )
 from aisley_scraper.db.repository import Repository
 from aisley_scraper.diagnostics import diagnose_staged_runs
-from aisley_scraper.extract.policies import _looks_like_policy, fetch_shipping_returns
+from aisley_scraper.extract.policies import (
+    _looks_like_policy,
+    fetch_shipping_returns,
+    stored_policy_is_weak,
+)
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.geocoding import geocode_address
@@ -794,7 +798,7 @@ def run_recapture_policies(
             return 1
 
     if only_broken:
-        profiles = [p for p in profiles if not _looks_like_policy(p.shipping_returns or "")]
+        profiles = [p for p in profiles if stored_policy_is_weak(p.shipping_returns)]
 
     if limit is not None:
         profiles = profiles[:limit]
