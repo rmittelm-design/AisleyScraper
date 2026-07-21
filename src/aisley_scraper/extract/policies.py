@@ -175,10 +175,20 @@ def stored_policy_is_weak(text: str | None, *, min_score: float = 2.0) -> bool:
     contains two incidental policy words somewhere, so a presence check reports
     it as fine. Density separates a menu (many chars, few signals) from a real
     policy (few chars, many signals).
+
+    Deliberately does NOT apply ``_candidate_score``'s nav penalty. That penalty
+    exists to rank competing blocks *within one page*; against a stored value it
+    misfires on genuine policies that merely mention a nav-ish phrase (e.g.
+    "gift cards are non-returnable"), which flagged real 13-signal policies as
+    junk.
     """
     if not text or not text.strip():
         return True
-    return _candidate_score(text) < min_score
+    signals = _policy_signal_count(text)
+    if signals < 2:
+        return True
+    density = signals / max(1.0, len(text) / 1000.0)
+    return density < min_score
 
 
 def _clean_text(html: str) -> str:
