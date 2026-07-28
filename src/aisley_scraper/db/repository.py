@@ -737,6 +737,89 @@ class Repository:
                 cur.executemany(sql, params)
             conn.commit()
 
+    def update_products_metadata(
+        self, website: str, products: list[ProductRecord], *, dry_run: bool = False
+    ) -> tuple[int, int]:
+        """Refresh scraped metadata on EXISTING shopify_products rows for a domain.
+
+        Updates only metadata sourced from a fresh scrape (name, description,
+        price, availability, sizes, colors, brand, product_type, sku, handle,
+        url) plus last_seen_at. Deliberately does NOT touch images /
+        supabase_images (preserving the CLIP-validated set) or gender_* columns,
+        and never INSERTs — a genuinely new product needs image validation via
+        the full crawl, not a metadata refresh.
+
+        Matched by domain (all branch rows) + product_id, like sync_store_branches.
+        Returns ``(rows_updated, products_scraped)``.
+        """
+        domain = _domain_key(website)
+        if not domain or not products:
+            return 0, len(products)
+        by_id: dict[str, ProductRecord] = {}
+        for product in products:
+            by_id[product.product_id] = product  # last wins; scrape already deduped
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select id, website from shopify_stores where website ilike %s;",
+                    (f"%{domain}%",),
+                )
+                store_ids = [
+                    int(sid) for sid, site in cur.fetchall() if _domain_key(site) == domain
+                ]
+                if not store_ids:
+                    return 0, len(products)
+
+                cur.execute(
+                    "select distinct product_id from shopify_products "
+                    "where store_id = any(%s) and product_id = any(%s);",
+                    (store_ids, list(by_id.keys())),
+                )
+                existing_ids = [row[0] for row in cur.fetchall() if row[0] in by_id]
+                if dry_run or not existing_ids:
+                    return len(existing_ids), len(products)
+
+                sql = """
+                update shopify_products set
+                    product_handle = %s,
+                    product_url = %s,
+                    item_name = %s,
+                    description = %s,
+                    sku = %s,
+                    updated_at = %s,
+                    price_cents = %s,
+                    sizes = %s,
+                    colors = %s,
+                    brand = %s,
+                    product_type = %s,
+                    unavailable = %s,
+                    last_seen_at = now()
+                where store_id = any(%s) and product_id = %s;
+                """
+                params = [
+                    (
+                        p.product_handle,
+                        p.product_url,
+                        p.item_name,
+                        p.description,
+                        p.sku,
+                        p.updated_at,
+                        p.price_cents,
+                        Jsonb(list(p.sizes)),
+                        Jsonb(list(p.colors)),
+                        p.brand,
+                        p.product_type,
+                        p.unavailable,
+                        store_ids,
+                        pid,
+                    )
+                    for pid, p in ((pid, by_id[pid]) for pid in existing_ids)
+                ]
+                cur.executemany(sql, params)
+            conn.commit()
+        return len(existing_ids), len(products)
+
     def delete_product(self, store_id: int, product_id: str) -> None:
         sql = "delete from shopify_products where store_id = %s and product_id = %s;"
         with self._connect() as conn:

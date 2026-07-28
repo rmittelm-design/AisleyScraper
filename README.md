@@ -233,9 +233,20 @@ FETCHER_BYTE_CACHE_MAX_MB=256
 - `FETCHER_DISK_CACHE_MAX_MB` sets a hard cap for the on-disk cache; oldest cached files are evicted once the directory exceeds this size.
 - Old cache files from prior runs are cleared automatically at crawl startup, and current-run cache files are deleted during normal batch cleanup.
 
-### Skip-upsert optimisation
+### Skip-validation optimisation
 
-Both `--phase both` and `--phase 2` skip the DB upsert for products whose images have not changed since the last run — only metadata fields (price, availability, etc.) require a write when images are unchanged. This significantly reduces Supabase write traffic on re-crawls of large catalogs.
+On a re-crawl, products whose image URLs are unchanged since the last run skip the expensive step — image download and CLIP validation (`_needs_enrichment`) — **not** the DB write. Their scraped metadata (price, availability, description, sizes, etc.) is still upserted, so metadata stays current while unchanged-image products cost no image or CLIP work. On the product upsert only `gender_label` / `gender_probs_csv` are preserved (via `coalesce`); every other column is overwritten from the fresh scrape.
+
+### Refresh metadata only (`refresh-products`)
+
+To refresh metadata on **existing** `shopify_products` rows without any staging, image download, or CLIP, use:
+
+```bash
+aisley-scraper refresh-products --domain <domain>   # one store; omit --domain for all
+aisley-scraper refresh-products --domain <domain> --dry-run   # scrape + report, no writes
+```
+
+It re-scrapes each store's `products.json` (the same lightweight fetch as Phase 1) and updates only scraped metadata — `item_name`, `description`, `price_cents`, `unavailable`, `sizes`, `colors`, `brand`, `product_type`, `sku`, `product_handle`, `product_url`, `last_seen_at` — **in place**. It deliberately does **not** touch `images` / `supabase_images` (preserving the CLIP-validated set) or gender labels, and **never inserts**: a product not already in production is skipped, because a genuinely new item needs the full crawl's image validation. Use it to keep prices/availability/descriptions current far more cheaply than a full re-crawl.
 
 ### Staging tables
 

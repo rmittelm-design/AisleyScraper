@@ -18,7 +18,11 @@ from uuid import uuid4
 
 from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.fetcher import Fetcher
-from aisley_scraper.crawl.orchestrator import scrape_many, scrape_many_stream
+from aisley_scraper.crawl.orchestrator import (
+    _fetch_all_products,
+    scrape_many,
+    scrape_many_stream,
+)
 from aisley_scraper.crawl.image_verifier import (
     evaluate_first_image_product_validation,
     verify_first_image_product_validation,
@@ -257,6 +261,33 @@ def _build_parser() -> argparse.ArgumentParser:
             "no products) and a single row for address-less TSV stores, so the "
             "stores table fully mirrors the TSVs"
         ),
+    )
+
+    refresh = sub.add_parser(
+        "refresh-products",
+        help=(
+            "Re-scrape each store's products.json and refresh metadata "
+            "(name, description, price, availability, sizes/colors, brand, type) "
+            "on EXISTING shopify_products rows in place. Lightweight: no image "
+            "downloads, no CLIP, no staging. Images and gender labels are left "
+            "untouched; genuinely new products are skipped (they need the full "
+            "crawl for image validation)."
+        ),
+    )
+    refresh.add_argument("--limit", type=int, default=None, help="Max stores to process")
+    refresh.add_argument(
+        "--domain",
+        type=str,
+        default=None,
+        help=(
+            "Only this one store (www/scheme-insensitive domain, e.g. toddsnyder.com). "
+            "Leaves every other store untouched."
+        ),
+    )
+    refresh.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scrape and report what would be refreshed, without writing to the database",
     )
 
     recapture = sub.add_parser(
@@ -764,6 +795,86 @@ def run_rebuild_branches(
     print(
         f"{verb} {reconciled} store(s) ({total_rows} rows; "
         f"{created} newly created from the TSV)."
+    )
+    return 0
+
+
+def run_refresh_products(
+    limit: int | None = None,
+    *,
+    domain_filter: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Re-scrape products.json and refresh metadata on existing shopify_products.
+
+    This is the lightweight metadata-only path: it re-fetches each store's
+    products.json (the same scrape+filter as Phase 1, ``_fetch_all_products``)
+    but downloads no images and runs no CLIP. It updates only scraped metadata
+    columns on rows that already exist in production (via
+    ``repo.update_products_metadata``); images, supabase_images and gender
+    labels are preserved, and new products are skipped (they need the full
+    crawl's image validation). For price/availability/description refreshes on
+    an existing catalog this is far cheaper than a full crawl.
+    """
+    settings = get_settings()
+    repo = Repository(settings)
+
+    profiles = repo.list_all_store_profiles()
+    if domain_filter:
+        target = _domain_key(
+            domain_filter if "://" in domain_filter else f"https://{domain_filter}"
+        )
+        profiles = [p for p in profiles if _domain_key(p.website) == target]
+        if not profiles:
+            print(f"No store found for domain {domain_filter!r}.")
+            return 1
+
+    if limit is not None:
+        profiles = profiles[:limit]
+
+    if not profiles:
+        print("Nothing to refresh.")
+        return 0
+
+    print(f"Refreshing product metadata for {len(profiles)} store(s)...")
+
+    async def _run() -> tuple[int, int, int, int]:
+        fetcher = Fetcher(settings)
+        updated_total = scraped_total = new_total = failed = 0
+        try:
+            for index, profile in enumerate(profiles, start=1):
+                base = profile.website.rstrip("/")
+                try:
+                    products = await _fetch_all_products(
+                        base=base, settings=settings, fetcher=fetcher
+                    )
+                except Exception as exc:
+                    logger.warning("refresh-products failed for %s: %s", base, exc)
+                    failed += 1
+                    continue
+
+                matched, scraped = repo.update_products_metadata(
+                    base, products, dry_run=dry_run
+                )
+                updated_total += matched
+                scraped_total += scraped
+                new_total += scraped - matched
+                verb = "would refresh" if dry_run else "refreshed"
+                print(
+                    f"  [{index}/{len(profiles)}] {_domain_key(base)}: {verb} "
+                    f"{matched}/{scraped} existing ({scraped - matched} scraped but "
+                    f"not in production, skipped)"
+                )
+        finally:
+            await fetcher.close()
+        return updated_total, scraped_total, new_total, failed
+
+    updated, scraped, new, failed = asyncio.run(_run())
+    verb = "Would refresh" if dry_run else "Refreshed"
+    print(
+        f"{verb} metadata on {updated} existing product(s) across {len(profiles)} "
+        f"store(s); {new} scraped product(s) not in production (skipped); "
+        f"{failed} store fetch failure(s)."
     )
     return 0
 
@@ -2776,6 +2887,12 @@ def main() -> int:
             limit=getattr(args, "limit", None),
             skip_geocode=getattr(args, "skip_geocode", False),
             include_missing=getattr(args, "include_missing", False),
+            domain_filter=getattr(args, "domain", None),
+            dry_run=getattr(args, "dry_run", False),
+        )
+    if args.command == "refresh-products":
+        return run_refresh_products(
+            limit=getattr(args, "limit", None),
             domain_filter=getattr(args, "domain", None),
             dry_run=getattr(args, "dry_run", False),
         )
