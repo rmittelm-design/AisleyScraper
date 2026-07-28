@@ -289,6 +289,25 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Scrape and report what would be refreshed, without writing to the database",
     )
+    refresh.add_argument(
+        "--no-mark-removed",
+        action="store_true",
+        help=(
+            "Do NOT flag production products that are absent from the scrape as "
+            "unavailable (default: flag them, when the scrape looks complete)"
+        ),
+    )
+    refresh.add_argument(
+        "--min-coverage",
+        type=float,
+        default=0.5,
+        help=(
+            "Safety threshold for marking removed products unavailable: only do "
+            "so when the scrape re-found at least this fraction of the store's "
+            "existing products (default 0.5). Guards against partial/bot-blocked "
+            "scrapes wrongly flagging a whole catalog."
+        ),
+    )
 
     recapture = sub.add_parser(
         "recapture-policies",
@@ -804,6 +823,8 @@ def run_refresh_products(
     *,
     domain_filter: str | None = None,
     dry_run: bool = False,
+    mark_removed: bool = True,
+    min_coverage: float = 0.5,
 ) -> int:
     """Re-scrape products.json and refresh metadata on existing shopify_products.
 
@@ -813,8 +834,10 @@ def run_refresh_products(
     columns on rows that already exist in production (via
     ``repo.update_products_metadata``); images, supabase_images and gender
     labels are preserved, and new products are skipped (they need the full
-    crawl's image validation). For price/availability/description refreshes on
-    an existing catalog this is far cheaper than a full crawl.
+    crawl's image validation). Products that have disappeared from the store's
+    catalog are flagged ``unavailable`` (guarded against partial scrapes). For
+    price/availability/description refreshes on an existing catalog this is far
+    cheaper than a full crawl.
     """
     settings = get_settings()
     repo = Repository(settings)
@@ -840,7 +863,7 @@ def run_refresh_products(
 
     async def _run() -> tuple[int, int, int, int]:
         fetcher = Fetcher(settings)
-        updated_total = scraped_total = new_total = failed = 0
+        updated_total = new_total = removed_total = failed = 0
         try:
             for index, profile in enumerate(profiles, start=1):
                 base = profile.website.rstrip("/")
@@ -853,28 +876,36 @@ def run_refresh_products(
                     failed += 1
                     continue
 
-                matched, scraped = repo.update_products_metadata(
-                    base, products, dry_run=dry_run
+                r = repo.update_products_metadata(
+                    base,
+                    products,
+                    dry_run=dry_run,
+                    mark_removed=mark_removed,
+                    min_coverage=min_coverage,
                 )
-                updated_total += matched
-                scraped_total += scraped
-                new_total += scraped - matched
+                updated_total += int(r["updated"])
+                new_total += int(r["scraped"]) - int(r["updated"])
+                removed_total += int(r["marked_unavailable"])
                 verb = "would refresh" if dry_run else "refreshed"
+                note = ""
+                if r["marked_unavailable"]:
+                    note = f", {r['marked_unavailable']} removed -> unavailable"
+                elif r["mark_skipped_reason"]:
+                    note = f", removal-mark skipped ({r['mark_skipped_reason']})"
                 print(
                     f"  [{index}/{len(profiles)}] {_domain_key(base)}: {verb} "
-                    f"{matched}/{scraped} existing ({scraped - matched} scraped but "
-                    f"not in production, skipped)"
+                    f"{r['updated']}/{r['scraped']} existing{note}"
                 )
         finally:
             await fetcher.close()
-        return updated_total, scraped_total, new_total, failed
+        return updated_total, new_total, removed_total, failed
 
-    updated, scraped, new, failed = asyncio.run(_run())
+    updated, new, removed, failed = asyncio.run(_run())
     verb = "Would refresh" if dry_run else "Refreshed"
     print(
         f"{verb} metadata on {updated} existing product(s) across {len(profiles)} "
-        f"store(s); {new} scraped product(s) not in production (skipped); "
-        f"{failed} store fetch failure(s)."
+        f"store(s); {removed} delisted product(s) marked unavailable; {new} scraped "
+        f"product(s) not in production (skipped); {failed} store fetch failure(s)."
     )
     return 0
 
@@ -2895,6 +2926,8 @@ def main() -> int:
             limit=getattr(args, "limit", None),
             domain_filter=getattr(args, "domain", None),
             dry_run=getattr(args, "dry_run", False),
+            mark_removed=not getattr(args, "no_mark_removed", False),
+            min_coverage=getattr(args, "min_coverage", 0.5),
         )
     if args.command == "recapture-policies":
         return run_recapture_policies(

@@ -248,6 +248,15 @@ aisley-scraper refresh-products --domain <domain> --dry-run   # scrape + report,
 
 It re-scrapes each store's `products.json` (the same lightweight fetch as Phase 1) and updates only scraped metadata — `item_name`, `description`, `price_cents`, `unavailable`, `sizes`, `colors`, `brand`, `product_type`, `sku`, `product_handle`, `product_url`, `last_seen_at` — **in place**. It deliberately does **not** touch `images` / `supabase_images` (preserving the CLIP-validated set) or gender labels, and **never inserts**: a product not already in production is skipped, because a genuinely new item needs the full crawl's image validation. Use it to keep prices/availability/descriptions current far more cheaply than a full re-crawl.
 
+**Delisted products.** A production product that is **absent from the scrape** (removed from the store's catalog) is flagged `unavailable = true`. (A sold-out-but-still-listed item is handled separately — Shopify keeps it in `products.json` with `available:false`.) This is guarded against partial/bot-blocked scrapes: if the scrape returns nothing, or re-finds less than `--min-coverage` (default `0.5`) of the store's existing products, the removal marking is skipped for that store. A wrongly-flagged item self-corrects on the next successful scrape (its metadata refresh restores availability).
+
+```bash
+aisley-scraper refresh-products                      # all stores
+aisley-scraper refresh-products --dry-run            # all stores, report only
+aisley-scraper refresh-products --no-mark-removed    # metadata only; don't flag delisted
+aisley-scraper refresh-products --min-coverage 0.8   # stricter guard before flagging
+```
+
 ### Staging tables
 
 | Table | Purpose |
