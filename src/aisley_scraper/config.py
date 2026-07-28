@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     crawl_request_total_timeout_sec: int = Field(
         default=60, alias="CRAWL_REQUEST_TOTAL_TIMEOUT_SEC"
     )
+    # The pre-crawl orphan-storage audit (see _run_orphan_preflight) walks the
+    # ENTIRE storage bucket via the Supabase Storage API before scraping starts,
+    # and then auto-deletes orphaned objects. On a large bucket this can take a
+    # very long time (or hang behind Cloudflare), wedging the whole crawl. Gate it
+    # so it can be skipped, and cap it so it can never block the crawl indefinitely.
+    crawl_orphan_preflight_enabled: bool = Field(
+        default=True, alias="CRAWL_ORPHAN_PREFLIGHT_ENABLED"
+    )
+    crawl_orphan_preflight_timeout_sec: int = Field(
+        default=120, alias="CRAWL_ORPHAN_PREFLIGHT_TIMEOUT_SEC"
+    )
     crawl_http2_enabled: bool = Field(default=True, alias="CRAWL_HTTP2_ENABLED")
     # Verify TLS certs on crawl fetches. Default True (secure); set CRAWL_SSL_VERIFY=false
     # ONLY to scrape stores with broken/expired certs (skips MITM protection).

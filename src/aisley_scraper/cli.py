@@ -13,6 +13,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 from uuid import uuid4
 
@@ -569,8 +570,55 @@ def _select_shard(websites: list[str], shard_index: int, shard_count: int) -> li
     return selected
 
 
+def _detect_orphans_bounded(settings, timeout_sec: int) -> dict | None:
+    """Run the orphan-storage audit under a hard wall-clock cap.
+
+    ``detect_orphan_storage_objects`` BFS-walks the ENTIRE storage bucket via the
+    Supabase Storage API; httpx's timeout is per-read, so a large bucket (or a
+    slow-streamed page behind Cloudflare) can make it run effectively forever and
+    wedge the crawl before scraping begins. Run it in a *daemon* thread and
+    ``join`` for at most ``timeout_sec`` — a daemon so an overrunning listing can
+    never block process exit. Returns the audit dict, or None when it timed out or
+    errored (the caller then proceeds WITHOUT the destructive auto-delete).
+    """
+    box: dict = {}
+
+    def _worker() -> None:
+        try:
+            box["audit"] = detect_orphan_storage_objects(settings)
+        except Exception as exc:  # noqa: BLE001 - preflight is best-effort
+            box["error"] = exc
+
+    thread = threading.Thread(target=_worker, name="orphan-preflight", daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    if thread.is_alive():
+        logger.warning(
+            "Orphan storage preflight exceeded %ss (large bucket or slow storage "
+            "API); skipping orphan cleanup and proceeding with the crawl.",
+            timeout_sec,
+        )
+        return None
+    if "error" in box:
+        logger.warning(
+            "Orphan storage preflight failed (%s); proceeding with the crawl.",
+            box["error"],
+        )
+        return None
+    return box.get("audit")
+
+
 def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
-    audit = detect_orphan_storage_objects(settings)
+    if not getattr(settings, "crawl_orphan_preflight_enabled", True):
+        logger.info(
+            "Orphan storage preflight skipped (CRAWL_ORPHAN_PREFLIGHT_ENABLED=false)"
+        )
+        return
+    timeout_sec = max(1, int(getattr(settings, "crawl_orphan_preflight_timeout_sec", 120)))
+
+    audit = _detect_orphans_bounded(settings, timeout_sec)
+    if audit is None:
+        return  # timed out / errored -> best-effort, keep crawling
     orphan_paths = list(audit["orphan_paths"])
     if not orphan_paths:
         logger.info(
@@ -588,10 +636,16 @@ def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
         audit["stored_paths"],
     )
 
-    verify = detect_orphan_storage_objects(settings)
+    verify = _detect_orphans_bounded(settings, timeout_sec)
+    if verify is None:
+        return
     remaining_orphans = list(verify["orphan_paths"])
     if remaining_orphans:
-        raise RuntimeError(f"orphan preflight failed: remaining_orphans={len(remaining_orphans)}")
+        # Non-fatal: a residual-orphan count must not abort a scrape run.
+        logger.warning(
+            "Orphan preflight still sees remaining_orphans=%s after cleanup; continuing.",
+            len(remaining_orphans),
+        )
 
 
 def _build_db_first_seeds(settings, repo: Repository) -> list[StoreSeed]:
