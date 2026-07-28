@@ -360,3 +360,135 @@ def test_category_filter_preserves_apparel_collisions() -> None:
     ]
     for product in keeps:
         assert should_exclude_product(product) is False, product.item_name
+
+
+# Non-apparel categories imported for parity with the AisleyAgent ban list:
+# bedding/furniture/home decor/kitchen/food/nursery/stationery/electronics/pet
+# gear/sporting equipment/bath & body/services/misc accessories. Collision-safe
+# subset only (bare ambiguous words are excluded — see the next two tests).
+def test_should_exclude_aisleyagent_parity_categories() -> None:
+    drops = [
+        # Home textiles & bedding.
+        _p("Linen Duvet Cover"),
+        _p("Down Comforter"),
+        _p("Cotton Pillowcase"),
+        _p("Quilted Bedspread", ptype="Bedding"),
+        _p("Memory Foam Mattress"),
+        _p("Waffle Bath Mat"),
+        _p("Hand-Knotted Area Rug"),
+        _p("Wool Rug", ptype="Home"),
+        _p("Linen Napkins"),
+        _p("Ceramic Trivet"),
+        # Furniture.
+        _p("Oak Nightstand"),
+        _p("Velvet Loveseat"),
+        _p("Walnut Bookcase"),
+        _p("Rattan Armchair"),
+        _p("Reclaimed Coffee Table"),
+        _p("Brass Floor Lamp"),
+        _p("Leather Sofa", ptype="Furniture"),
+        # Home decor & scent.
+        _p("Ceramic Vase"),
+        _p("Dried Flower Wreath"),
+        _p("Terracotta Planter"),
+        _p("Incense Holder"),
+        _p("Wax Melts"),
+        # Kitchen / drinkware / tableware.
+        _p("Marble Cheese Board"),
+        _p("Acacia Charcuterie Board"),
+        _p("Crystal Decanter"),
+        _p("Stainless Water Bottle"),
+        _p("Brass Bottle Opener"),
+        _p("Hand-Blown Glassware", ptype="Drinkware"),
+        # Food & consumables.
+        _p("Beef Jerky"),
+        _p("Sea Salt Chocolate Bar"),
+        _p("Single-Origin Coffee Beans"),
+        _p("Daily Multivitamin Supplement", ptype="Supplements"),
+        _p("Sour Gummies"),
+        # Nursery / baby gear.
+        _p("Rattan Bassinet"),
+        _p("Muslin Swaddle"),
+        _p("Overnight Diapers"),
+        # Stationery / office / games.
+        _p("A5 Notebook"),
+        _p("Brass Fountain Pen"),
+        _p("Family Board Game"),
+        _p("Vinyl Sticker Decal"),
+        # Consumer electronics / phone accessories.
+        _p("iPhone 15 Case"),
+        _p("AirPods Pro Case"),
+        _p("Braided Charging Cable"),
+        _p("Tempered Screen Protector"),
+        # Pet gear.
+        _p("Leather Dog Leash"),
+        _p("Orthopedic Cat Bed"),
+        _p("Ceramic Pet Bowl"),
+        # Sporting goods / fitness / outdoor equipment.
+        _p("Cork Yoga Mat"),
+        _p("Cast Iron Kettlebell"),
+        _p("High-Density Foam Roller"),
+        _p("Neoprene Wetsuit"),
+        _p("Longboard Cruiser"),
+        _p("Packing Cubes Set"),
+        _p("Fishing Rod Combo"),
+        # Bath & body / personal care.
+        _p("Lavender Bath Bomb"),
+        _p("Epsom Salt Soak"),
+        _p("Whipped Body Butter"),
+        _p("Nourishing Hand Cream"),
+        _p("Broad-Spectrum Sunscreen"),
+        _p("Hydrating Sheet Mask"),
+        _p("Eau de Parfum", ptype="Fragrance"),
+        # Services, digital goods & order add-ons.
+        _p("Personal Styling Session"),
+        _p("Color Analysis Consultation"),
+        _p("Shipping Protection"),
+        _p("Digital Download Guide"),
+        _p("Alterations", ptype="Services"),
+        # Misc accessories & shoe/leather care.
+        _p("Leather Key Fob"),
+        _p("Cedar Shoe Trees"),
+        _p("Silver Money Clip"),
+        _p("Enamel Bag Charm"),
+        _p("Leather Care Cleaning Kit"),
+        # Wellness devices & art-book publishers.
+        _p("LED Face Mask"),
+        _p("Assouline Coffee Table Book"),
+        _p("TASCHEN Art Volume"),
+        # Kids/juniors demographic terms added to the substring list.
+        _p("Youth Graphic Hoodie"),
+        _p("Junior Fit Blazer"),
+    ]
+    for product in drops:
+        assert should_exclude_product(product) is True, product.item_name
+
+
+# The newly-added categories ride on many apparel/jewelry/color/brand words.
+# Matching is whole-word/phrase, so these real apparel items must be KEPT.
+def test_parity_additions_do_not_drop_apparel() -> None:
+    keeps = [
+        _p("Blanket Scarf", ptype="Scarves"),           # bare 'blanket' not matched
+        _p("Pillow Clutch Bag", ptype="Bags"),          # 'pillow bag' silhouette
+        _p("Cushion-Cut Diamond Ring", ptype="Jewelry"),  # 'cushion' cut, kept jewelry
+        _p("Board Shorts", ptype="Swimwear"),           # bare 'board' not matched
+        _p("Long Board Shorts", ptype="Swimwear"),      # board sports use no-space spelling
+        _p("Tent Dress", ptype="Dresses"),              # 'tent' silhouette, not the gear
+        _p("Candy Stripe Shirt", ptype="Tops"),         # 'candy' color/pattern
+        _p("Chocolate Brown Sweater", ptype="Knitwear"),  # 'chocolate' color
+        _p("Pistachio Ribbed Knit", ptype="Tops"),      # 'pistachio' color
+        _p("Vitamin A Swimsuit", ptype="Swimwear"),     # brand name, not the supplement
+        _p("Journal Standard Wool Coat", ptype="Coats"),  # apparel brand
+        _p("Snowboard Jacket", ptype="Outerwear"),      # bare 'snowboard' not matched
+        _p("Cat-Eye Sunglasses", ptype="Eyewear"),      # 'cat' not matched (phrase-gated)
+        _p("Dog Tag Pendant Necklace", ptype="Jewelry"),  # 'dog' not matched (phrase-gated)
+        _p("Nappa Leather Tote", ptype="Bags"),         # 'nappa' != 'nappy'
+        _p("Sateen Slip Dress", ptype="Dresses"),       # 'sateen' fabric != 'teen'
+        _p("Arm Warmers", ptype="Accessories"),         # 'arm' != 'arm chair'
+        _p("Charm Necklace", ptype="Jewelry"),          # bare 'charm' kept, not 'bag charm'
+        _p("Tailored Wool Blazer", ptype="Blazers"),    # 'tailoring service' phrase-gated
+        _p("Bottle Green Trench Coat", ptype="Coats"),  # 'bottle' color, not 'water bottle'
+        _p("Prong Setting Signet Ring", ptype="Jewelry"),  # 'setting' != 'setting spray/powder'
+    ]
+    for product in keeps:
+        assert should_exclude_product(product) is False, product.item_name

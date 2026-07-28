@@ -24,6 +24,11 @@ _KIDS_SUBSTRINGS: tuple[str, ...] = (
     "babies",
     "infant",
     "newborn",
+    # "youth"/"junior" mark kids/juniors apparel too. NOT added: "teen" (collides
+    # with "sateen" fabric), "tween" (collides with "between"), "2t"/"3t" (too
+    # short — would match random SKU/handle fragments).
+    "youth",
+    "junior",
 )
 
 
@@ -81,7 +86,96 @@ _NON_APPAREL_PATTERN = re.compile(
     # romper) and is intentionally NOT filtered, so real dolls are caught by "doll"
     # while babydoll apparel is kept.
     r"dolls?|teddy[\s-]*bears?|plushies?|stuffed[\s-]*animals?|action[\s-]*figures?|"
-    r"toys?"
+    r"toys?|"
+    # The groups below mirror the non-apparel ban list in the AisleyAgent app so the
+    # scraper drops the same categories at scrape time. Only the COLLISION-SAFE terms
+    # are included — whole words/phrases with no apparel/jewelry/footwear overlap.
+    # Ambiguous words AisleyAgent parser-safeguards (throw, box, candy, chocolate,
+    # foundation, tent, cushion, pillow, ottoman, tackle, luggage, journal, vitamin,
+    # pistachio, licorice, dog/cat, snowboard, skateboard) are intentionally EXCLUDED
+    # here — they ride on real apparel/colors/brands and AisleyAgent still catches them
+    # at ingestion.
+    # --- Home textiles & bedding. "blanket"/"pillow"/"sham" are matched only in
+    #     phrases: a bare "blanket scarf" and a "pillow bag" are real apparel/bags.
+    #     "towel" is already handled above; \brug\b won't match "rugby". ---
+    r"duvets?|comforters?|coverlets?|bedspreads?|pillowcases?|bed[\s-]*sheets?|"
+    r"bedding|bed[\s-]*skirts?|mattress(?:es)?|slipcovers?|headboards?|"
+    r"throw[\s-]*blankets?|throw[\s-]*pillows?|pillow[\s-]*shams?|duvet[\s-]*covers?|"
+    r"fitted[\s-]*sheets?|flat[\s-]*sheets?|bath[\s-]*sheets?|dish[\s-]*cloths?|"
+    r"tablecloths?|placemats?|napkins?|doormats?|trivets?|potholders?|oven[\s-]*mitts?|"
+    r"bath[\s-]*mats?|bath[\s-]*rugs?|area[\s-]*rugs?|bedding[\s-]*sets?|rugs?|"
+    # --- Furniture (no apparel collision). "arm warmers" won't match "arm chair". ---
+    r"recliners?|loveseats?|nightstands?|credenzas?|sideboards?|bookshelf|bookshelves|"
+    r"bookcases?|futons?|bar[\s-]*stools?|barstools?|armchairs?|settees?|footstools?|"
+    r"sofas?|couch(?:es)?|sectionals?|chaises?|sconces?|"
+    r"(?:lounge|accent|dining|office|club|swivel|rocking|wingback|wing|arm)[\s-]*chairs?|"
+    r"(?:dining|coffee|console|side|end|dressing)[\s-]*tables?|table[\s-]*lamps?|"
+    r"floor[\s-]*lamps?|bar[\s-]*carts?|"
+    # --- Home decor & scent (diffuser/candle already handled above). ---
+    r"vases?|wreaths?|garlands?|planters?|canisters?|coasters?|incense|"
+    r"wax[\s-]*melts?|room[\s-]*sprays?|shower[\s-]*curtains?|"
+    # --- Kitchen / drinkware / tableware. Bare "bottle" collides with "bottle green";
+    #     matched only as "water bottle"/"bottle opener". ---
+    r"drinkware|glassware|cookware|bakeware|dinnerware|tableware|dishware|flatware|"
+    r"decanters?|flasks?|(?:cutting|cheese|charcuterie|serving)[\s-]*boards?|"
+    r"bottle[\s-]*openers?|water[\s-]*bottles?|"
+    # --- Food & consumables. Bare "candy"/"chocolate"/"licorice"/"pistachio"/"vitamin"
+    #     are EXCLUDED — they collide with color/pattern/brand names ("candy stripe",
+    #     "chocolate brown", "pistachio knit", Vitamin A swimwear). ---
+    r"jerky|confectionery|confections|gumm(?:y|ies)|trail[\s-]*mix|mixed[\s-]*nuts|"
+    r"hot[\s-]*sauce|chocolate[\s-]*bars?|chocolate[\s-]*truffles?|coffee[\s-]*beans?|"
+    r"tea[\s-]*bags?|grocer(?:y|ies)|supplements?|"
+    # --- Nursery / baby gear (kids apparel is handled by _KIDS_SUBSTRINGS). \bnappy\b
+    #     won't match "nappa" leather. ---
+    r"cribs?|nurser(?:y|ies)|bassinets?|swaddles?|diapers?|napp(?:y|ies)|layette|"
+    r"pacifiers?|"
+    # --- Stationery / office / games. "journal" is EXCLUDED (Journal Standard is an
+    #     apparel brand); "card game" is already covered by bare "card" above. ---
+    r"notebooks?|workbooks?|decals?|magnets?|mouse[\s-]*pads?|"
+    r"(?:ballpoint|fountain)[\s-]*pens?|ink[\s-]*cartridges?|"
+    r"(?:board|party|trivia|dice|guessing)[\s-]*games?|"
+    # --- Consumer electronics / phone accessories. \bled\b won't match "sled". ---
+    r"iphones?|airpods?|earbuds?|headphones?|(?:phone|gadget)[\s-]*cases?|"
+    r"charging[\s-]*cables?|screen[\s-]*protectors?|"
+    # --- Pet gear (bare "pet"/"pets"/"petwear" handled above; bare "dog"/"cat" collide
+    #     with "dog tag" necklaces and "cat-eye" eyewear, so match phrases only). ---
+    r"(?:dog|cat|pet)[\s-]*(?:leash(?:es)?|harness(?:es)?|beds?|bowls?|treats?|food)|"
+    r"litter[\s-]*box(?:es)?|"
+    # --- Sporting goods / fitness / outdoor equipment. Bare "board"/"tent"/"snowboard"
+    #     are EXCLUDED (board shorts, tent dress, snowboard jacket); board sports use the
+    #     no-space spelling so "... board shorts" isn't caught. ---
+    r"helmets?|kayaks?|canoes?|paddles?|treadmills?|carabiners?|hammocks?|"
+    r"dumbbells?|kettlebells?|wet[\s-]*suits?|wetsuits?|fullsuits?|"
+    r"surfboards?|paddleboards?|longboards?|wakeboards?|boogie[\s-]*boards?|"
+    r"(?:yoga|exercise|pilates|workout|gym)[\s-]*mats?|foam[\s-]*rollers?|"
+    r"sleeping[\s-]*bags?|sleeping[\s-]*pads?|packing[\s-]*cubes?|hydration[\s-]*packs?|"
+    r"camping[\s-]*tents?|fishing[\s-]*(?:rods?|reels?|tackle)|tackle[\s-]*box(?:es)?|"
+    r"golf[\s-]*clubs?|"
+    # --- Personal care / bath & body (cosmetics the terms above miss). ---
+    r"bath[\s-]*bombs?|bath[\s-]*salts?|bath[\s-]*soaks?|epsom[\s-]*salts?|"
+    r"shower[\s-]*steamers?|body[\s-]*(?:wash|lotion|butter|scrub|mist|cream)|"
+    r"hand[\s-]*(?:cream|lotion)|shower[\s-]*gel|bubble[\s-]*bath|"
+    r"lip[\s-]*(?:balm|oil|tint|liner|stain)|hair[\s-]*(?:dye|mask)|"
+    r"eau[\s-]*de[\s-]*(?:parfum|toilette|cologne)|sunscreens?|antiperspirants?|"
+    r"sheet[\s-]*masks?|face[\s-]*wash|setting[\s-]*(?:spray|powder)|makeup[\s-]*remover|"
+    r"brow[\s-]*pencils?|"
+    # --- Services, digital goods & order add-ons (not physical apparel). "gift…"
+    #     variants are already covered by bare "gift" above. ---
+    r"(?:styling|style)[\s-]*(?:session|service|consultation|fee|package)s?|"
+    r"personal[\s-]*styling|wardrobe[\s-]*consultation|colou?r[\s-]*analysis|"
+    r"alterations?|hemming|tailoring[\s-]*service|(?:repair|engraving)[\s-]*service|"
+    r"digital[\s-]*download|(?:shipping|order|package|route|return)[\s-]*protection|"
+    r"shipping[\s-]*insurance|appointments?|"
+    # --- Misc non-apparel accessories & shoe/leather care. "bag charm" is a phrase so
+    #     bare "charm" jewelry stays; bare "luggage" (a kept bag category) is not matched. ---
+    r"key[\s-]*fobs?|key[\s-]*chains?|keychains?|key[\s-]*rings?|keyrings?|"
+    r"luggage[\s-]*tags?|bag[\s-]*charms?|money[\s-]*clips?|"
+    r"shoe[\s-]*trees?|shoe[\s-]*horns?|shoe[\s-]*creams?|shoe[\s-]*brush(?:es)?|"
+    r"shoe[\s-]*polish(?:es)?|heel[\s-]*grips?|(?:cleaning|repair)[\s-]*kits?|orthotics?|"
+    # --- Wellness devices (non-apparel gadgets). ---
+    r"led[\s-]*(?:face[\s-]*)?masks?|light[\s-]*therapy|infrared[\s-]*sauna|"
+    # --- Art-book publishers (boutiques stock these as coffee-table books). ---
+    r"assouline|taschen|rizzoli|phaidon|gestalten|prestel|skira|te[\s-]*neues"
     r")\b",
     re.IGNORECASE,
 )
