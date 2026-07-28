@@ -2622,6 +2622,20 @@ def run_crawl(
                         if product.product_id in seen_product_ids:
                             continue
                         seen_product_ids.add(product.product_id)
+                        # Record every still-listed apparel id for the removal
+                        # reconcile — INCLUDING items we skip below for the
+                        # <2-images rule. Otherwise a product that is still in the
+                        # store's catalog but image-poor is absent from the scraped
+                        # set and --mark-removed wrongly flags it as delisted.
+                        # Non-apparel is intentionally NOT recorded here, so it is
+                        # still reconciled away (the intended cleanup).
+                        if product.product_id and not matches_excluded_category(
+                            item_name=product.item_name,
+                            product_url=product.product_url,
+                            product_handle=product.product_handle,
+                            product_type=product.product_type,
+                        ):
+                            state.setdefault("catalog_ids", set()).add(product.product_id)
                         normalized = normalize_product(product)
                         if normalized is not None:
                             page_products.append(normalized)
@@ -2719,10 +2733,15 @@ def run_crawl(
                         # pagination reached the true end of the catalog (not
                         # truncated by a mid-stream failure, the item cap, or a
                         # block/anomaly 200) — otherwise the un-scraped tail is not
-                        # actually gone.
+                        # actually gone. Reconcile against catalog_ids (every still-
+                        # listed apparel id, image-poor ones included), NOT seen_ids
+                        # (only the products we persisted): a product we skipped for
+                        # the <2-images rule is still on the store, not delisted.
                         if persisted_ok and page_state.get("complete"):
                             await asyncio.to_thread(
-                                _reconcile_removed, seed.store_url, list(seen_ids)
+                                _reconcile_removed,
+                                seed.store_url,
+                                list(page_state.get("catalog_ids", set())),
                             )
 
                         mark_status = getattr(repo, "mark_run_store_status", None)

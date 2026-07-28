@@ -161,3 +161,122 @@ def test_run_crawl_streaming_mode_persists_page_by_page_without_orchestrator_fet
 
     assert exit_code == 0
     assert _FakeRestRepo.inserted_product_ids == ["1001", "1002", "1003"]
+
+
+class _ReconcileFetcher:
+    """One catalog page: a normal apparel item, an image-poor apparel item that
+    we won't persist (<2 images), and a non-apparel item that the filter drops."""
+
+    def __init__(self, _settings: Settings) -> None:
+        _ = _settings
+
+    async def get_text(self, _url: str) -> str:
+        return "<html></html>"
+
+    async def get_json(self, url: str):
+        page = int(parse_qs(urlparse(url).query).get("page", ["1"])[0])
+        if page == 1:
+            return {
+                "products": [
+                    {
+                        "id": 2001,
+                        "handle": "blue-dress",
+                        "title": "Blue Dress",
+                        "product_type": "Dresses",
+                        "images": [
+                            {"src": "https://cdn.example.com/2001-0.jpg"},
+                            {"src": "https://cdn.example.com/2001-1.jpg"},
+                        ],
+                    },
+                    {
+                        "id": 2002,
+                        "handle": "red-skirt",
+                        "title": "Red Skirt",
+                        "product_type": "Skirts",
+                        # Only 1 image -> excluded from persistence by MIN_PRODUCT_IMAGES,
+                        # but it is STILL LISTED on the store, not delisted.
+                        "images": [{"src": "https://cdn.example.com/2002-0.jpg"}],
+                    },
+                    {
+                        "id": 2003,
+                        "handle": "scented-candle",
+                        "title": "Scented Candle",
+                        "product_type": "Home",
+                        "images": [
+                            {"src": "https://cdn.example.com/2003-0.jpg"},
+                            {"src": "https://cdn.example.com/2003-1.jpg"},
+                        ],
+                    },
+                ]
+            }
+        return {"products": []}
+
+    async def get_bytes(self, _url: str) -> bytes:
+        return b"bytes"
+
+    async def close(self) -> None:
+        return None
+
+
+class _ReconcileRepo(_FakeRestRepo):
+    reconcile_product_ids: set | None = None
+
+    def mark_removed_products_unavailable(
+        self, website: str, product_ids, *, min_coverage: float = 0.5, dry_run: bool = False
+    ):
+        _ = (website, min_coverage, dry_run)
+        self.__class__.reconcile_product_ids = {str(p) for p in product_ids}
+        return {"marked_unavailable": 0}
+
+
+def test_mark_removed_counts_image_poor_listed_products_as_present(monkeypatch, tmp_path) -> None:
+    """Regression: a product still in the store's catalog but skipped for the
+    <2-images rule must NOT be treated as delisted by --mark-removed. Only
+    non-apparel (and genuinely-absent) ids may be reconciled away."""
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        STORE_PAGE_STREAMING_ENABLED=True,
+        SHOPIFY_PRODUCTS_PAGE_LIMIT=50,
+        SHOPIFY_PRODUCTS_MAX_PAGES=10,
+        CRAWL_RUN_STATE_PATH=str(tmp_path / "run_id.txt"),
+    )
+    seed = StoreSeed(store_url="https://example.com")
+
+    def _fake_classify_store(_homepage: str, base: str, _settings: Settings) -> StoreProfile:
+        _ = _settings
+        return StoreProfile(store_name="Example", website=base, store_type="online")
+
+    async def _fake_verify_product_images(*, products, fetcher, settings):
+        _ = (products, fetcher, settings)
+        return None
+
+    _ReconcileRepo.inserted_product_ids = []
+    _ReconcileRepo.reconcile_product_ids = None
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+    monkeypatch.setattr(cli, "_build_db_first_seeds", lambda _settings, _repo: [seed])
+    monkeypatch.setattr(cli, "Repository", _ReconcileRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "Fetcher", _ReconcileFetcher)
+    monkeypatch.setattr(cli, "classify_store", _fake_classify_store)
+    monkeypatch.setattr(cli, "verify_product_images", _fake_verify_product_images)
+    monkeypatch.setattr(orchestrator, "Fetcher", _FailIfUsedFetcher)
+
+    exit_code = cli.run_crawl(limit=1, fresh=True, mark_removed=True)
+
+    assert exit_code == 0
+    # Only the multi-image apparel item is persisted.
+    assert _ReconcileRepo.inserted_product_ids == ["2001"]
+    # The reconcile must have run and been handed the full listed-apparel catalog.
+    ids = _ReconcileRepo.reconcile_product_ids
+    assert ids is not None, "reconcile was not invoked"
+    assert "2001" in ids
+    assert "2002" in ids, "image-poor but still-listed apparel was wrongly treated as delisted"
+    assert "2003" not in ids, "non-apparel must be excluded so it is reconciled away"
