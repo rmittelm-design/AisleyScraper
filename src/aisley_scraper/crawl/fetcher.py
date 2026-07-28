@@ -368,11 +368,28 @@ class Fetcher:
 
         return await asyncio.to_thread(_request)
 
+    async def _get_within_budget(
+        self, client: httpx.AsyncClient, url: str, **kwargs: Any
+    ) -> httpx.Response:
+        """GET with a hard total wall-clock ceiling.
+
+        httpx's read timeout is per-read, so a server that slow-streams one byte
+        at a time (e.g. a Cloudflare "Just a moment" interstitial) resets it on
+        every chunk and the request hangs indefinitely. ``asyncio.wait_for``
+        imposes a total ceiling and cancels the underlying socket, converting the
+        hang into a ``TimeoutError`` that the callers below route to the curl /
+        curl_cffi fallbacks (which are themselves bounded via --max-time / timeout).
+        """
+        total = max(1, int(self._settings.crawl_request_total_timeout_sec))
+        return await asyncio.wait_for(client.get(url, **kwargs), timeout=total)
+
     @staticmethod
     def _should_use_curl_fallback(exc: Exception) -> bool:
         if isinstance(exc, httpx.HTTPStatusError):
             return exc.response.status_code in {403, 429, 500, 502, 503, 504, 520, 522, 524}
-        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        # TimeoutError also covers asyncio.TimeoutError (an alias since 3.11) raised
+        # by _get_within_budget when the total wall-clock ceiling trips.
+        if isinstance(exc, (httpx.TimeoutException, httpx.TransportError, TimeoutError)):
             return True
         return False
 
@@ -380,7 +397,7 @@ class Fetcher:
     def _should_use_image_fallback_client(exc: Exception) -> bool:
         if isinstance(exc, httpx.HTTPStatusError):
             return exc.response.status_code in {403, 429, 500, 502, 503, 504, 520, 522, 524}
-        return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+        return isinstance(exc, (httpx.TimeoutException, httpx.TransportError, TimeoutError))
 
     @staticmethod
     def _image_request_headers(url: str) -> dict[str, str]:
@@ -397,7 +414,9 @@ class Fetcher:
         async with self._domain_semaphores[domain]:
             await self._apply_jitter()
             try:
-                response = await self._client.get(url, headers=self._text_request_headers(url))
+                response = await self._get_within_budget(
+                    self._client, url, headers=self._text_request_headers(url)
+                )
                 response.raise_for_status()
                 return response.text
             except Exception as exc:
@@ -420,7 +439,9 @@ class Fetcher:
             curl_cffi_exc: Exception | None = None
             curl_exc: Exception | None = None
             try:
-                response = await self._client.get(url, headers=self._json_request_headers(url))
+                response = await self._get_within_budget(
+                    self._client, url, headers=self._json_request_headers(url)
+                )
                 response.raise_for_status()
                 try:
                     payload = response.json()
@@ -491,7 +512,7 @@ class Fetcher:
                 return cached
             await self._apply_jitter()
             try:
-                response = await self._client.get(url)
+                response = await self._get_within_budget(self._client, url)
                 response.raise_for_status()
                 content = response.content
                 self._set_cached_bytes(url, content)
@@ -501,7 +522,8 @@ class Fetcher:
                 fallback_exc: Exception = exc
                 if self._should_use_image_fallback_client(exc):
                     try:
-                        fallback_response = await self._image_fallback_client.get(
+                        fallback_response = await self._get_within_budget(
+                            self._image_fallback_client,
                             url,
                             headers=self._image_request_headers(url),
                         )

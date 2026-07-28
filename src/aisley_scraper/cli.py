@@ -2690,6 +2690,15 @@ def run_crawl(
                         if persisted_ok:
                             success_in_batch += 1
 
+                        overall_idx = processed_count + processed_in_batch
+                        print(
+                            f"  [{overall_idx}/{len(seeds)}] "
+                            f"{seed.store_url.rstrip('/')} — "
+                            f"{'ok' if persisted_ok else 'FAILED'} "
+                            f"({len(seen_ids)} product id(s))",
+                            flush=True,
+                        )
+
                     return processed_in_batch, success_in_batch
                 finally:
                     await fetcher.close()
@@ -2779,6 +2788,13 @@ def run_crawl(
             _run_phase2()
         else:
             # --phase both: existing single-phase pipeline unchanged.
+            print(
+                f"Starting crawl: {len(seeds)} store(s) | phase=both | "
+                f"mark_removed={mark_removed} | min_coverage={removed_min_coverage} | "
+                f"streaming={settings.store_page_streaming_enabled} | "
+                f"batch_size={chunk_size}",
+                flush=True,
+            )
             for start in range(0, len(seeds), chunk_size):
                 batch = seeds[start : start + chunk_size]
                 processed_in_batch, success_in_batch = asyncio.run(
@@ -2787,9 +2803,9 @@ def run_crawl(
                 processed_count += processed_in_batch
                 success_count += success_in_batch
 
-                print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
+                print(f"Progress: persisted {processed_count}/{len(seeds)} stores", flush=True)
 
-            print(f"Crawled {success_count}/{len(seeds)} stores successfully")
+            print(f"Crawled {success_count}/{len(seeds)} stores successfully", flush=True)
 
         if mark_removed:
             print(f"Marked {removed_marked[0]} delisted product(s) unavailable.")

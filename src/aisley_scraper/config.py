@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     crawl_global_qps: int = Field(default=8, alias="CRAWL_GLOBAL_QPS")
     crawl_request_timeout_sec: int = Field(default=25, alias="CRAWL_REQUEST_TIMEOUT_SEC")
     crawl_connect_timeout_sec: int = Field(default=10, alias="CRAWL_CONNECT_TIMEOUT_SEC")
+    # Hard wall-clock ceiling on a SINGLE http request. httpx's read timeout is
+    # per-read, so a server that slow-streams one byte at a time (a Cloudflare
+    # "Just a moment" interstitial) resets it forever and the request hangs
+    # indefinitely. This total ceiling cancels such a request and lets the crawl
+    # fall back / move on. Must be > crawl_request_timeout_sec.
+    crawl_request_total_timeout_sec: int = Field(
+        default=60, alias="CRAWL_REQUEST_TOTAL_TIMEOUT_SEC"
+    )
     crawl_http2_enabled: bool = Field(default=True, alias="CRAWL_HTTP2_ENABLED")
     # Verify TLS certs on crawl fetches. Default True (secure); set CRAWL_SSL_VERIFY=false
     # ONLY to scrape stores with broken/expired certs (skips MITM protection).
