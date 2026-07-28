@@ -248,7 +248,12 @@ aisley-scraper refresh-products --domain <domain> --dry-run   # scrape + report,
 
 It re-scrapes each store's `products.json` (the same lightweight fetch as Phase 1) and updates only scraped metadata — `item_name`, `description`, `price_cents`, `unavailable`, `sizes`, `colors`, `brand`, `product_type`, `sku`, `product_handle`, `product_url`, `last_seen_at` — **in place**. It deliberately does **not** touch `images` / `supabase_images` (preserving the CLIP-validated set) or gender labels, and **never inserts**: a product not already in production is skipped, because a genuinely new item needs the full crawl's image validation. Use it to keep prices/availability/descriptions current far more cheaply than a full re-crawl.
 
-**Delisted products.** A production product that is **absent from the scrape** (removed from the store's catalog) is flagged `unavailable = true`. (A sold-out-but-still-listed item is handled separately — Shopify keeps it in `products.json` with `available:false`.) This is guarded against partial/bot-blocked scrapes: if the scrape returns nothing, or re-finds less than `--min-coverage` (default `0.5`) of the store's existing products, the removal marking is skipped for that store. A wrongly-flagged item self-corrects on the next successful scrape (its metadata refresh restores availability).
+**Delisted products.** A production product that is **absent from the scrape** (removed from the store's catalog) is flagged `unavailable = true`. (A sold-out-but-still-listed item is handled separately — Shopify keeps it in `products.json` with `available:false`.) Two guards prevent a bad scrape from wrongly flagging a live catalog:
+
+1. **Completeness** — removal marking runs only when the scrape reached the *true end* of the catalog. If pagination stopped because of the per-store item cap, a fetch error, or an anomalous `200` that lacks a products array (a WAF/block), the scrape is treated as incomplete and marking is **skipped** — the un-scraped tail is not actually gone.
+2. **Coverage** — even on a complete scrape, if it re-found less than `--min-coverage` (default `0.5`) of the store's existing products, marking is skipped.
+
+A wrongly-flagged item also self-corrects on the next successful scrape (its refresh restores availability).
 
 ```bash
 aisley-scraper refresh-products                      # all stores
@@ -256,6 +261,15 @@ aisley-scraper refresh-products --dry-run            # all stores, report only
 aisley-scraper refresh-products --no-mark-removed    # metadata only; don't flag delisted
 aisley-scraper refresh-products --min-coverage 0.8   # stricter guard before flagging
 ```
+
+**Full re-scrape + mark removed in one pass.** To *also add newly-listed products* (which need image validation) while flagging delisted ones, run the full crawl with `--mark-removed` — same two guards apply:
+
+```bash
+aisley-scraper crawl-stores --mark-removed                  # add new + update + flag delisted
+aisley-scraper crawl-stores --mark-removed --min-coverage 0.8
+```
+
+`--mark-removed` applies to `--phase both` (the live scrape); it is ignored for `--phase 2` because staged data does not record whether the Phase 1 scrape reached the end of the catalog.
 
 ### Staging tables
 

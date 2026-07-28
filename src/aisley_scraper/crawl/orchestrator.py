@@ -42,7 +42,18 @@ async def _fetch_all_products(
     base: str,
     settings: Settings,
     fetcher: Fetcher,
-) -> list[ProductRecord]:
+) -> tuple[list[ProductRecord], bool]:
+    """Return ``(kept_products, catalog_complete)``.
+
+    ``catalog_complete`` is True only when pagination reached a genuine end of
+    the catalog — a well-formed products.json with an explicitly-empty products
+    list, or a store that repeats pages (all unique products already seen). It
+    is False when pagination stopped for any reason that leaves an unknown tail:
+    a fetch error mid-run, the per-store item cap, an anomalous 200 lacking a
+    products array (a WAF/block), or exhausting max_pages. Callers must NOT
+    reconcile removals (mark absent products unavailable) on an incomplete
+    scrape — the un-scraped tail is not actually gone.
+    """
     page_limit = max(1, settings.shopify_products_page_limit)
     max_pages = max(1, settings.shopify_products_max_pages)
     max_items_per_store = max(0, settings.shopify_products_max_items_per_store)
@@ -53,6 +64,7 @@ async def _fetch_all_products(
     # AFTER filtering. CLIP image validation runs later and may reduce further.
     kept: list[ProductRecord] = []
     seen_product_ids: set[str] = set()
+    complete = False
 
     for page in range(1, max_pages + 1):
         products_url = f"{base}/products.json?limit={page_limit}&page={page}"
@@ -94,10 +106,16 @@ async def _fetch_all_products(
                     len(kept),
                     max_items_per_store,
                 )
-                return kept
+                # Truncated by the cap -> catalog is NOT fully known.
+                return kept, False
 
         products_raw = payload.get("products", []) if isinstance(payload, dict) else []
         if not isinstance(products_raw, list) or not products_raw:
+            # Genuine end only when the response is a well-formed products.json
+            # with an explicitly-empty list. A 200 lacking the key (block/anomaly)
+            # is NOT a real end, so leave complete=False.
+            if isinstance(payload, dict) and "products" in payload:
+                complete = True
             break
         # Some stores ignore the ?page param and return the SAME products on every
         # page; without this guard they'd paginate to max_pages (or until a 4xx).
@@ -108,9 +126,10 @@ async def _fetch_all_products(
                 page,
                 base,
             )
+            complete = True
             break
 
-    return kept
+    return kept, complete
 
 
 async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) -> ScrapeResult:
@@ -121,12 +140,12 @@ async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) ->
     await _attach_shipping_returns(store, base, fetcher, settings, homepage)
 
     # _fetch_all_products already returns filtered + capped products.
-    products = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
+    products, complete = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
     # CLIP image validation trims each product's images to validated ones and
     # drops products left with none (mutates the list in place).
     await verify_product_images(products=products, fetcher=fetcher, settings=settings)
 
-    return ScrapeResult(store=store, products=products)
+    return ScrapeResult(store=store, products=products, scrape_complete=complete)
 
 
 async def scrape_many(seeds: list[StoreSeed], settings: Settings) -> list[tuple[StoreSeed, ScrapeResult | Exception]]:
@@ -166,8 +185,12 @@ async def scrape_many_stream(
 
                 # _fetch_all_products already returns filtered + capped products
                 # (image validation is deferred to phase 2 in this path).
-                products = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
-                return seed, ScrapeResult(store=store, products=products)
+                products, complete = await _fetch_all_products(
+                    base=base, settings=settings, fetcher=fetcher
+                )
+                return seed, ScrapeResult(
+                    store=store, products=products, scrape_complete=complete
+                )
             except Exception as exc:
                 return seed, exc
 

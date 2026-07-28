@@ -26,6 +26,39 @@ def canonical_website(url: str) -> str:
     return f"https://{domain}" if domain else (url or "").strip()
 
 
+def _removal_plan(
+    *,
+    scraped_count: int,
+    production_count: int,
+    matched_count: int,
+    missing: list[str],
+    available_ids: set[str],
+    min_coverage: float,
+) -> tuple[list[str], str | None]:
+    """Decide which delisted products to flag ``unavailable`` (pure, no DB).
+
+    Shared by ``refresh-products`` and the full crawl so the safety guard has a
+    single definition. Returns ``(to_flag, skip_reason)``:
+
+    - Nothing missing -> nothing to do.
+    - Scrape returned no products -> skip (a bot-block/error, not an empty store).
+    - Scrape re-found less than ``min_coverage`` of production -> skip (likely a
+      partial/blocked fetch; flagging would wrongly mark much of the catalog).
+    - Otherwise flag the missing products that are currently available.
+    """
+    if not missing:
+        return [], None
+    if scraped_count == 0:
+        return [], "scrape returned no products"
+    if production_count and (matched_count / production_count) < min_coverage:
+        pct = matched_count / production_count
+        return [], (
+            f"scrape covered {pct:.0%} of catalog "
+            f"(< {min_coverage:.0%}); likely partial/blocked"
+        )
+    return [pid for pid in missing if pid in available_ids], None
+
+
 class Repository:
     """Direct Postgres (psycopg) repository.
 
@@ -813,18 +846,17 @@ class Repository:
 
                 # Decide whether the "removed -> unavailable" marking is trustworthy.
                 to_flag: list[str] = []
-                if mark_removed and missing:
-                    if not products:
-                        result["mark_skipped_reason"] = "scrape returned no products"
-                    elif production_ids and (len(matched) / len(production_ids)) < min_coverage:
-                        pct = len(matched) / len(production_ids)
-                        result["mark_skipped_reason"] = (
-                            f"scrape covered {pct:.0%} of catalog "
-                            f"(< {min_coverage:.0%}); likely partial/blocked"
-                        )
-                    else:
-                        to_flag = [pid for pid in missing if pid in available_ids]
-                        result["marked_unavailable"] = len(to_flag)
+                if mark_removed:
+                    to_flag, reason = _removal_plan(
+                        scraped_count=len(products),
+                        production_count=len(production_ids),
+                        matched_count=len(matched),
+                        missing=missing,
+                        available_ids=available_ids,
+                        min_coverage=min_coverage,
+                    )
+                    result["mark_skipped_reason"] = reason
+                    result["marked_unavailable"] = len(to_flag)
 
                 if dry_run:
                     return result
@@ -876,6 +908,83 @@ class Repository:
                         "where store_id = any(%s) and product_id = any(%s);",
                         (store_ids, to_flag),
                     )
+            conn.commit()
+        return result
+
+    def mark_removed_products_unavailable(
+        self,
+        website: str,
+        scraped_product_ids,
+        *,
+        min_coverage: float = 0.5,
+        dry_run: bool = False,
+    ) -> dict[str, int | str | None]:
+        """Flag production products absent from a store's scraped catalog.
+
+        Given the FULL set of product ids seen in a store's scrape (pre-CLIP, so
+        a CLIP-rejected-but-still-listed item counts as present), mark every
+        production product NOT in that set as ``unavailable = true`` — guarded by
+        ``_removal_plan`` against partial/blocked scrapes. Used by the full crawl
+        to reconcile removals in the same pass as adding/updating products.
+        Returns a summary dict. Only flips currently-available rows.
+        """
+        scraped = set(scraped_product_ids)
+        result: dict[str, int | str | None] = {
+            "production": 0,
+            "scraped": len(scraped),
+            "matched": 0,
+            "missing": 0,
+            "marked_unavailable": 0,
+            "mark_skipped_reason": None,
+        }
+        domain = _domain_key(website)
+        if not domain:
+            return result
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select id, website from shopify_stores where website ilike %s;",
+                    (f"%{domain}%",),
+                )
+                store_ids = [
+                    int(sid) for sid, site in cur.fetchall() if _domain_key(site) == domain
+                ]
+                if not store_ids:
+                    return result
+
+                cur.execute(
+                    "select product_id, unavailable from shopify_products "
+                    "where store_id = any(%s);",
+                    (store_ids,),
+                )
+                prod_rows = cur.fetchall()
+                production_ids = {row[0] for row in prod_rows}
+                available_ids = {row[0] for row in prod_rows if not row[1]}
+                result["production"] = len(production_ids)
+                matched = [pid for pid in production_ids if pid in scraped]
+                missing = [pid for pid in production_ids if pid not in scraped]
+                result["matched"] = len(matched)
+                result["missing"] = len(missing)
+
+                to_flag, reason = _removal_plan(
+                    scraped_count=len(scraped),
+                    production_count=len(production_ids),
+                    matched_count=len(matched),
+                    missing=missing,
+                    available_ids=available_ids,
+                    min_coverage=min_coverage,
+                )
+                result["mark_skipped_reason"] = reason
+                result["marked_unavailable"] = len(to_flag)
+
+                if dry_run or not to_flag:
+                    return result
+                cur.execute(
+                    "update shopify_products set unavailable = true "
+                    "where store_id = any(%s) and product_id = any(%s);",
+                    (store_ids, to_flag),
+                )
             conn.commit()
         return result
 

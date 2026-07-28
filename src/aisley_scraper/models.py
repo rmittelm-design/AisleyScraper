@@ -60,3 +60,8 @@ class ProductRecord:
 class ScrapeResult:
     store: StoreProfile
     products: list[ProductRecord]
+    # True only when the scrape reached a genuine end of the store's catalog
+    # (not truncated by a fetch error, the item cap, a block, or max_pages).
+    # Removal reconciliation (marking absent products unavailable) must only run
+    # on a complete scrape. Default True for non-scrape construction sites.
+    scrape_complete: bool = True

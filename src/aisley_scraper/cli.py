@@ -205,6 +205,28 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     crawl.add_argument(
+        "--mark-removed",
+        action="store_true",
+        help=(
+            "After writing each store's products, flag production products that "
+            "are absent from the fresh scrape (delisted from the catalog) as "
+            "unavailable. Only reconciles when the scrape reached the true end of "
+            "the catalog (never on a capped/blocked/errored scrape) and is further "
+            "guarded by --min-coverage. Applies to --phase both (the live scrape); "
+            "ignored for --phase 2, whose staged data lacks completeness info."
+        ),
+    )
+    crawl.add_argument(
+        "--min-coverage",
+        type=float,
+        default=0.5,
+        help=(
+            "With --mark-removed: only flag delisted products when the scrape "
+            "re-found at least this fraction of a store's existing products "
+            "(default 0.5). Guards against a partial scrape flagging a whole catalog."
+        ),
+    )
+    crawl.add_argument(
         "--shard-index",
         type=int,
         default=None,
@@ -868,7 +890,7 @@ def run_refresh_products(
             for index, profile in enumerate(profiles, start=1):
                 base = profile.website.rstrip("/")
                 try:
-                    products = await _fetch_all_products(
+                    products, complete = await _fetch_all_products(
                         base=base, settings=settings, fetcher=fetcher
                     )
                 except Exception as exc:
@@ -876,13 +898,17 @@ def run_refresh_products(
                     failed += 1
                     continue
 
+                # Only reconcile removals when the scrape reached the true end of
+                # the catalog; an incomplete scrape's absences aren't real removals.
                 r = repo.update_products_metadata(
                     base,
                     products,
                     dry_run=dry_run,
-                    mark_removed=mark_removed,
+                    mark_removed=mark_removed and complete,
                     min_coverage=min_coverage,
                 )
+                if mark_removed and not complete and not r["mark_skipped_reason"]:
+                    r["mark_skipped_reason"] = "scrape incomplete (truncated/blocked)"
                 updated_total += int(r["updated"])
                 new_total += int(r["scraped"]) - int(r["updated"])
                 removed_total += int(r["marked_unavailable"])
@@ -1186,12 +1212,43 @@ def run_crawl(
     csv_path: str | None = None,
     shard_index: int = 0,
     shard_count: int = 1,
+    mark_removed: bool = False,
+    removed_min_coverage: float = 0.5,
 ) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
     # Gender scoring has been removed; products are never required to carry gender
     # probabilities (gender_probs_csv stays NULL).
     allow_null_gender_probs = True
+
+    # Accumulates delisted-products flagged across the --phase both reconcile
+    # sites (streaming + non-streaming) so a single summary can report the total.
+    removed_marked = [0]
+
+    def _reconcile_removed(website: str, product_ids: list[str]) -> None:
+        """Flag production products absent from this store's scrape as unavailable.
+
+        No-op unless --mark-removed is set. ``product_ids`` must be the store's
+        FULL scraped catalog (callers accumulate across pages in streaming mode),
+        so this never sees a partial view. Guarded server-side by
+        Repository.mark_removed_products_unavailable / _removal_plan.
+        """
+        if not mark_removed:
+            return
+        marker = getattr(repo, "mark_removed_products_unavailable", None)
+        if not callable(marker):
+            return
+        try:
+            r = marker(website, product_ids, min_coverage=removed_min_coverage)
+        except Exception as exc:  # noqa: BLE001 - reconciliation must not fail the store
+            logger.warning("mark-removed failed for %s: %s", website, exc)
+            return
+        n = int(r.get("marked_unavailable") or 0)
+        if n:
+            removed_marked[0] += n
+            logger.info("Marked %s delisted product(s) unavailable for %s", n, website)
+        elif r.get("mark_skipped_reason"):
+            logger.info("Removal-mark skipped for %s (%s)", website, r["mark_skipped_reason"])
 
     if settings.persistence_target == "local":
         seeds = load_store_seeds_from_dir(settings.input_tsv_dir, settings)
@@ -2151,6 +2208,13 @@ def run_crawl(
                                 )
                                 return False
 
+                        # NOTE: removal reconciliation is intentionally NOT done in
+                        # the staged Phase 2 path — staging does not carry whether
+                        # the Phase 1 scrape reached the true end of the catalog, so
+                        # marking absences unavailable here could act on a truncated
+                        # scrape. --mark-removed is supported for --phase both (live
+                        # scrape) and refresh-products, which know completeness.
+
                         await asyncio.to_thread(
                             repo.delete_staged_run_website, resolved_run_id, website
                         )
@@ -2477,7 +2541,7 @@ def run_crawl(
             success_in_batch = 0
             stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
 
-            async def _iter_page_outcomes(seed: StoreSeed, fetcher: Fetcher):
+            async def _iter_page_outcomes(seed: StoreSeed, fetcher: Fetcher, state: dict):
                 base = seed.store_url.rstrip("/")
                 homepage = await fetcher.get_text(base)
                 store = classify_store(homepage, base, settings)
@@ -2489,6 +2553,9 @@ def run_crawl(
                 seen_product_ids: set[str] = set()
                 yielded_any = False
                 kept_count = 0
+                # True only when pagination reaches a genuine end of catalog; the
+                # caller must not reconcile removals otherwise (cap/block/error).
+                state["complete"] = False
 
                 for page in range(1, max_pages + 1):
                     products_url = f"{base}/products.json?limit={page_limit}&page={page}"
@@ -2518,18 +2585,27 @@ def run_crawl(
 
                     if page_products:
                         yielded_any = True
-                        yield ScrapeResult(store=store, products=page_products)
+                        # A single page is never the complete catalog; streaming
+                        # completeness is tracked via `state`, not this flag.
+                        yield ScrapeResult(
+                            store=store, products=page_products, scrape_complete=False
+                        )
 
                     if hit_cap:
                         break
 
                     products_raw = payload.get("products", []) if isinstance(payload, dict) else []
                     if not isinstance(products_raw, list) or not products_raw:
+                        # Genuine end only if the store returned a well-formed
+                        # products.json with an explicitly-empty list. A block/
+                        # anomaly 200 lacks the key -> leave complete=False.
+                        if isinstance(payload, dict) and "products" in payload:
+                            state["complete"] = True
                         break
 
                 if not yielded_any:
                     # Persist store row even when no products are present.
-                    yield ScrapeResult(store=store, products=[])
+                    yield ScrapeResult(store=store, products=[], scrape_complete=False)
 
             use_streaming_mode = (
                 settings.store_page_streaming_enabled
@@ -2545,8 +2621,14 @@ def run_crawl(
                         persisted_ok = True
                         error_message = "store_persist_failed"
 
+                        seen_ids: set[str] = set()
+                        page_state: dict = {"complete": False}
                         try:
-                            async for outcome in _iter_page_outcomes(seed, fetcher):
+                            async for outcome in _iter_page_outcomes(seed, fetcher, page_state):
+                                if isinstance(outcome, ScrapeResult):
+                                    seen_ids.update(
+                                        p.product_id for p in outcome.products if p.product_id
+                                    )
                                 persist_task = asyncio.create_task(
                                     asyncio.to_thread(_persist_store_result, seed, outcome)
                                 )
@@ -2578,6 +2660,16 @@ def run_crawl(
                         except Exception as exc:
                             persisted_ok = False
                             error_message = str(exc)
+
+                        # Reconcile removals only when the store persisted OK AND
+                        # pagination reached the true end of the catalog (not
+                        # truncated by a mid-stream failure, the item cap, or a
+                        # block/anomaly 200) — otherwise the un-scraped tail is not
+                        # actually gone.
+                        if persisted_ok and page_state.get("complete"):
+                            await asyncio.to_thread(
+                                _reconcile_removed, seed.store_url, list(seen_ids)
+                            )
 
                         mark_status = getattr(repo, "mark_run_store_status", None)
                         if callable(mark_status):
@@ -2625,6 +2717,20 @@ def run_crawl(
                             len(seeds),
                         )
 
+                # Reconcile removals only when the store persisted OK and its
+                # scrape reached the true end of the catalog (outcome.products is
+                # not pruned in place); an incomplete scrape's absences aren't real.
+                if (
+                    persisted_ok
+                    and isinstance(outcome, ScrapeResult)
+                    and outcome.scrape_complete
+                ):
+                    await asyncio.to_thread(
+                        _reconcile_removed,
+                        seed.store_url,
+                        [p.product_id for p in outcome.products if p.product_id],
+                    )
+
                 mark_status = getattr(repo, "mark_run_store_status", None)
                 if callable(mark_status):
                     if persisted_ok:
@@ -2664,6 +2770,12 @@ def run_crawl(
                     "Phase 2 startup: fetcher disk cache preserved "
                     f"files={cleared_disk_cache_files} dir={disk_cache_dir}"
                 )
+            if mark_removed:
+                print(
+                    "Note: --mark-removed is ignored for --phase 2 (staged data "
+                    "does not carry scrape completeness). Use --phase both or "
+                    "refresh-products to mark delisted products unavailable."
+                )
             _run_phase2()
         else:
             # --phase both: existing single-phase pipeline unchanged.
@@ -2678,6 +2790,9 @@ def run_crawl(
                 print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
 
             print(f"Crawled {success_count}/{len(seeds)} stores successfully")
+
+        if mark_removed:
+            print(f"Marked {removed_marked[0]} delisted product(s) unavailable.")
 
         count_status = getattr(repo, "count_run_store_status", None)
         if callable(count_status):
@@ -2912,6 +3027,8 @@ def main() -> int:
             csv_path=getattr(args, "csv", None),
             shard_index=shard_index,
             shard_count=shard_count,
+            mark_removed=getattr(args, "mark_removed", False),
+            removed_min_coverage=getattr(args, "min_coverage", 0.5),
         )
     if args.command == "rebuild-branches":
         return run_rebuild_branches(

@@ -214,3 +214,61 @@ def test_unknown_domain_is_noop(monkeypatch):
 
     assert r["updated"] == 0 and r["marked_unavailable"] == 0
     assert cur.executemany_calls == [] and _mark_update(cur) == []
+
+
+# ── Repository.mark_removed_products_unavailable (used by the full crawl) ──
+
+def test_mark_removed_flags_delisted_products(monkeypatch):
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[("P1", False), ("P2", False), ("P4", False)],  # P4 delisted
+    )
+    repo = _repo(monkeypatch, cur)
+    r = repo.mark_removed_products_unavailable("shop.example.com", ["P1", "P2", "P3"])
+    assert r["matched"] == 2 and r["missing"] == 1 and r["marked_unavailable"] == 1
+    marks = _mark_update(cur)
+    assert len(marks) == 1 and marks[0][1] == ([10], ["P4"])
+
+
+def test_mark_removed_guard_skips_partial_scrape(monkeypatch):
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[(f"P{i}", False) for i in range(10)],
+    )
+    repo = _repo(monkeypatch, cur)
+    r = repo.mark_removed_products_unavailable("shop.example.com", ["P0"])  # 10%
+    assert r["marked_unavailable"] == 0
+    assert "partial" in str(r["mark_skipped_reason"])
+    assert _mark_update(cur) == []
+
+
+def test_mark_removed_empty_scrape_skips(monkeypatch):
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[("P1", False), ("P2", False)],
+    )
+    repo = _repo(monkeypatch, cur)
+    r = repo.mark_removed_products_unavailable("shop.example.com", [])
+    assert r["mark_skipped_reason"] == "scrape returned no products"
+    assert _mark_update(cur) == []
+
+
+def test_mark_removed_dry_run_reports_but_writes_nothing(monkeypatch):
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[("P1", False), ("P4", False)],
+    )
+    repo = _repo(monkeypatch, cur)
+    r = repo.mark_removed_products_unavailable("shop.example.com", ["P1"], dry_run=True)
+    assert r["marked_unavailable"] == 1 and _mark_update(cur) == []
+
+
+def test_mark_removed_skips_already_unavailable(monkeypatch):
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[("P1", False), ("P5", True)],  # P5 delisted but already unavailable
+    )
+    repo = _repo(monkeypatch, cur)
+    r = repo.mark_removed_products_unavailable("shop.example.com", ["P1"])
+    assert r["missing"] == 1 and r["marked_unavailable"] == 0
+    assert _mark_update(cur) == []
