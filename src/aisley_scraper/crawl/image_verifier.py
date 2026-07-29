@@ -204,14 +204,22 @@ async def verify_product_images(
     products: list[ProductRecord],
     fetcher: Fetcher,
     settings: Settings,
+    max_images_per_product: int | None = None,
 ) -> None:
     if not settings.image_validation_enabled:
         return
 
+    # Optionally validate only the first N images of each product (the rest are
+    # kept unvalidated). Downloading/validating the whole gallery per product is
+    # the dominant cost of a --phase both crawl; the first image is the main
+    # product photo, so N=1 is a large speedup with negligible quality loss.
+    cap = max(1, int(max_images_per_product)) if max_images_per_product else None
+
     seen_urls: set[str] = set()
     unique_urls: list[str] = []
     for product in products:
-        for image_url in product.images:
+        product_urls = product.images[:cap] if cap is not None else product.images
+        for image_url in product_urls:
             normalized_url = image_url.strip() if image_url else ""
             if not normalized_url or normalized_url in seen_urls:
                 continue
@@ -430,13 +438,17 @@ async def verify_product_images(
     network_preserved_products = 0
     for product in products:
         normalized_urls = [url.strip() for url in product.images if url and url.strip()]
-        validated_urls = [url for url in normalized_urls if verdicts.get(url, False)]
+        # Only the first `cap` images were validated; images past the cap are kept
+        # as-is (untested) so capping doesn't drop the gallery.
+        tested_urls = normalized_urls[:cap] if cap is not None else normalized_urls
+        preserved_tail = normalized_urls[cap:] if cap is not None else []
+        validated_urls = [url for url in tested_urls if verdicts.get(url, False)]
         if validated_urls:
-            product.images = validated_urls
+            product.images = validated_urls + preserved_tail
             continue
 
-        if normalized_urls:
-            reasons = [terminal_reasons.get(url) for url in normalized_urls if url in verdicts]
+        if tested_urls:
+            reasons = [terminal_reasons.get(url) for url in tested_urls if url in verdicts]
             known_reasons = {reason for reason in reasons if reason}
             if known_reasons and known_reasons.issubset(_NETWORK_TRANSIENT_REASONS):
                 # Keep network-failed images so transient CDN behavior doesn't zero out otherwise valid products.
@@ -444,7 +456,8 @@ async def verify_product_images(
                 network_preserved_products += 1
                 continue
 
-        product.images = validated_urls
+        # Every tested image deterministically failed -> drop the product.
+        product.images = []
 
     if network_preserved_products:
         logger.warning(

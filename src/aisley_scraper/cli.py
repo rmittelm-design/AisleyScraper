@@ -1631,10 +1631,17 @@ def run_crawl(
             async def _postprocess_products(products: list) -> None:
                 postprocess_fetcher = Fetcher(settings)
                 try:
+                    # Validate only the first image per product — the whole
+                    # gallery is restored from original_images_by_product_id after
+                    # validation, so this just avoids downloading every gallery
+                    # image (the dominant cost / CDN-throttling source).
                     await verify_product_images(
                         products=products,
                         fetcher=postprocess_fetcher,
                         settings=settings,
+                        max_images_per_product=max(
+                            1, int(settings.phase2_max_images_per_product)
+                        ),
                     )
                 finally:
                     clear_cached_bytes = getattr(postprocess_fetcher, "clear_cached_bytes", None)

@@ -123,7 +123,7 @@ def test_run_crawl_skips_new_unavailable_products(monkeypatch) -> None:
             return None
 
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (products, fetcher, settings)
         return None
 
@@ -241,7 +241,7 @@ def test_run_crawl_skip_image_upload_flag_bypasses_storage_uploads(monkeypatch) 
             return None
 
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (products, fetcher, settings)
         return None
 
@@ -326,7 +326,7 @@ def test_run_crawl_constructs_direct_db_repository(monkeypatch) -> None:
             return None
 
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (products, fetcher, settings)
         return None
 
@@ -426,7 +426,7 @@ def test_run_crawl_marks_store_failed_when_final_upsert_never_succeeds(monkeypat
             return None
 
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (products, fetcher, settings)
         return None
 
@@ -522,7 +522,7 @@ def test_run_crawl_skips_product_when_verifier_removes_all_images(monkeypatch) -
         async def close(self) -> None:
             return None
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (fetcher, settings)
         for product in products:
             product.images = []
@@ -630,7 +630,7 @@ def test_run_crawl_deletes_existing_product_when_verifier_empties_images(
         async def close(self) -> None:
             return None
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (fetcher, settings)
         # Simulate verifier clearing product images in-place.
         for product in products:
@@ -735,7 +735,7 @@ def test_run_crawl_skips_upsert_for_products_without_images(monkeypatch) -> None
         async def close(self) -> None:
             return None
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (products, fetcher, settings)
         return None
 
@@ -846,7 +846,7 @@ def test_run_crawl_clears_single_phase_fetcher_cache_after_use(monkeypatch) -> N
         async def close(self) -> None:
             return None
 
-    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings):
+    async def _fake_verify_product_images(*, products: list[ProductRecord], fetcher: object, settings: Settings, max_images_per_product: int | None = None):
         _ = (products, fetcher, settings)
         return None
 
