@@ -1631,17 +1631,16 @@ def run_crawl(
             async def _postprocess_products(products: list) -> None:
                 postprocess_fetcher = Fetcher(settings)
                 try:
-                    # Validate only the first image per product — the whole
-                    # gallery is restored from original_images_by_product_id after
-                    # validation, so this just avoids downloading every gallery
-                    # image (the dominant cost / CDN-throttling source).
+                    # Validate ALL images and keep the product if ANY image passes.
+                    # Do NOT cap to the first image: many products lead with a
+                    # low-res/low-contrast or lifestyle shot, so first-image-only
+                    # validation drops real products whose later images are fine
+                    # (observed 60-93% false drops). Re-crawl speed comes from the
+                    # skip-revalidation path (_needs_postprocess), not from capping.
                     await verify_product_images(
                         products=products,
                         fetcher=postprocess_fetcher,
                         settings=settings,
-                        max_images_per_product=max(
-                            1, int(settings.phase2_max_images_per_product)
-                        ),
                     )
                 finally:
                     clear_cached_bytes = getattr(postprocess_fetcher, "clear_cached_bytes", None)
