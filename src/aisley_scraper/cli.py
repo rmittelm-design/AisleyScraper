@@ -2627,7 +2627,34 @@ def run_crawl(
 
                 for page in range(1, max_pages + 1):
                     products_url = f"{base}/products.json?limit={page_limit}&page={page}"
-                    payload = await fetcher.get_json(products_url)
+                    try:
+                        payload = await fetcher.get_json(products_url)
+                    except Exception as exc:  # noqa: BLE001 - deep-page error handling
+                        # Big shops (e.g. charmingcharlie, 18k products) can error at a
+                        # DEEP page after scraping the whole catalog. A page-1 error is a
+                        # genuine failure (re-raise -> store fails). Past page 1, don't
+                        # FAIL the store (which left it retried for hours every run) —
+                        # stop and keep what we scraped. Distinguish the error kind:
+                        #   * A 4xx that means "past the last page" (400/404/410 — the
+                        #     store returns Bad Request / Not Found instead of an empty
+                        #     list) is a real END OF CATALOG -> mark complete so
+                        #     --mark-removed reconciles (delisted products get flagged).
+                        #   * A rate-limit / transient error (429/503/timeout) may have
+                        #     TRUNCATED the scrape -> leave complete False so we never
+                        #     mark the un-scraped tail delisted (min-coverage is a
+                        #     second guard).
+                        if page == 1:
+                            raise
+                        status = getattr(getattr(exc, "response", None), "status_code", None)
+                        end_of_catalog = status in (400, 404, 410)
+                        logger.warning(
+                            "Stopping pagination for %s at page %s (%s); keeping %s products "
+                            "(end_of_catalog=%s)",
+                            base, page, exc, kept_count, end_of_catalog,
+                        )
+                        if end_of_catalog:
+                            state["complete"] = True
+                        break
                     extracted = extract_products_from_products_json(payload, settings, base_url=base)
 
                     page_products = []
