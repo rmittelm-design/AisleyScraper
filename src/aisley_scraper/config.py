@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     crawl_orphan_preflight_timeout_sec: int = Field(
         default=120, alias="CRAWL_ORPHAN_PREFLIGHT_TIMEOUT_SEC"
     )
+    # --phase both processes stores in two concurrent lanes so one giant store no
+    # longer blocks the rest: small stores first (higher concurrency, they finish
+    # fast), then large stores (lower concurrency to avoid multiplying CDN 429s).
+    # A store with >= crawl_large_store_min_products rows in the DB goes to the
+    # large lane. Safe to run concurrently because every Repository call opens its
+    # own connection; keep concurrency modest to stay under the pooler's limit.
+    crawl_small_store_concurrency: int = Field(default=5, alias="CRAWL_SMALL_STORE_CONCURRENCY")
+    crawl_large_store_concurrency: int = Field(default=3, alias="CRAWL_LARGE_STORE_CONCURRENCY")
+    crawl_large_store_min_products: int = Field(default=3000, alias="CRAWL_LARGE_STORE_MIN_PRODUCTS")
     crawl_http2_enabled: bool = Field(default=True, alias="CRAWL_HTTP2_ENABLED")
     # Verify TLS certs on crawl fetches. Default True (secure); set CRAWL_SSL_VERIFY=false
     # ONLY to scrape stores with broken/expired certs (skips MITM protection).

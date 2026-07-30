@@ -1257,6 +1257,41 @@ def run_diagnose_staged_runs() -> int:
     return 0
 
 
+def _partition_seeds_by_size(
+    seeds: list[StoreSeed], repo: Repository, threshold: int
+) -> tuple[list[StoreSeed], list[StoreSeed]]:
+    """Split seeds into (small, large) lanes by current DB product count.
+
+    A store with >= ``threshold`` products goes to the 'large' lane (processed
+    later, at lower concurrency). Never-scraped / unknown stores default to
+    'small'. On any DB error, everything is treated as small (a safe fallback —
+    the crawl still runs, just without the mega-store lane).
+    """
+    counts: dict[str, int] = {}
+    try:
+        conn = repo._connect()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("set statement_timeout=20000")
+        cur.execute(
+            "select s.website, count(p.id) from shopify_stores s "
+            "left join shopify_products p on p.store_id = s.id group by s.website"
+        )
+        for website, n in cur.fetchall():
+            key = _domain_key(website)
+            if key:
+                counts[key] = max(counts.get(key, 0), int(n or 0))
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - lane sizing is best-effort
+        logger.warning("Could not size stores for lane partition (%s); all in small lane", exc)
+    small: list[StoreSeed] = []
+    large: list[StoreSeed] = []
+    for seed in seeds:
+        n = counts.get(_domain_key(seed.store_url), 0)
+        (large if n >= threshold else small).append(seed)
+    return small, large
+
+
 def run_crawl(
     limit: int | None,
     run_id: str | None = None,
@@ -1318,12 +1353,6 @@ def run_crawl(
             f"saved local output to {settings.local_output_path} ({fail_count} failed)"
         )
         return 0
-
-    # Persist in small batches to keep runtime memory bounded.
-    chunk_size = max(
-        1,
-        min(settings.crawl_store_batch_size, settings.crawl_global_concurrency),
-    )
 
     cleared_disk_cache_files, disk_cache_dir = _clear_fetcher_disk_cache(settings)
 
@@ -2724,96 +2753,95 @@ def run_crawl(
 
             if use_streaming_mode:
                 fetcher = Fetcher(settings)
-                try:
-                    for seed in batch:
-                        processed_in_batch += 1
-                        persisted_ok = True
-                        error_message = "store_persist_failed"
+                done_counter = [0]  # progress index shared across the concurrent stores
 
-                        seen_ids: set[str] = set()
-                        page_state: dict = {"complete": False}
-                        try:
-                            async for outcome in _iter_page_outcomes(seed, fetcher, page_state):
-                                if isinstance(outcome, ScrapeResult):
-                                    seen_ids.update(
-                                        p.product_id for p in outcome.products if p.product_id
-                                    )
-                                persist_task = asyncio.create_task(
-                                    asyncio.to_thread(_persist_store_result, seed, outcome)
+                async def _process_one_store(seed: StoreSeed) -> bool:
+                    persisted_ok = True
+                    error_message = "store_persist_failed"
+                    seen_ids: set[str] = set()
+                    page_state: dict = {"complete": False}
+                    try:
+                        async for outcome in _iter_page_outcomes(seed, fetcher, page_state):
+                            if isinstance(outcome, ScrapeResult):
+                                seen_ids.update(
+                                    p.product_id for p in outcome.products if p.product_id
                                 )
-                                while True:
-                                    try:
-                                        if stall_interval > 0:
-                                            persisted_ok = await asyncio.wait_for(
-                                                asyncio.shield(persist_task),
-                                                timeout=stall_interval,
-                                            )
-                                        else:
-                                            persisted_ok = await persist_task
-                                        break
-                                    except asyncio.TimeoutError:
-                                        logger.warning(
-                                            "Store persist still running: store=%s processed_in_batch=%s/%s overall=%s/%s",
-                                            seed.store_url,
-                                            processed_in_batch,
-                                            len(batch),
-                                            processed_count + processed_in_batch,
-                                            len(seeds),
-                                        )
-
-                                if not persisted_ok:
-                                    error_message = "store_persist_failed"
-                                    break
-                                # Reduce retained objects between streamed pages on large stores.
-                                gc.collect()
-                        except Exception as exc:
-                            persisted_ok = False
-                            error_message = str(exc)
-
-                        # Reconcile removals only when the store persisted OK AND
-                        # pagination reached the true end of the catalog (not
-                        # truncated by a mid-stream failure, the item cap, or a
-                        # block/anomaly 200) — otherwise the un-scraped tail is not
-                        # actually gone. Reconcile against catalog_ids (every still-
-                        # listed apparel id, image-poor ones included), NOT seen_ids
-                        # (only the products we persisted): a product we skipped for
-                        # the <2-images rule is still on the store, not delisted.
-                        if persisted_ok and page_state.get("complete"):
-                            await asyncio.to_thread(
-                                _reconcile_removed,
-                                seed.store_url,
-                                list(page_state.get("catalog_ids", set())),
+                            persist_task = asyncio.create_task(
+                                asyncio.to_thread(_persist_store_result, seed, outcome)
                             )
+                            while True:
+                                try:
+                                    if stall_interval > 0:
+                                        persisted_ok = await asyncio.wait_for(
+                                            asyncio.shield(persist_task),
+                                            timeout=stall_interval,
+                                        )
+                                    else:
+                                        persisted_ok = await persist_task
+                                    break
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        "Store persist still running: store=%s", seed.store_url
+                                    )
+                            if not persisted_ok:
+                                error_message = "store_persist_failed"
+                                break
+                            gc.collect()
+                    except Exception as exc:  # noqa: BLE001
+                        persisted_ok = False
+                        error_message = str(exc)
 
-                        mark_status = getattr(repo, "mark_run_store_status", None)
-                        if callable(mark_status):
-                            if persisted_ok:
-                                mark_status(
-                                    run_id=resolved_run_id,
-                                    website=seed.store_url,
-                                    status="completed",
-                                )
-                            else:
-                                mark_status(
-                                    run_id=resolved_run_id,
-                                    website=seed.store_url,
-                                    status="failed",
-                                    error_message=error_message,
-                                )
-
-                        if persisted_ok:
-                            success_in_batch += 1
-
-                        overall_idx = processed_count + processed_in_batch
-                        print(
-                            f"  [{overall_idx}/{len(seeds)}] "
-                            f"{seed.store_url.rstrip('/')} — "
-                            f"{'ok' if persisted_ok else 'FAILED'} "
-                            f"({len(seen_ids)} product id(s))",
-                            flush=True,
+                    # Reconcile removals only when the store persisted OK AND
+                    # pagination reached the true end of the catalog. Reconcile
+                    # against catalog_ids (every still-listed apparel id, image-poor
+                    # ones included), NOT the persisted set — a product skipped for
+                    # the <2-images rule is still on the store, not delisted.
+                    if persisted_ok and page_state.get("complete"):
+                        await asyncio.to_thread(
+                            _reconcile_removed,
+                            seed.store_url,
+                            list(page_state.get("catalog_ids", set())),
                         )
 
-                    return processed_in_batch, success_in_batch
+                    mark_status = getattr(repo, "mark_run_store_status", None)
+                    if callable(mark_status):
+                        if persisted_ok:
+                            mark_status(
+                                run_id=resolved_run_id,
+                                website=seed.store_url,
+                                status="completed",
+                            )
+                        else:
+                            mark_status(
+                                run_id=resolved_run_id,
+                                website=seed.store_url,
+                                status="failed",
+                                error_message=error_message,
+                            )
+
+                    done_counter[0] += 1
+                    print(
+                        f"  [{processed_count + done_counter[0]}/{len(seeds)}] "
+                        f"{seed.store_url.rstrip('/')} — "
+                        f"{'ok' if persisted_ok else 'FAILED'} "
+                        f"({len(seen_ids)} product id(s))",
+                        flush=True,
+                    )
+                    return persisted_ok
+
+                try:
+                    # The batch IS the concurrency unit: run_crawl sizes each batch to
+                    # the desired per-lane concurrency (small vs large stores), so
+                    # processing the whole batch at once = that many stores in parallel.
+                    # Safe because every Repository call opens its own connection.
+                    results = await asyncio.gather(
+                        *(_process_one_store(seed) for seed in batch),
+                        return_exceptions=True,
+                    )
+                    for seed, r in zip(batch, results):
+                        if isinstance(r, Exception):
+                            logger.warning("Store task crashed: %s (%s)", seed.store_url, r)
+                    return len(batch), sum(1 for r in results if r is True)
                 finally:
                     await fetcher.close()
 
@@ -2901,23 +2929,41 @@ def run_crawl(
                 )
             _run_phase2()
         else:
-            # --phase both: existing single-phase pipeline unchanged.
+            # --phase both: two concurrent lanes so one giant store can't block the
+            # rest — small stores first (higher concurrency; they finish fast), then
+            # large stores (lower concurrency, gentler on the CDN). Each batch is
+            # processed concurrently by _persist_batch_stream, so batch size == that
+            # lane's concurrency.
+            small_conc = max(1, int(settings.crawl_small_store_concurrency))
+            large_conc = max(1, int(settings.crawl_large_store_concurrency))
+            small_seeds, large_seeds = _partition_seeds_by_size(
+                seeds, repo, max(1, int(settings.crawl_large_store_min_products))
+            )
             print(
                 f"Starting crawl: {len(seeds)} store(s) | phase=both | "
                 f"mark_removed={mark_removed} | min_coverage={removed_min_coverage} | "
                 f"streaming={settings.store_page_streaming_enabled} | "
-                f"batch_size={chunk_size}",
+                f"small={len(small_seeds)}@{small_conc} large={len(large_seeds)}@{large_conc}",
                 flush=True,
             )
-            for start in range(0, len(seeds), chunk_size):
-                batch = seeds[start : start + chunk_size]
-                processed_in_batch, success_in_batch = asyncio.run(
-                    _persist_batch_stream(batch)
+            for lane_name, lane_seeds, conc in (
+                ("small", small_seeds, small_conc),
+                ("large", large_seeds, large_conc),
+            ):
+                if not lane_seeds:
+                    continue
+                print(
+                    f"--- lane={lane_name}: {len(lane_seeds)} store(s) at concurrency {conc} ---",
+                    flush=True,
                 )
-                processed_count += processed_in_batch
-                success_count += success_in_batch
-
-                print(f"Progress: persisted {processed_count}/{len(seeds)} stores", flush=True)
+                for start in range(0, len(lane_seeds), conc):
+                    batch = lane_seeds[start : start + conc]
+                    processed_in_batch, success_in_batch = asyncio.run(
+                        _persist_batch_stream(batch)
+                    )
+                    processed_count += processed_in_batch
+                    success_count += success_in_batch
+                    print(f"Progress: persisted {processed_count}/{len(seeds)} stores", flush=True)
 
             print(f"Crawled {success_count}/{len(seeds)} stores successfully", flush=True)
 
