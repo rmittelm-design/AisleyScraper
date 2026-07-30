@@ -1772,6 +1772,14 @@ def run_crawl(
                 if current_images != stored_images:
                     return True
 
+                # Gender scoring was removed (allow_null_gender_probs=True), so a
+                # missing gender score must NOT force re-validation. Without this
+                # short-circuit every unchanged product re-downloads its image and
+                # re-runs CLIP on each re-crawl — a 16k-product store then takes
+                # hours instead of validating only its new/changed items. Mirrors
+                # _needs_enrichment in the phase-2 path.
+                if allow_null_gender_probs:
+                    return False
                 # Recompute only when existing score is missing.
                 return not bool(existing_gender_probs or product.gender_probs_csv)
 

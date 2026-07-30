@@ -280,3 +280,102 @@ def test_mark_removed_counts_image_poor_listed_products_as_present(monkeypatch, 
     assert "2001" in ids
     assert "2002" in ids, "image-poor but still-listed apparel was wrongly treated as delisted"
     assert "2003" not in ids, "non-apparel must be excluded so it is reconciled away"
+
+
+class _SkipFetcher:
+    """Two products: 3001 (already in DB with identical images) and 3002 (new)."""
+
+    _IMGS = {
+        3001: ["https://cdn.example.com/3001-a.jpg", "https://cdn.example.com/3001-b.jpg"],
+        3002: ["https://cdn.example.com/3002-a.jpg", "https://cdn.example.com/3002-b.jpg"],
+    }
+
+    def __init__(self, _settings: Settings) -> None:
+        _ = _settings
+
+    async def get_text(self, _url: str) -> str:
+        return "<html></html>"
+
+    async def get_json(self, url: str):
+        page = int(parse_qs(urlparse(url).query).get("page", ["1"])[0])
+        if page == 1:
+            return {
+                "products": [
+                    {"id": 3001, "handle": "unchanged", "title": "Unchanged Dress",
+                     "product_type": "Dresses",
+                     "images": [{"src": u} for u in self._IMGS[3001]]},
+                    {"id": 3002, "handle": "newprod", "title": "New Top",
+                     "product_type": "Tops",
+                     "images": [{"src": u} for u in self._IMGS[3002]]},
+                ]
+            }
+        return {"products": []}
+
+    async def get_bytes(self, _url: str) -> bytes:
+        return b"bytes"
+
+    async def close(self) -> None:
+        return None
+
+
+class _SkipRepo(_FakeRestRepo):
+    validated_ids: list | None = None
+    # 3001 already validated last run with the SAME images -> should be skipped.
+    _existing = {"3001": (list(_SkipFetcher._IMGS[3001]), [], None)}
+
+    def get_product_image_states(self, store_id: int, product_ids: list[str]):
+        _ = store_id
+        return {pid: st for pid, st in self._existing.items() if pid in set(product_ids)}
+
+    def get_product_image_state(self, store_id: int, product_id: str):
+        _ = store_id
+        return self._existing.get(product_id)
+
+
+def test_unchanged_products_skip_revalidation(monkeypatch, tmp_path) -> None:
+    """Regression: on a re-crawl, a product whose image URLs are unchanged must NOT
+    be re-downloaded/re-validated (the skip-validation optimisation). Before the fix,
+    the missing allow_null_gender_probs short-circuit re-validated every product."""
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        STORE_PAGE_STREAMING_ENABLED=True,
+        SHOPIFY_PRODUCTS_PAGE_LIMIT=50,
+        SHOPIFY_PRODUCTS_MAX_PAGES=10,
+        CRAWL_RUN_STATE_PATH=str(tmp_path / "run_id.txt"),
+    )
+    seed = StoreSeed(store_url="https://example.com")
+
+    def _fake_classify_store(_homepage: str, base: str, _settings: Settings) -> StoreProfile:
+        _ = _settings
+        return StoreProfile(store_name="Example", website=base, store_type="online")
+
+    async def _recording_verify(*, products, fetcher, settings, max_images_per_product=None):
+        _ = (fetcher, settings, max_images_per_product)
+        _SkipRepo.validated_ids = sorted(p.product_id for p in products)
+
+    _SkipRepo.inserted_product_ids = []
+    _SkipRepo.validated_ids = None
+
+    monkeypatch.setattr(cli, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli, "_run_orphan_preflight", lambda _settings, batch_size=200: None)
+    monkeypatch.setattr(cli, "_build_db_first_seeds", lambda _settings, _repo: [seed])
+    monkeypatch.setattr(cli, "Repository", _SkipRepo)
+    monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
+    monkeypatch.setattr(cli, "Fetcher", _SkipFetcher)
+    monkeypatch.setattr(cli, "classify_store", _fake_classify_store)
+    monkeypatch.setattr(cli, "verify_product_images", _recording_verify)
+    monkeypatch.setattr(orchestrator, "Fetcher", _FailIfUsedFetcher)
+
+    exit_code = cli.run_crawl(limit=1, fresh=True)
+
+    assert exit_code == 0
+    assert _SkipRepo.validated_ids is not None, "verify_product_images was never called"
+    # 3001 (unchanged) must be skipped; only 3002 (new) is validated.
+    assert "3001" not in _SkipRepo.validated_ids, "unchanged product was needlessly re-validated"
+    assert _SkipRepo.validated_ids == ["3002"]
