@@ -3,18 +3,27 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import errno
 import gc
+import hashlib
 import logging
 from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
 import sys
+import threading
+import time
 from uuid import uuid4
 
 from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.fetcher import Fetcher
-from aisley_scraper.crawl.orchestrator import scrape_many, scrape_many_stream
+from aisley_scraper.crawl.orchestrator import (
+    _fetch_all_products,
+    scrape_many,
+    scrape_many_stream,
+)
 from aisley_scraper.crawl.image_verifier import (
     evaluate_first_image_product_validation,
     verify_first_image_product_validation,
@@ -22,6 +31,10 @@ from aisley_scraper.crawl.image_verifier import (
 )
 from aisley_scraper.db.repository import Repository
 from aisley_scraper.diagnostics import diagnose_staged_runs
+from aisley_scraper.extract.policies import (
+    fetch_shipping_returns,
+    stored_policy_is_weak,
+)
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.geocoding import geocode_address
@@ -33,7 +46,11 @@ from aisley_scraper.ingest.csv_loader import (
 )
 from aisley_scraper.local_output import write_local_results
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreProfile, StoreSeed
-from aisley_scraper.normalize.products import normalize_product
+from aisley_scraper.normalize.products import (
+    matches_clear_nonfashion,
+    matches_excluded_category,
+    normalize_product,
+)
 from aisley_scraper.storage import StorageUploader
 from aisley_scraper.storage_integrity import (
     delete_orphan_storage_objects,
@@ -188,6 +205,47 @@ def _build_parser() -> argparse.ArgumentParser:
             "both=standard single-phase run (default)"
         ),
     )
+    crawl.add_argument(
+        "--mark-removed",
+        action="store_true",
+        help=(
+            "After writing each store's products, flag production products that "
+            "are absent from the fresh scrape (delisted from the catalog) as "
+            "unavailable. Only reconciles when the scrape reached the true end of "
+            "the catalog (never on a capped/blocked/errored scrape) and is further "
+            "guarded by --min-coverage. Applies to --phase both (the live scrape); "
+            "ignored for --phase 2, whose staged data lacks completeness info."
+        ),
+    )
+    crawl.add_argument(
+        "--min-coverage",
+        type=float,
+        default=0.5,
+        help=(
+            "With --mark-removed: only flag delisted products when the scrape "
+            "re-found at least this fraction of a store's existing products "
+            "(default 0.5). Guards against a partial scrape flagging a whole catalog."
+        ),
+    )
+    crawl.add_argument(
+        "--shard-index",
+        type=int,
+        default=None,
+        help=(
+            "0-based shard for parallel Phase 2: this worker processes only the "
+            "staged stores where hash(website) %% shard-count == shard-index. "
+            "Defaults to $CLOUD_RUN_TASK_INDEX."
+        ),
+    )
+    crawl.add_argument(
+        "--shard-count",
+        type=int,
+        default=None,
+        help=(
+            "Total number of parallel Phase 2 shards/workers. "
+            "Defaults to $CLOUD_RUN_TASK_COUNT (1 = no sharding)."
+        ),
+    )
 
     rebuild = sub.add_parser(
         "rebuild-branches",
@@ -199,9 +257,158 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rebuild.add_argument("--limit", type=int, default=None, help="Max domains to process")
     rebuild.add_argument(
+        "--domain",
+        type=str,
+        default=None,
+        help=(
+            "Only reconcile this one store (www/scheme-insensitive domain, e.g. "
+            "colehaan.com or https://www.colehaan.com/). Leaves every other store "
+            "untouched."
+        ),
+    )
+    rebuild.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Geocode and print the planned branch rows without writing to the database",
+    )
+    rebuild.add_argument(
         "--skip-geocode",
         action="store_true",
         help="Don't geocode new branch addresses (leave lat/long NULL; fill on a later run)",
+    )
+    rebuild.add_argument(
+        "--include-missing",
+        action="store_true",
+        help=(
+            "Also create rows for TSV stores not yet in the table (TSV-derived, "
+            "no products) and a single row for address-less TSV stores, so the "
+            "stores table fully mirrors the TSVs"
+        ),
+    )
+
+    refresh = sub.add_parser(
+        "refresh-products",
+        help=(
+            "Re-scrape each store's products.json and refresh metadata "
+            "(name, description, price, availability, sizes/colors, brand, type) "
+            "on EXISTING shopify_products rows in place. Lightweight: no image "
+            "downloads, no CLIP, no staging. Images and gender labels are left "
+            "untouched; genuinely new products are skipped (they need the full "
+            "crawl for image validation)."
+        ),
+    )
+    refresh.add_argument("--limit", type=int, default=None, help="Max stores to process")
+    refresh.add_argument(
+        "--domain",
+        type=str,
+        default=None,
+        help=(
+            "Only this one store (www/scheme-insensitive domain, e.g. toddsnyder.com). "
+            "Leaves every other store untouched."
+        ),
+    )
+    refresh.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scrape and report what would be refreshed, without writing to the database",
+    )
+    refresh.add_argument(
+        "--no-mark-removed",
+        action="store_true",
+        help=(
+            "Do NOT flag production products that are absent from the scrape as "
+            "unavailable (default: flag them, when the scrape looks complete)"
+        ),
+    )
+    refresh.add_argument(
+        "--min-coverage",
+        type=float,
+        default=0.5,
+        help=(
+            "Safety threshold for marking removed products unavailable: only do "
+            "so when the scrape re-found at least this fraction of the store's "
+            "existing products (default 0.5). Guards against partial/bot-blocked "
+            "scrapes wrongly flagging a whole catalog."
+        ),
+    )
+
+    recapture = sub.add_parser(
+        "recapture-policies",
+        help=(
+            "Re-fetch each store's shipping/returns policy and rewrite "
+            "shipping_returns/_url (no product re-scrape). Repairs rows whose "
+            "stored text is navigation boilerplate rather than a real policy."
+        ),
+    )
+    recapture.add_argument("--limit", type=int, default=None, help="Max stores to process")
+    recapture.add_argument(
+        "--domain",
+        type=str,
+        default=None,
+        help=(
+            "Only this one store (www/scheme-insensitive domain, e.g. doors.nyc). "
+            "Leaves every other store untouched."
+        ),
+    )
+    recapture.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch and print what would be written, without touching the database",
+    )
+    recapture.add_argument(
+        "--clear-unfixable",
+        action="store_true",
+        help=(
+            "Also NULL rows whose stored policy is boilerplate and for which no "
+            "real policy could be fetched (default: leave such rows unchanged)"
+        ),
+    )
+    recapture.add_argument(
+        "--only-broken",
+        action="store_true",
+        help=(
+            "Skip stores whose stored policy already reads like a real policy; "
+            "only re-capture NULL or navigation-boilerplate rows"
+        ),
+    )
+
+    prune = sub.add_parser(
+        "prune-stores",
+        help=(
+            "TSV is the source of truth: delete shopify_stores whose domain is not "
+            "in any TSV file (their products cascade). Dry-run unless --execute."
+        ),
+    )
+    prune.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply deletions (default: dry-run preview)",
+    )
+
+    prune_nf = sub.add_parser(
+        "prune-nonfashion",
+        help=(
+            "Scan saved shopify_products and remove non-apparel / cosmetics items "
+            "(nail polish, makeup, home goods, kids, etc.) using the same keyword "
+            "rules as the scraper. Deletes the row, its item_embeddings, and its "
+            "/scraped Supabase images. Dry-run unless --execute."
+        ),
+    )
+    prune_nf.add_argument("--limit", type=int, default=None, help="Max rows to scan")
+    prune_nf.add_argument("--batch-size", type=int, default=500, help="Scan page size")
+    prune_nf.add_argument(
+        "--execute",
+        action="store_true",
+        help="Apply deletions (default: dry-run preview)",
+    )
+    prune_nf.add_argument(
+        "--aggressive",
+        action="store_true",
+        help=(
+            "Use the full scrape-time rules (also removes vintage/beauty/boyfriend/"
+            "girl-named apparel and jewelry caught by word collisions). Default is "
+            "the safe mode: only unambiguous non-fashion, never jewelry/apparel."
+        ),
     )
 
     return parser
@@ -310,8 +517,108 @@ def _resolve_existing_run_id(state_path: str, run_id: str | None) -> str:
     )
 
 
+def _fmt_duration(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
+class _ProgressEta:
+    """Live progress + ETA for a phase: elapsed time, throughput, time remaining.
+
+    Printed to stdout so it's visible in `tail`/terminal and in Cloud Run logs.
+    """
+
+    def __init__(self, total: int, label: str) -> None:
+        self.total = max(1, int(total))
+        self.label = label
+        self._start = time.monotonic()
+
+    def line(self, done: int) -> str:
+        elapsed = time.monotonic() - self._start
+        rate = (done / elapsed) if (elapsed > 0 and done > 0) else 0.0
+        eta = ((self.total - done) / rate) if rate > 0 else 0.0
+        pct = (done / self.total) * 100.0
+        return (
+            f"{self.label}: {done}/{self.total} ({pct:.1f}%) | "
+            f"elapsed {_fmt_duration(elapsed)} | ~{_fmt_duration(eta)} left | "
+            f"{rate * 60.0:.1f}/min"
+        )
+
+
+def _select_shard(websites: list[str], shard_index: int, shard_count: int) -> list[str]:
+    """Keep only the websites that belong to this shard.
+
+    Uses a stable SHA-256 hash (NOT the built-in ``hash()``, which is
+    randomized per process via PYTHONHASHSEED) so every worker computes the same
+    partition — the shards are disjoint and together cover every website. This
+    lets N Cloud Run tasks each enrich a slice of the same staged run with no
+    coordination: task k processes the websites where hash(website) % N == k.
+    """
+    if shard_count <= 1:
+        return websites
+    selected: list[str] = []
+    for website in websites:
+        digest = hashlib.sha256(website.encode("utf-8")).hexdigest()
+        if int(digest, 16) % shard_count == shard_index:
+            selected.append(website)
+    return selected
+
+
+def _detect_orphans_bounded(settings, timeout_sec: int) -> dict | None:
+    """Run the orphan-storage audit under a hard wall-clock cap.
+
+    ``detect_orphan_storage_objects`` BFS-walks the ENTIRE storage bucket via the
+    Supabase Storage API; httpx's timeout is per-read, so a large bucket (or a
+    slow-streamed page behind Cloudflare) can make it run effectively forever and
+    wedge the crawl before scraping begins. Run it in a *daemon* thread and
+    ``join`` for at most ``timeout_sec`` — a daemon so an overrunning listing can
+    never block process exit. Returns the audit dict, or None when it timed out or
+    errored (the caller then proceeds WITHOUT the destructive auto-delete).
+    """
+    box: dict = {}
+
+    def _worker() -> None:
+        try:
+            box["audit"] = detect_orphan_storage_objects(settings)
+        except Exception as exc:  # noqa: BLE001 - preflight is best-effort
+            box["error"] = exc
+
+    thread = threading.Thread(target=_worker, name="orphan-preflight", daemon=True)
+    thread.start()
+    thread.join(timeout_sec)
+    if thread.is_alive():
+        logger.warning(
+            "Orphan storage preflight exceeded %ss (large bucket or slow storage "
+            "API); skipping orphan cleanup and proceeding with the crawl.",
+            timeout_sec,
+        )
+        return None
+    if "error" in box:
+        logger.warning(
+            "Orphan storage preflight failed (%s); proceeding with the crawl.",
+            box["error"],
+        )
+        return None
+    return box.get("audit")
+
+
 def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
-    audit = detect_orphan_storage_objects(settings)
+    if not getattr(settings, "crawl_orphan_preflight_enabled", True):
+        logger.info(
+            "Orphan storage preflight skipped (CRAWL_ORPHAN_PREFLIGHT_ENABLED=false)"
+        )
+        return
+    timeout_sec = max(1, int(getattr(settings, "crawl_orphan_preflight_timeout_sec", 120)))
+
+    audit = _detect_orphans_bounded(settings, timeout_sec)
+    if audit is None:
+        return  # timed out / errored -> best-effort, keep crawling
     orphan_paths = list(audit["orphan_paths"])
     if not orphan_paths:
         logger.info(
@@ -329,10 +636,16 @@ def _run_orphan_preflight(settings, *, batch_size: int = 200) -> None:
         audit["stored_paths"],
     )
 
-    verify = detect_orphan_storage_objects(settings)
+    verify = _detect_orphans_bounded(settings, timeout_sec)
+    if verify is None:
+        return
     remaining_orphans = list(verify["orphan_paths"])
     if remaining_orphans:
-        raise RuntimeError(f"orphan preflight failed: remaining_orphans={len(remaining_orphans)}")
+        # Non-fatal: a residual-orphan count must not abort a scrape run.
+        logger.warning(
+            "Orphan preflight still sees remaining_orphans=%s after cleanup; continuing.",
+            len(remaining_orphans),
+        )
 
 
 def _build_db_first_seeds(settings, repo: Repository) -> list[StoreSeed]:
@@ -417,31 +730,63 @@ def _build_db_first_seeds(settings, repo: Repository) -> list[StoreSeed]:
     return db_seeds + csv_new
 
 
-def run_rebuild_branches(limit: int | None = None, skip_geocode: bool = False) -> int:
-    """Materialize/reconcile branch store rows from the TSV branch addresses
-    against the EXISTING production stores — no re-scrape, no image work.
+def run_rebuild_branches(
+    limit: int | None = None,
+    skip_geocode: bool = False,
+    include_missing: bool = False,
+    domain_filter: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Materialize/reconcile branch store rows from the TSV branch addresses —
+    no re-scrape, no image work.
 
-    For every domain that has branch addresses in ``INPUT_TSV_DIR`` and an
-    existing ``shopify_stores`` row, build one branch profile per address (copied
-    from the live store row, geocoded best-effort) and call
-    ``sync_store_branches``. That reuses existing row ids by domain (so each
-    store's products stay on its single original id), creates the missing branch
-    rows, converges websites to canonical, and drops stale rows. Idempotent and
-    re-runnable; lat/long already present is preserved, so a later run just fills
-    in addresses that failed to geocode.
+    Default: for every domain that has branch addresses in ``INPUT_TSV_DIR`` AND
+    an existing ``shopify_stores`` row, build one branch profile per address
+    (copied from the live row, geocoded best-effort) and call
+    ``sync_store_branches`` — reusing existing ids (products stay on one id),
+    creating missing branch rows, converging websites to canonical, dropping
+    stale rows. Idempotent; existing lat/long is preserved.
+
+    With ``include_missing=True`` the stores table is made to fully mirror the
+    TSVs: stores not yet in the table get rows from a TSV-derived profile (no
+    products), and address-less TSV stores get a single online row.
+
+    With ``domain_filter`` set, only that one domain (www/scheme-insensitive) is
+    reconciled; every other store is left untouched. ``dry_run`` geocodes and
+    prints the planned branch rows without writing.
     """
     settings = get_settings()
     _setup_logging(settings.log_level)
     repo = Repository(settings)
     repo.ensure_schema()
 
-    branch_addresses_by_domain: dict[str, list[str]] = {}
-    for seed in load_store_seeds_from_dir(settings.input_tsv_dir, settings):
-        if seed.addresses:
-            branch_addresses_by_domain[_domain_key(seed.store_url)] = list(seed.addresses)
+    # Accept a bare domain ("colehaan.com"), a www host, or a full URL. Prepend a
+    # scheme when absent so urlparse populates netloc for _domain_key.
+    only_domain = None
+    if domain_filter:
+        raw = domain_filter.strip()
+        if "://" not in raw:
+            raw = f"https://{raw}"
+        only_domain = _domain_key(raw)
 
-    # One base profile per domain — prefer the row that already carries an
-    # address (the live, products-bearing row).
+    # One seed per domain from the TSVs (dedup, preserve order).
+    seed_by_domain: dict[str, StoreSeed] = {}
+    for seed in load_store_seeds_from_dir(settings.input_tsv_dir, settings):
+        domain = _domain_key(seed.store_url)
+        if domain and domain not in seed_by_domain:
+            seed_by_domain[domain] = seed
+
+    if only_domain is not None:
+        if only_domain not in seed_by_domain:
+            print(
+                f"No TSV branch addresses found for domain={only_domain} in "
+                f"{settings.input_tsv_dir}; nothing to do."
+            )
+            return 1
+        seed_by_domain = {only_domain: seed_by_domain[only_domain]}
+
+    # One base profile per existing domain — prefer the row that already carries
+    # an address (the live, products-bearing row).
     base_by_domain: dict[str, StoreProfile] = {}
     for profile in repo.list_all_store_profiles():
         domain = _domain_key(profile.website)
@@ -469,31 +814,431 @@ def run_rebuild_branches(limit: int | None = None, skip_geocode: bool = False) -
                 geocode_cache[key] = None
         return geocode_cache[key]
 
-    domains = [d for d in branch_addresses_by_domain if d in base_by_domain]
+    domains = list(seed_by_domain.keys())
     if limit is not None:
         domains = domains[:limit]
 
     reconciled = 0
+    created = 0
     total_rows = 0
     for domain in domains:
-        base = base_by_domain[domain]
-        branches: list[StoreProfile] = []
-        for address in branch_addresses_by_domain[domain]:
-            branch = replace(base, address=address, lat=None, long=None)
-            coords = _geocode(address)
-            if coords is not None:
-                branch.lat, branch.long = coords
-            branches.append(branch)
+        seed = seed_by_domain[domain]
+        base = base_by_domain.get(domain)
+        in_prod = base is not None
+        if not in_prod:
+            if not include_missing:
+                continue
+            # TSV-derived profile; sync/upsert canonicalize the website on write.
+            base = StoreProfile(
+                store_name=seed.store_name or domain,
+                website=seed.store_url,
+                store_type="online",
+            )
+            created += 1
+
         try:
-            ids = repo.sync_store_branches(base.website, branches)
+            # Prefer the curated TSV name over the scraped page title (often an
+            # SEO string like "Brand | Shop New Arrivals"), matching
+            # _apply_seed_store_metadata() on the crawl path. Applied to the base
+            # so every branch row and the address-less path inherit it.
+            seed_name = (seed.store_name or "").strip()
+            if seed_name:
+                base = replace(base, store_name=seed_name)
+
+            if seed.addresses:
+                branches: list[StoreProfile] = []
+                for address in seed.addresses:
+                    branch = replace(base, address=address, lat=None, long=None)
+                    coords = _geocode(address)
+                    if coords is not None:
+                        branch.lat, branch.long = coords
+                    branches.append(branch)
+                if dry_run:
+                    print(
+                        f"[dry-run] {domain}: {len(branches)} branch(es) planned "
+                        f"(website={base.website}, store_name={base.store_name!r}, "
+                        f"store_type={base.store_type!r}); primary reuses the existing "
+                        f"lowest store id, the rest get new ids:"
+                    )
+                    for idx, branch in enumerate(branches):
+                        tag = "primary" if idx == 0 else "new"
+                        print(
+                            f"    [{idx}] ({tag}) address={branch.address!r} "
+                            f"lat={branch.lat} long={branch.long}"
+                        )
+                    total_rows += len(branches)
+                else:
+                    ids = repo.sync_store_branches(base.website, branches)
+                    total_rows += len(ids)
+            else:
+                # Address-less store: ensure a single online row exists. Only
+                # actively created in include_missing mode.
+                if not include_missing:
+                    continue
+                if dry_run:
+                    print(f"[dry-run] {domain}: 1 online row (no branch addresses)")
+                    total_rows += 1
+                else:
+                    repo.upsert_store(base)
+                    total_rows += 1
         except Exception as exc:
             logger.warning("rebuild-branches failed for domain=%s: %s", domain, exc)
             continue
         reconciled += 1
-        total_rows += len(ids)
-        print(f"{domain}: {len(ids)} branch row(s)")
 
-    print(f"Rebuilt branches for {reconciled} domain(s) ({total_rows} store rows).")
+    verb = "Would rebuild" if dry_run else "Rebuilt"
+    print(
+        f"{verb} {reconciled} store(s) ({total_rows} rows; "
+        f"{created} newly created from the TSV)."
+    )
+    return 0
+
+
+def run_refresh_products(
+    limit: int | None = None,
+    *,
+    domain_filter: str | None = None,
+    dry_run: bool = False,
+    mark_removed: bool = True,
+    min_coverage: float = 0.5,
+) -> int:
+    """Re-scrape products.json and refresh metadata on existing shopify_products.
+
+    This is the lightweight metadata-only path: it re-fetches each store's
+    products.json (the same scrape+filter as Phase 1, ``_fetch_all_products``)
+    but downloads no images and runs no CLIP. It updates only scraped metadata
+    columns on rows that already exist in production (via
+    ``repo.update_products_metadata``); images, supabase_images and gender
+    labels are preserved, and new products are skipped (they need the full
+    crawl's image validation). Products that have disappeared from the store's
+    catalog are flagged ``unavailable`` (guarded against partial scrapes). For
+    price/availability/description refreshes on an existing catalog this is far
+    cheaper than a full crawl.
+    """
+    settings = get_settings()
+    repo = Repository(settings)
+
+    profiles = repo.list_all_store_profiles()
+    if domain_filter:
+        target = _domain_key(
+            domain_filter if "://" in domain_filter else f"https://{domain_filter}"
+        )
+        profiles = [p for p in profiles if _domain_key(p.website) == target]
+        if not profiles:
+            print(f"No store found for domain {domain_filter!r}.")
+            return 1
+
+    if limit is not None:
+        profiles = profiles[:limit]
+
+    if not profiles:
+        print("Nothing to refresh.")
+        return 0
+
+    print(f"Refreshing product metadata for {len(profiles)} store(s)...")
+
+    async def _run() -> tuple[int, int, int, int]:
+        fetcher = Fetcher(settings)
+        updated_total = new_total = removed_total = failed = 0
+        try:
+            for index, profile in enumerate(profiles, start=1):
+                base = profile.website.rstrip("/")
+                try:
+                    products, complete = await _fetch_all_products(
+                        base=base, settings=settings, fetcher=fetcher
+                    )
+                except Exception as exc:
+                    logger.warning("refresh-products failed for %s: %s", base, exc)
+                    failed += 1
+                    continue
+
+                # Only reconcile removals when the scrape reached the true end of
+                # the catalog; an incomplete scrape's absences aren't real removals.
+                r = repo.update_products_metadata(
+                    base,
+                    products,
+                    dry_run=dry_run,
+                    mark_removed=mark_removed and complete,
+                    min_coverage=min_coverage,
+                )
+                if mark_removed and not complete and not r["mark_skipped_reason"]:
+                    r["mark_skipped_reason"] = "scrape incomplete (truncated/blocked)"
+                updated_total += int(r["updated"])
+                new_total += int(r["scraped"]) - int(r["updated"])
+                removed_total += int(r["marked_unavailable"])
+                verb = "would refresh" if dry_run else "refreshed"
+                note = ""
+                if r["marked_unavailable"]:
+                    note = f", {r['marked_unavailable']} removed -> unavailable"
+                elif r["mark_skipped_reason"]:
+                    note = f", removal-mark skipped ({r['mark_skipped_reason']})"
+                print(
+                    f"  [{index}/{len(profiles)}] {_domain_key(base)}: {verb} "
+                    f"{r['updated']}/{r['scraped']} existing{note}"
+                )
+        finally:
+            await fetcher.close()
+        return updated_total, new_total, removed_total, failed
+
+    updated, new, removed, failed = asyncio.run(_run())
+    verb = "Would refresh" if dry_run else "Refreshed"
+    print(
+        f"{verb} metadata on {updated} existing product(s) across {len(profiles)} "
+        f"store(s); {removed} delisted product(s) marked unavailable; {new} scraped "
+        f"product(s) not in production (skipped); {failed} store fetch failure(s)."
+    )
+    return 0
+
+
+def run_recapture_policies(
+    limit: int | None = None,
+    *,
+    domain_filter: str | None = None,
+    dry_run: bool = False,
+    only_broken: bool = False,
+    clear_unfixable: bool = False,
+) -> int:
+    """Re-fetch shipping/returns policies for existing stores and rewrite them.
+
+    Uses the same extractor as the crawl (``fetch_shipping_returns``), which
+    prefers a real policy container over the page body — so stores previously
+    stored with navigation boilerplate get a correct policy (or NULL, which is
+    honest, when no policy page exposes one).
+    """
+    settings = get_settings()
+    repo = Repository(settings)
+
+    profiles = repo.list_all_store_profiles()
+    if domain_filter:
+        target = _domain_key(
+            domain_filter if "://" in domain_filter else f"https://{domain_filter}"
+        )
+        profiles = [p for p in profiles if _domain_key(p.website) == target]
+        if not profiles:
+            print(f"No store found for domain {domain_filter!r}.")
+            return 1
+
+    if only_broken:
+        profiles = [p for p in profiles if stored_policy_is_weak(p.shipping_returns)]
+
+    if limit is not None:
+        profiles = profiles[:limit]
+
+    if not profiles:
+        print("Nothing to re-capture.")
+        return 0
+
+    print(f"Re-capturing policies for {len(profiles)} store(s)...")
+
+    async def _run() -> tuple[int, int, int, int]:
+        fetcher = Fetcher(settings)
+        repaired = cleared = failed = skipped = 0
+        try:
+            for index, profile in enumerate(profiles, start=1):
+                base = profile.website.rstrip("/")
+                try:
+                    # Fetch the homepage so link discovery can find policy pages
+                    # whose slug matches none of the canonical paths (e.g.
+                    # /pages/online-store-policy). Best-effort: canonical paths
+                    # still work if the homepage is unreachable.
+                    try:
+                        homepage_html = await fetcher.get_text(base)
+                    except Exception:
+                        homepage_html = None
+                    text, url = await fetch_shipping_returns(
+                        base, fetcher, settings, homepage_html=homepage_html
+                    )
+                except Exception as exc:
+                    logger.warning("recapture-policies failed for %s: %s", base, exc)
+                    failed += 1
+                    continue
+
+                # Consistent with --only-broken: 'ok' means genuinely good,
+                # not merely containing policy words (privacy/T&C text does).
+                before_ok = not stored_policy_is_weak(profile.shipping_returns)
+                if text:
+                    status = "policy" if not before_ok else "policy (refreshed)"
+                    repaired += 1
+                else:
+                    # Nothing usable found. Default to leaving the row alone: a
+                    # fetch can miss for transient reasons (bot-block, JS-only
+                    # page), and silently wiping hundreds of rows is worse than
+                    # leaving them. --clear-unfixable opts into NULLing junk.
+                    if before_ok or not clear_unfixable:
+                        skipped += 1
+                        continue
+                    status = "no policy found -> NULL"
+                    cleared += 1
+
+                preview = (text or "").replace("\n", " ")[:90]
+                print(f"  [{index}/{len(profiles)}] {_domain_key(base)}: {status} {preview}")
+                if not dry_run:
+                    repo.update_store_policies(base, text, url)
+        finally:
+            await fetcher.close()
+        return repaired, cleared, failed, skipped
+
+    repaired, cleared, failed, skipped = asyncio.run(_run())
+    verb = "Would update" if dry_run else "Updated"
+    print(
+        f"{verb} {repaired} store(s) with a real policy; {skipped} left unchanged "
+        f"(no policy found); {cleared} cleared to NULL; {failed} fetch failure(s)."
+    )
+    return 0
+
+
+def _tsv_domains(settings) -> set[str]:
+    """Set of www/scheme-insensitive domains present across all TSV files."""
+    domains = {
+        _domain_key(seed.store_url)
+        for seed in load_store_seeds_from_dir(settings.input_tsv_dir, settings)
+    }
+    domains.discard("")
+    return domains
+
+
+def run_prune_stores(execute: bool = False) -> int:
+    """Make the TSV the source of truth: delete every shopify_stores row whose
+    domain is not present in any TSV file (their products cascade). Dry-run by
+    default; pass execute=True to apply.
+    """
+    settings = get_settings()
+    _setup_logging(settings.log_level)
+    repo = Repository(settings)
+    repo.ensure_schema()
+
+    keep_domains = _tsv_domains(settings)
+    if not keep_domains:
+        print("No TSV domains found in INPUT_TSV_DIR — refusing to prune (would wipe the table).")
+        return 1
+
+    prod_domains = sorted({_domain_key(p.website) for p in repo.list_all_store_profiles()})
+    extra = [d for d in prod_domains if d not in keep_domains]
+    print(
+        f"TSV domains={len(keep_domains)} store-table domains={len(prod_domains)} "
+        f"not_in_tsv={len(extra)}"
+    )
+    for domain in extra:
+        print("  -", domain)
+    if not extra:
+        print("Nothing to prune — every store is already in the TSV.")
+        return 0
+    if not execute:
+        print(f"(dry-run) re-run with --execute to delete {len(extra)} stores and their products.")
+        return 0
+
+    deleted, removed = repo.delete_stores_not_in_domains(keep_domains)
+    print(f"Deleted {deleted} store rows across {len(removed)} domains not in the TSV (products cascaded).")
+    return 0
+
+
+def run_prune_nonfashion(
+    *, limit: int | None = None, batch_size: int = 500, execute: bool = False,
+    aggressive: bool = False,
+) -> int:
+    """Re-apply the non-apparel / cosmetics keyword filter to already-saved
+    products and remove the ones that should never have been kept (nail polish,
+    makeup, home goods, kids, etc.). For each match it deletes the
+    shopify_products row, its item_embeddings, and its /scraped Supabase images.
+
+    Dry-run by default — prints what it WOULD remove. Pass execute=True to delete.
+    """
+    settings = get_settings()
+    _setup_logging(settings.log_level)
+    repo = Repository(settings)
+    uploader = StorageUploader(settings)
+
+    detect = matches_excluded_category if aggressive else matches_clear_nonfashion
+    print(f"prune-nonfashion mode={'aggressive' if aggressive else 'safe'} execute={execute}", flush=True)
+
+    scanned = 0
+    matched = 0
+    deleted_rows = 0
+    deleted_emb = 0
+    samples: list[str] = []
+    pending_image_urls: list[str] = []
+    after_id: int | None = None
+    page = max(1, int(batch_size))
+
+    def _chunks(seq: list, n: int):
+        for i in range(0, len(seq), n):
+            yield seq[i : i + n]
+
+    # Delete per page as we scan: rows + embeddings are committed page-by-page so
+    # progress is visible and recoverable (a stalled page never wedges the whole
+    # run). Storage images are slower HTTP, so we collect their URLs and delete
+    # them at the end — the catalog (rows) clears first.
+    while True:
+        rows = repo.list_products_for_category_scan(limit=page, after_id=after_id)
+        if not rows:
+            break
+        page_ids: list[int] = []
+        page_uuids: set[str] = set()
+        reached_limit = False
+        for row in rows:
+            after_id = int(row["id"])
+            scanned += 1
+            if detect(
+                item_name=row["item_name"],
+                product_url=row["product_url"],
+                product_handle=row["product_handle"],
+                product_type=row["product_type"],
+            ):
+                page_ids.append(int(row["id"]))
+                uuid = row.get("item_uuid")
+                if uuid:
+                    page_uuids.add(str(uuid))
+                pending_image_urls.extend(row.get("supabase_images") or [])
+                if len(samples) < 40:
+                    samples.append(
+                        f"  store={row['store_id']} product={row['product_id']} "
+                        f"type={row['product_type']!r} name={row['item_name']!r}"
+                    )
+            if limit is not None and scanned >= limit:
+                reached_limit = True
+                break
+
+        matched += len(page_ids)
+        if execute and page_ids:
+            deleted_rows += repo.delete_products_by_ids(page_ids)
+            if page_uuids:
+                try:
+                    deleted_emb += repo.delete_item_embeddings_batch(list(page_uuids))
+                except Exception as exc:
+                    logger.warning("Embedding batch delete failed (%s): %s", len(page_uuids), exc)
+        # Heartbeat every page (both dry-run and execute) so a long cross-region
+        # scan is visible and a stall is obvious (count stops advancing).
+        print(
+            f"progress: scanned={scanned} matched={matched} deleted_rows={deleted_rows}",
+            flush=True,
+        )
+
+        if reached_limit or len(rows) < page:
+            break
+
+    print(f"Scanned {scanned} saved products; {matched} match the non-fashion rules.", flush=True)
+    for line in samples:
+        print(line)
+    if matched > len(samples):
+        print(f"  … and {matched - len(samples)} more.", flush=True)
+
+    if not execute:
+        print("DRY RUN — nothing deleted. Re-run with --execute to remove these.")
+        return 0
+
+    # Rows + embeddings are already gone. Now delete the /scraped Supabase images.
+    deleted_images = 0
+    for chunk in _chunks(pending_image_urls, 200):
+        try:
+            uploader.delete_images(chunk)
+            deleted_images += len(chunk)
+        except Exception as exc:
+            logger.warning("Storage delete batch failed (%s urls): %s", len(chunk), exc)
+    print(
+        f"DELETED {deleted_rows} shopify_products rows, {deleted_emb} item_embeddings, "
+        f"{deleted_images} /scraped images.",
+        flush=True,
+    )
     return 0
 
 
@@ -512,6 +1257,41 @@ def run_diagnose_staged_runs() -> int:
     return 0
 
 
+def _partition_seeds_by_size(
+    seeds: list[StoreSeed], repo: Repository, threshold: int
+) -> tuple[list[StoreSeed], list[StoreSeed]]:
+    """Split seeds into (small, large) lanes by current DB product count.
+
+    A store with >= ``threshold`` products goes to the 'large' lane (processed
+    later, at lower concurrency). Never-scraped / unknown stores default to
+    'small'. On any DB error, everything is treated as small (a safe fallback —
+    the crawl still runs, just without the mega-store lane).
+    """
+    counts: dict[str, int] = {}
+    try:
+        conn = repo._connect()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("set statement_timeout=20000")
+        cur.execute(
+            "select s.website, count(p.id) from shopify_stores s "
+            "left join shopify_products p on p.store_id = s.id group by s.website"
+        )
+        for website, n in cur.fetchall():
+            key = _domain_key(website)
+            if key:
+                counts[key] = max(counts.get(key, 0), int(n or 0))
+        conn.close()
+    except Exception as exc:  # noqa: BLE001 - lane sizing is best-effort
+        logger.warning("Could not size stores for lane partition (%s); all in small lane", exc)
+    small: list[StoreSeed] = []
+    large: list[StoreSeed] = []
+    for seed in seeds:
+        n = counts.get(_domain_key(seed.store_url), 0)
+        (large if n >= threshold else small).append(seed)
+    return small, large
+
+
 def run_crawl(
     limit: int | None,
     run_id: str | None = None,
@@ -519,12 +1299,45 @@ def run_crawl(
     phase: str = "both",
     skip_image_upload: bool = False,
     csv_path: str | None = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    mark_removed: bool = False,
+    removed_min_coverage: float = 0.5,
 ) -> int:
     settings = get_settings()
     _setup_logging(settings.log_level)
     # Gender scoring has been removed; products are never required to carry gender
     # probabilities (gender_probs_csv stays NULL).
     allow_null_gender_probs = True
+
+    # Accumulates delisted-products flagged across the --phase both reconcile
+    # sites (streaming + non-streaming) so a single summary can report the total.
+    removed_marked = [0]
+
+    def _reconcile_removed(website: str, product_ids: list[str]) -> None:
+        """Flag production products absent from this store's scrape as unavailable.
+
+        No-op unless --mark-removed is set. ``product_ids`` must be the store's
+        FULL scraped catalog (callers accumulate across pages in streaming mode),
+        so this never sees a partial view. Guarded server-side by
+        Repository.mark_removed_products_unavailable / _removal_plan.
+        """
+        if not mark_removed:
+            return
+        marker = getattr(repo, "mark_removed_products_unavailable", None)
+        if not callable(marker):
+            return
+        try:
+            r = marker(website, product_ids, min_coverage=removed_min_coverage)
+        except Exception as exc:  # noqa: BLE001 - reconciliation must not fail the store
+            logger.warning("mark-removed failed for %s: %s", website, exc)
+            return
+        n = int(r.get("marked_unavailable") or 0)
+        if n:
+            removed_marked[0] += n
+            logger.info("Marked %s delisted product(s) unavailable for %s", n, website)
+        elif r.get("mark_skipped_reason"):
+            logger.info("Removal-mark skipped for %s (%s)", website, r["mark_skipped_reason"])
 
     if settings.persistence_target == "local":
         seeds = load_store_seeds_from_dir(settings.input_tsv_dir, settings)
@@ -541,16 +1354,15 @@ def run_crawl(
         )
         return 0
 
-    # Persist in small batches to keep runtime memory bounded.
-    chunk_size = max(
-        1,
-        min(settings.crawl_store_batch_size, settings.crawl_global_concurrency),
-    )
-
     cleared_disk_cache_files, disk_cache_dir = _clear_fetcher_disk_cache(settings)
 
     repo = Repository(settings)
-    upload_images = not skip_image_upload
+    # The scraper no longer re-hosts product images to Supabase Storage: the app
+    # reads the original Shopify CDN URLs from the `images` column, and nothing
+    # consumes `supabase_images`. Uploads are off unconditionally (the
+    # --skip-image-upload flag is retained as a no-op for compatibility).
+    upload_images = False
+    _ = skip_image_upload
 
     try:
         repo.ensure_schema()
@@ -565,6 +1377,36 @@ def run_crawl(
                 all_seeds = _dedupe_seeds_by_domain(load_store_seeds(csv_path, settings))
             else:
                 all_seeds = _build_db_first_seeds(settings, repo)
+                # TSV is the source of truth: remove stores whose domain is not in
+                # any TSV file (products cascade). Only on a full-directory crawl
+                # (never on a --csv subset) and never against an empty TSV set.
+                # Gated by PRUNE_NONTSV_STORES (default on) so a re-scrape can be
+                # run with PRUNE_NONTSV_STORES=false to GUARANTEE no store deletion.
+                prune_fn = getattr(repo, "delete_stores_not_in_domains", None)
+                if not getattr(settings, "prune_nontsv_stores", True):
+                    logger.warning("PRUNE_NONTSV_STORES=false: skipping non-TSV store prune")
+                elif callable(prune_fn):
+                    keep_domains = _tsv_domains(settings)
+                    if keep_domains:
+                        # Safety valve: refuse a mass prune (e.g. an incomplete TSV
+                        # that would wipe most of the catalog). Require the operator
+                        # to opt in via PRUNE_MAX_STORES if they really mean it.
+                        prod_domains = {_domain_key(p.website) for p in repo.list_all_store_profiles()}
+                        to_prune = [d for d in prod_domains if d and d not in keep_domains]
+                        cap = int(getattr(settings, "prune_max_stores", 25))
+                        if len(to_prune) > cap:
+                            logger.error(
+                                "Refusing to prune %s stores (> PRUNE_MAX_STORES=%s) — "
+                                "TSV may be incomplete. Run `prune-stores --execute` "
+                                "intentionally if this is correct.",
+                                len(to_prune), cap,
+                            )
+                        else:
+                            pruned, _removed = prune_fn(keep_domains)
+                            if pruned:
+                                logger.warning(
+                                    "Pruned %s stores not present in the TSV files", pruned
+                                )
             all_seeds = _dedupe_seeds_by_domain(all_seeds)
             if limit is not None:
                 all_seeds = all_seeds[:limit]
@@ -614,6 +1456,10 @@ def run_crawl(
             if not store.address:
                 return
             if store.lat is not None and store.long is not None:
+                return
+            if not getattr(settings, "geocoding_enabled", True):
+                # Geocoding disabled: leave coords null; the upsert's coalesce
+                # preserves any existing lat/long for this branch.
                 return
 
             cache_key = store.address.strip().lower()
@@ -807,7 +1653,6 @@ def run_crawl(
                 return True
 
             chunk_size = max(1, int(settings.postprocess_product_chunk_size))
-            image_bytes_by_url: dict[str, bytes] = {}
 
             def _chunk_products(products: list) -> list[list]:
                 return [products[i : i + chunk_size] for i in range(0, len(products), chunk_size)]
@@ -815,19 +1660,17 @@ def run_crawl(
             async def _postprocess_products(products: list) -> None:
                 postprocess_fetcher = Fetcher(settings)
                 try:
+                    # Validate ALL images and keep the product if ANY image passes.
+                    # Do NOT cap to the first image: many products lead with a
+                    # low-res/low-contrast or lifestyle shot, so first-image-only
+                    # validation drops real products whose later images are fine
+                    # (observed 60-93% false drops). Re-crawl speed comes from the
+                    # skip-revalidation path (_needs_postprocess), not from capping.
                     await verify_product_images(
                         products=products,
                         fetcher=postprocess_fetcher,
                         settings=settings,
                     )
-                    for product in products:
-                        for image_url in product.images:
-                            normalized_url = image_url.strip()
-                            if not normalized_url:
-                                continue
-                            cached = postprocess_fetcher.get_cached_bytes(normalized_url)
-                            if cached is not None:
-                                image_bytes_by_url[normalized_url] = cached
                 finally:
                     clear_cached_bytes = getattr(postprocess_fetcher, "clear_cached_bytes", None)
                     if callable(clear_cached_bytes):
@@ -843,78 +1686,17 @@ def run_crawl(
                 return
 
             def _safe_upload_new_product_images(product) -> list[str]:
-                if not upload_images:
-                    return list(product.supabase_images or [])
-                if not product.images:
-                    return []
-                try:
-                    upload_from_cache = getattr(uploader, "upload_product_images_from_cache", None)
-                    cached_for_product = {
-                        image_url.strip(): image_bytes_by_url[image_url.strip()]
-                        for image_url in product.images
-                        if image_url and image_url.strip() and image_url.strip() in image_bytes_by_url
-                    }
-                    if callable(upload_from_cache) and cached_for_product:
-                        return upload_from_cache(
-                            product.images,
-                            store_id,
-                            product.product_id,
-                            cached_for_product,
-                        )
-                    return uploader.upload_product_images(
-                        product.images,
-                        store_id=store_id,
-                        product_id=product.product_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Image upload failed for store=%s product=%s: %s",
-                        store_id,
-                        product.product_id,
-                        exc,
-                    )
-                    return []
+                # Uploads removed: never re-host to Supabase. Preserve any storage
+                # URLs the product already had; new products get none.
+                return list(product.supabase_images or [])
 
             def _safe_sync_existing_product_images(
                 product,
                 existing_images: list[str],
                 existing_supabase_images: list[str],
             ) -> list[str]:
-                if not upload_images:
-                    return list(existing_supabase_images)
-                try:
-                    sync_from_cache = getattr(uploader, "sync_product_images_from_cache", None)
-                    cached_for_product = {
-                        image_url.strip(): image_bytes_by_url[image_url.strip()]
-                        for image_url in product.images
-                        if image_url and image_url.strip() and image_url.strip() in image_bytes_by_url
-                    }
-                    if callable(sync_from_cache) and cached_for_product:
-                        return sync_from_cache(
-                            current_source_urls=product.images,
-                            existing_source_urls=existing_images,
-                            existing_supabase_urls=existing_supabase_images,
-                            store_id=store_id,
-                            product_id=product.product_id,
-                            image_bytes_by_url=cached_for_product,
-                            delete_stale=False,
-                        )
-                    return uploader.sync_product_images(
-                        current_source_urls=product.images,
-                        existing_source_urls=existing_images,
-                        existing_supabase_urls=existing_supabase_images,
-                        store_id=store_id,
-                        product_id=product.product_id,
-                        delete_stale=False,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Image sync failed for store=%s product=%s: %s",
-                        store_id,
-                        product.product_id,
-                        exc,
-                    )
-                    return existing_supabase_images
+                # Uploads removed: keep whatever storage URLs already exist, unchanged.
+                return list(existing_supabase_images)
 
             def _safe_upsert_product(product) -> None:
                 images_incomplete = upload_images and (
@@ -1009,14 +1791,23 @@ def run_crawl(
                 existing_images, existing_supabase_images, existing_gender_probs = _split_existing_state(
                     existing_image_state
                 )
-                if len(existing_images) != len(existing_supabase_images):
-                    return True
+                # NOTE: image uploads were removed -> supabase_images is always
+                # empty/stale, so the old len(images)!=len(supabase) check forced
+                # re-processing of the whole catalog. Dropped (see _needs_enrichment).
 
                 current_images = _normalize_source_urls(product.images)
                 stored_images = _normalize_source_urls(existing_images)
                 if current_images != stored_images:
                     return True
 
+                # Gender scoring was removed (allow_null_gender_probs=True), so a
+                # missing gender score must NOT force re-validation. Without this
+                # short-circuit every unchanged product re-downloads its image and
+                # re-runs CLIP on each re-crawl — a 16k-product store then takes
+                # hours instead of validating only its new/changed items. Mirrors
+                # _needs_enrichment in the phase-2 path.
+                if allow_null_gender_probs:
+                    return False
                 # Recompute only when existing score is missing.
                 return not bool(existing_gender_probs or product.gender_probs_csv)
 
@@ -1269,6 +2060,7 @@ def run_crawl(
                 stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
                 success = 0
                 done = 0
+                _p1 = _ProgressEta(len(seeds), "Phase 1 (scrape)")
 
                 # scrape_many_stream with include_postprocess=False: pure JSON fetch,
                 # no image validation, no CLIP.  Semaphore concurrency is
@@ -1320,7 +2112,7 @@ def run_crawl(
 
                     if ok:
                         success += 1
-                    print(f"Phase 1 progress: {done}/{len(seeds)}")
+                    print(_p1.line(done), flush=True)
 
                 return success
 
@@ -1342,14 +2134,14 @@ def run_crawl(
                 fetcher = Fetcher(settings)
                 try:
                     io_sem = asyncio.Semaphore(settings.crawl_global_concurrency)
-                    upload_sem = asyncio.Semaphore(settings.phase2_upload_concurrency)
                     stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
                     progress_lock = asyncio.Lock()
                     completed_count = 0
-                    phase2_store_batch_size = max(
-                        1,
-                        min(settings.crawl_store_batch_size, settings.crawl_global_concurrency),
-                    )
+                    _p2 = _ProgressEta(len(scraped_websites), "Phase 2 (enrich)")
+                    # Decoupled from crawl concurrency: image bytes are bounded by
+                    # the chunk size + byte cache, not the store batch, so we can
+                    # pool several stores per batch to keep validation/upload busy.
+                    phase2_store_batch_size = max(1, settings.phase2_store_batch_size)
                     phase2_product_chunk_size = max(1, settings.postprocess_product_chunk_size)
                     phase2_unique_url_budget = max(
                         1,
@@ -1363,25 +2155,61 @@ def run_crawl(
                         return [u.strip() for u in (urls or []) if u.strip()]
 
                     # ── Stage 1: load staged data + upsert stores in parallel ─────
+                    # The cross-region Supabase pooler intermittently FREEZES a read
+                    # (socket alive, no data flows). It is NOT catchable by TCP
+                    # keepalives, nor by server statement_timeout (the stall is at
+                    # pool checkout, before the server sees the query). So bound each
+                    # read with a client wall-clock timeout and retry on a fresh
+                    # connection (every repo read opens its own). A frozen attempt
+                    # leaks its worker thread (it never returns); a dedicated pool
+                    # keeps those leaks from starving CLIP's thread pool.
+                    _db_read_pool = ThreadPoolExecutor(
+                        max_workers=16, thread_name_prefix="p2dbread"
+                    )
+
+                    async def _resilient_read(
+                        fn, *args, what: str, attempts: int = 6, timeout: float = 25.0
+                    ):
+                        loop = asyncio.get_running_loop()
+                        last_exc: BaseException | None = None
+                        for attempt in range(1, attempts + 1):
+                            fut = loop.run_in_executor(_db_read_pool, fn, *args)
+                            try:
+                                return await asyncio.wait_for(fut, timeout=timeout)
+                            except asyncio.TimeoutError:
+                                last_exc = TimeoutError(f"{what} froze (>{timeout:.0f}s)")
+                                logger.warning(
+                                    "Pooler froze on %s (attempt %s/%s) — retrying on a fresh connection",
+                                    what,
+                                    attempt,
+                                    attempts,
+                                )
+                                await asyncio.sleep(min(6.0, 1.5 * attempt))
+                        raise last_exc or RuntimeError(f"{what} failed")
+
                     async def _load_one(website: str):
                         async with io_sem:
-                            staged_store = await asyncio.to_thread(
-                                repo.get_staged_store, resolved_run_id, website
+                            staged_store = await _resilient_read(
+                                repo.get_staged_store, resolved_run_id, website,
+                                what=f"get_staged_store[{website}]",
                             )
                             if staged_store is None:
                                 raise RuntimeError("staging store row missing")
-                            staged_products = await asyncio.to_thread(
-                                repo.get_staged_products, resolved_run_id, website
+                            staged_products = await _resilient_read(
+                                repo.get_staged_products, resolved_run_id, website,
+                                what=f"get_staged_products[{website}]",
                             )
                             # One store row per branch; products link to first branch.
+                            # (A write — pooler writes don't exhibit the read freeze.)
                             store_id = await asyncio.to_thread(
                                 _upsert_store_with_branches, staged_store
                             )
                             product_ids = [p.product_id for p in staged_products if p.product_id]
                             existing_states: dict = {}
                             if product_ids:
-                                existing_states = await asyncio.to_thread(
-                                    repo.get_product_image_states, store_id, product_ids
+                                existing_states = await _resilient_read(
+                                    repo.get_product_image_states, store_id, product_ids,
+                                    what=f"get_product_image_states[{website}]",
                                 )
                             return store_id, staged_products, existing_states
 
@@ -1394,9 +2222,12 @@ def run_crawl(
                         if existing is None:
                             return True
                         existing_imgs, existing_supa, existing_probs = existing
-                        # Previous upload was incomplete: re-process.
-                        if len(existing_imgs) != len(existing_supa):
-                            return True
+                        # NOTE: image uploads were removed, so supabase_images is now
+                        # always empty/stale. The old len(images)!=len(supabase)
+                        # "incomplete upload" check therefore fired for every product
+                        # and re-enriched the ENTIRE catalog (defeating skip-existing
+                        # and making the run take hours). Dropped — only re-enrich when
+                        # the source images actually changed.
                         if _norm(product.images) != _norm(existing_imgs):
                             return True
                         if allow_null_gender_probs:
@@ -1416,88 +2247,11 @@ def run_crawl(
                         if not product.images:
                             return True, None
 
-                        existing_imgs = list(existing[0]) if existing else []
+                        # Uploads removed: never re-host to Supabase. Preserve any
+                        # existing storage URLs; new products get none — they are
+                        # written with their Shopify CDN URLs in `images`.
                         existing_supa = list(existing[1]) if existing else []
-                        images_unchanged = bool(
-                            existing
-                            and _norm(product.images) == _norm(existing_imgs)
-                            and len(existing_supa) == len(product.images)
-                        )
-
-                        if not upload_images:
-                            # Preserve existing storage URLs when uploads are disabled.
-                            product.supabase_images = existing_supa if existing else []
-                        elif existing is None:
-                            # Ensure every image URL that needs uploading has its bytes
-                            # loaded through the shared Fetcher (hits cache for URLs already
-                            # processed in stage 2; fetches unconditionally otherwise).
-                            image_bytes_by_url = {
-                                image_url: cached
-                                for image_url in _norm(product.images)
-                                if (cached := fetcher.get_cached_bytes(image_url)) is not None
-                            }
-                            async with upload_sem:
-                                try:
-                                    product.supabase_images = await asyncio.to_thread(
-                                        uploader.upload_product_images_from_cache,
-                                        product.images,
-                                        store_id,
-                                        product.product_id,
-                                        image_bytes_by_url,
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "Upload failed store_id=%s product=%s: %s",
-                                        store_id, product.product_id, exc,
-                                    )
-                                    return False, None
-                        elif images_unchanged:
-                            # Images and upload count match: reuse existing Supabase URLs.
-                            product.supabase_images = existing_supa
-                        else:
-                            for image_url in _norm(product.images):
-                                if fetcher.get_cached_bytes(image_url) is None:
-                                    try:
-                                        await fetcher.get_bytes(image_url)
-                                    except Exception as exc:
-                                        logger.warning(
-                                            "Pre-upload fetch failed store_id=%s url=%s: %s",
-                                            store_id, image_url, exc,
-                                        )
-
-                            image_bytes_by_url = {
-                                image_url: cached
-                                for image_url in _norm(product.images)
-                                if (cached := fetcher.get_cached_bytes(image_url)) is not None
-                            }
-                            async with upload_sem:
-                                try:
-                                    product.supabase_images = await asyncio.to_thread(
-                                        uploader.sync_product_images_from_cache,
-                                        current_source_urls=product.images,
-                                        existing_source_urls=existing_imgs,
-                                        existing_supabase_urls=existing_supa,
-                                        store_id=store_id,
-                                        product_id=product.product_id,
-                                        image_bytes_by_url=image_bytes_by_url,
-                                        delete_stale=False,
-                                    )
-                                except Exception as exc:
-                                    logger.warning(
-                                        "Image sync failed store_id=%s product=%s: %s",
-                                        store_id, product.product_id, exc,
-                                    )
-                                    product.supabase_images = existing_supa or []
-
-                        images_incomplete = upload_images and (
-                            len(product.supabase_images) != len(product.images)
-                        )
-                        if images_incomplete:
-                            logger.warning(
-                                "Skipping upsert: incomplete required fields store_id=%s product=%s",
-                                store_id, product.product_id,
-                            )
-                            return False, None
+                        product.supabase_images = existing_supa if existing else []
 
                         if allow_null_gender_probs:
                             product.gender_probs_csv = None
@@ -1551,6 +2305,13 @@ def run_crawl(
                                 )
                                 return False
 
+                        # NOTE: removal reconciliation is intentionally NOT done in
+                        # the staged Phase 2 path — staging does not carry whether
+                        # the Phase 1 scrape reached the true end of the catalog, so
+                        # marking absences unavailable here could act on a truncated
+                        # scrape. --mark-removed is supported for --phase both (live
+                        # scrape) and refresh-products, which know completeness.
+
                         await asyncio.to_thread(
                             repo.delete_staged_run_website, resolved_run_id, website
                         )
@@ -1562,11 +2323,7 @@ def run_crawl(
                         nonlocal completed_count
                         async with progress_lock:
                             completed_count += 1
-                            pct = (completed_count / len(scraped_websites)) * 100.0
-                            print(
-                                f"Phase 2 progress: {completed_count}/{len(scraped_websites)} "
-                                f"({pct:.1f}%)"
-                            )
+                            print(_p2.line(completed_count), flush=True)
 
                         return True
 
@@ -1844,6 +2601,27 @@ def run_crawl(
                     )
                 return 0
 
+            # Parallel sharding: each worker keeps only its slice of the staged
+            # websites (e.g. one Cloud Run task per shard). Applied after the
+            # global emptiness check so the diagnostics above reflect the whole
+            # run, not just this shard.
+            if shard_count > 1:
+                total_staged = len(scraped_websites)
+                scraped_websites = _select_shard(scraped_websites, shard_index, shard_count)
+                logger.info(
+                    "Phase 2 shard %s/%s: %s of %s staged websites",
+                    shard_index, shard_count, len(scraped_websites), total_staged,
+                )
+                print(
+                    f"Phase 2 shard {shard_index}/{shard_count}: "
+                    f"{len(scraped_websites)}/{total_staged} staged stores in this shard"
+                )
+                if not scraped_websites:
+                    print(
+                        f"Phase 2 shard {shard_index}/{shard_count}: no stores in this shard — nothing to do."
+                    )
+                    return 0
+
             logger.info("Phase 2: enriching %s staged websites", len(scraped_websites))
             print(
                 f"Phase 2: enriching {len(scraped_websites)} staged websites "
@@ -1860,7 +2638,7 @@ def run_crawl(
             success_in_batch = 0
             stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
 
-            async def _iter_page_outcomes(seed: StoreSeed, fetcher: Fetcher):
+            async def _iter_page_outcomes(seed: StoreSeed, fetcher: Fetcher, state: dict):
                 base = seed.store_url.rstrip("/")
                 homepage = await fetcher.get_text(base)
                 store = classify_store(homepage, base, settings)
@@ -1871,45 +2649,101 @@ def run_crawl(
 
                 seen_product_ids: set[str] = set()
                 yielded_any = False
+                kept_count = 0
+                # True only when pagination reaches a genuine end of catalog; the
+                # caller must not reconcile removals otherwise (cap/block/error).
+                state["complete"] = False
 
                 for page in range(1, max_pages + 1):
                     products_url = f"{base}/products.json?limit={page_limit}&page={page}"
-                    payload = await fetcher.get_json(products_url)
+                    try:
+                        payload = await fetcher.get_json(products_url)
+                    except Exception as exc:  # noqa: BLE001 - deep-page error handling
+                        # Big shops (e.g. charmingcharlie, 18k products) can error at a
+                        # DEEP page after scraping the whole catalog. A page-1 error is a
+                        # genuine failure (re-raise -> store fails). Past page 1, don't
+                        # FAIL the store (which left it retried for hours every run) —
+                        # stop and keep what we scraped. Distinguish the error kind:
+                        #   * A 4xx that means "past the last page" (400/404/410 — the
+                        #     store returns Bad Request / Not Found instead of an empty
+                        #     list) is a real END OF CATALOG -> mark complete so
+                        #     --mark-removed reconciles (delisted products get flagged).
+                        #   * A rate-limit / transient error (429/503/timeout) may have
+                        #     TRUNCATED the scrape -> leave complete False so we never
+                        #     mark the un-scraped tail delisted (min-coverage is a
+                        #     second guard).
+                        if page == 1:
+                            raise
+                        status = getattr(getattr(exc, "response", None), "status_code", None)
+                        end_of_catalog = status in (400, 404, 410)
+                        logger.warning(
+                            "Stopping pagination for %s at page %s (%s); keeping %s products "
+                            "(end_of_catalog=%s)",
+                            base, page, exc, kept_count, end_of_catalog,
+                        )
+                        if end_of_catalog:
+                            state["complete"] = True
+                        break
                     extracted = extract_products_from_products_json(payload, settings, base_url=base)
 
                     page_products = []
+                    hit_cap = False
                     for product in extracted:
                         if product.product_id in seen_product_ids:
                             continue
                         seen_product_ids.add(product.product_id)
-                        if product.images:
-                            normalized = normalize_product(product)
-                            if normalized is not None:
-                                page_products.append(normalized)
-
-                        if max_items_per_store > 0 and len(seen_product_ids) >= max_items_per_store:
-                            logger.warning(
-                                "Reached per-store product cap for %s: collected=%s cap=%s",
-                                base,
-                                len(seen_product_ids),
-                                max_items_per_store,
-                            )
-                            break
+                        # Record every still-listed apparel id for the removal
+                        # reconcile — INCLUDING items we skip below for the
+                        # <2-images rule. Otherwise a product that is still in the
+                        # store's catalog but image-poor is absent from the scraped
+                        # set and --mark-removed wrongly flags it as delisted.
+                        # Non-apparel is intentionally NOT recorded here, so it is
+                        # still reconciled away (the intended cleanup).
+                        if product.product_id and not matches_excluded_category(
+                            item_name=product.item_name,
+                            product_url=product.product_url,
+                            product_handle=product.product_handle,
+                            product_type=product.product_type,
+                        ):
+                            state.setdefault("catalog_ids", set()).add(product.product_id)
+                        normalized = normalize_product(product)
+                        if normalized is not None:
+                            page_products.append(normalized)
+                            kept_count += 1
+                            # Cap AFTER filtering: count only products that passed.
+                            if max_items_per_store > 0 and kept_count >= max_items_per_store:
+                                logger.warning(
+                                    "Reached per-store product cap (after filtering) for %s: kept=%s cap=%s",
+                                    base,
+                                    kept_count,
+                                    max_items_per_store,
+                                )
+                                hit_cap = True
+                                break
 
                     if page_products:
                         yielded_any = True
-                        yield ScrapeResult(store=store, products=page_products)
+                        # A single page is never the complete catalog; streaming
+                        # completeness is tracked via `state`, not this flag.
+                        yield ScrapeResult(
+                            store=store, products=page_products, scrape_complete=False
+                        )
 
-                    if max_items_per_store > 0 and len(seen_product_ids) >= max_items_per_store:
+                    if hit_cap:
                         break
 
                     products_raw = payload.get("products", []) if isinstance(payload, dict) else []
                     if not isinstance(products_raw, list) or not products_raw:
+                        # Genuine end only if the store returned a well-formed
+                        # products.json with an explicitly-empty list. A block/
+                        # anomaly 200 lacks the key -> leave complete=False.
+                        if isinstance(payload, dict) and "products" in payload:
+                            state["complete"] = True
                         break
 
                 if not yielded_any:
                     # Persist store row even when no products are present.
-                    yield ScrapeResult(store=store, products=[])
+                    yield ScrapeResult(store=store, products=[], scrape_complete=False)
 
             use_streaming_mode = (
                 settings.store_page_streaming_enabled
@@ -1919,66 +2753,95 @@ def run_crawl(
 
             if use_streaming_mode:
                 fetcher = Fetcher(settings)
-                try:
-                    for seed in batch:
-                        processed_in_batch += 1
-                        persisted_ok = True
-                        error_message = "store_persist_failed"
+                done_counter = [0]  # progress index shared across the concurrent stores
 
-                        try:
-                            async for outcome in _iter_page_outcomes(seed, fetcher):
-                                persist_task = asyncio.create_task(
-                                    asyncio.to_thread(_persist_store_result, seed, outcome)
+                async def _process_one_store(seed: StoreSeed) -> bool:
+                    persisted_ok = True
+                    error_message = "store_persist_failed"
+                    seen_ids: set[str] = set()
+                    page_state: dict = {"complete": False}
+                    try:
+                        async for outcome in _iter_page_outcomes(seed, fetcher, page_state):
+                            if isinstance(outcome, ScrapeResult):
+                                seen_ids.update(
+                                    p.product_id for p in outcome.products if p.product_id
                                 )
-                                while True:
-                                    try:
-                                        if stall_interval > 0:
-                                            persisted_ok = await asyncio.wait_for(
-                                                asyncio.shield(persist_task),
-                                                timeout=stall_interval,
-                                            )
-                                        else:
-                                            persisted_ok = await persist_task
-                                        break
-                                    except asyncio.TimeoutError:
-                                        logger.warning(
-                                            "Store persist still running: store=%s processed_in_batch=%s/%s overall=%s/%s",
-                                            seed.store_url,
-                                            processed_in_batch,
-                                            len(batch),
-                                            processed_count + processed_in_batch,
-                                            len(seeds),
+                            persist_task = asyncio.create_task(
+                                asyncio.to_thread(_persist_store_result, seed, outcome)
+                            )
+                            while True:
+                                try:
+                                    if stall_interval > 0:
+                                        persisted_ok = await asyncio.wait_for(
+                                            asyncio.shield(persist_task),
+                                            timeout=stall_interval,
                                         )
-
-                                if not persisted_ok:
-                                    error_message = "store_persist_failed"
+                                    else:
+                                        persisted_ok = await persist_task
                                     break
-                                # Reduce retained objects between streamed pages on large stores.
-                                gc.collect()
-                        except Exception as exc:
-                            persisted_ok = False
-                            error_message = str(exc)
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        "Store persist still running: store=%s", seed.store_url
+                                    )
+                            if not persisted_ok:
+                                error_message = "store_persist_failed"
+                                break
+                            gc.collect()
+                    except Exception as exc:  # noqa: BLE001
+                        persisted_ok = False
+                        error_message = str(exc)
 
-                        mark_status = getattr(repo, "mark_run_store_status", None)
-                        if callable(mark_status):
-                            if persisted_ok:
-                                mark_status(
-                                    run_id=resolved_run_id,
-                                    website=seed.store_url,
-                                    status="completed",
-                                )
-                            else:
-                                mark_status(
-                                    run_id=resolved_run_id,
-                                    website=seed.store_url,
-                                    status="failed",
-                                    error_message=error_message,
-                                )
+                    # Reconcile removals only when the store persisted OK AND
+                    # pagination reached the true end of the catalog. Reconcile
+                    # against catalog_ids (every still-listed apparel id, image-poor
+                    # ones included), NOT the persisted set — a product skipped for
+                    # the <2-images rule is still on the store, not delisted.
+                    if persisted_ok and page_state.get("complete"):
+                        await asyncio.to_thread(
+                            _reconcile_removed,
+                            seed.store_url,
+                            list(page_state.get("catalog_ids", set())),
+                        )
 
+                    mark_status = getattr(repo, "mark_run_store_status", None)
+                    if callable(mark_status):
                         if persisted_ok:
-                            success_in_batch += 1
+                            mark_status(
+                                run_id=resolved_run_id,
+                                website=seed.store_url,
+                                status="completed",
+                            )
+                        else:
+                            mark_status(
+                                run_id=resolved_run_id,
+                                website=seed.store_url,
+                                status="failed",
+                                error_message=error_message,
+                            )
 
-                    return processed_in_batch, success_in_batch
+                    done_counter[0] += 1
+                    print(
+                        f"  [{processed_count + done_counter[0]}/{len(seeds)}] "
+                        f"{seed.store_url.rstrip('/')} — "
+                        f"{'ok' if persisted_ok else 'FAILED'} "
+                        f"({len(seen_ids)} product id(s))",
+                        flush=True,
+                    )
+                    return persisted_ok
+
+                try:
+                    # The batch IS the concurrency unit: run_crawl sizes each batch to
+                    # the desired per-lane concurrency (small vs large stores), so
+                    # processing the whole batch at once = that many stores in parallel.
+                    # Safe because every Repository call opens its own connection.
+                    results = await asyncio.gather(
+                        *(_process_one_store(seed) for seed in batch),
+                        return_exceptions=True,
+                    )
+                    for seed, r in zip(batch, results):
+                        if isinstance(r, Exception):
+                            logger.warning("Store task crashed: %s (%s)", seed.store_url, r)
+                    return len(batch), sum(1 for r in results if r is True)
                 finally:
                     await fetcher.close()
 
@@ -2004,6 +2867,20 @@ def run_crawl(
                             processed_count + processed_in_batch,
                             len(seeds),
                         )
+
+                # Reconcile removals only when the store persisted OK and its
+                # scrape reached the true end of the catalog (outcome.products is
+                # not pruned in place); an incomplete scrape's absences aren't real.
+                if (
+                    persisted_ok
+                    and isinstance(outcome, ScrapeResult)
+                    and outcome.scrape_complete
+                ):
+                    await asyncio.to_thread(
+                        _reconcile_removed,
+                        seed.store_url,
+                        [p.product_id for p in outcome.products if p.product_id],
+                    )
 
                 mark_status = getattr(repo, "mark_run_store_status", None)
                 if callable(mark_status):
@@ -2044,20 +2921,54 @@ def run_crawl(
                     "Phase 2 startup: fetcher disk cache preserved "
                     f"files={cleared_disk_cache_files} dir={disk_cache_dir}"
                 )
+            if mark_removed:
+                print(
+                    "Note: --mark-removed is ignored for --phase 2 (staged data "
+                    "does not carry scrape completeness). Use --phase both or "
+                    "refresh-products to mark delisted products unavailable."
+                )
             _run_phase2()
         else:
-            # --phase both: existing single-phase pipeline unchanged.
-            for start in range(0, len(seeds), chunk_size):
-                batch = seeds[start : start + chunk_size]
-                processed_in_batch, success_in_batch = asyncio.run(
-                    _persist_batch_stream(batch)
+            # --phase both: two concurrent lanes so one giant store can't block the
+            # rest — small stores first (higher concurrency; they finish fast), then
+            # large stores (lower concurrency, gentler on the CDN). Each batch is
+            # processed concurrently by _persist_batch_stream, so batch size == that
+            # lane's concurrency.
+            small_conc = max(1, int(settings.crawl_small_store_concurrency))
+            large_conc = max(1, int(settings.crawl_large_store_concurrency))
+            small_seeds, large_seeds = _partition_seeds_by_size(
+                seeds, repo, max(1, int(settings.crawl_large_store_min_products))
+            )
+            print(
+                f"Starting crawl: {len(seeds)} store(s) | phase=both | "
+                f"mark_removed={mark_removed} | min_coverage={removed_min_coverage} | "
+                f"streaming={settings.store_page_streaming_enabled} | "
+                f"small={len(small_seeds)}@{small_conc} large={len(large_seeds)}@{large_conc}",
+                flush=True,
+            )
+            for lane_name, lane_seeds, conc in (
+                ("small", small_seeds, small_conc),
+                ("large", large_seeds, large_conc),
+            ):
+                if not lane_seeds:
+                    continue
+                print(
+                    f"--- lane={lane_name}: {len(lane_seeds)} store(s) at concurrency {conc} ---",
+                    flush=True,
                 )
-                processed_count += processed_in_batch
-                success_count += success_in_batch
+                for start in range(0, len(lane_seeds), conc):
+                    batch = lane_seeds[start : start + conc]
+                    processed_in_batch, success_in_batch = asyncio.run(
+                        _persist_batch_stream(batch)
+                    )
+                    processed_count += processed_in_batch
+                    success_count += success_in_batch
+                    print(f"Progress: persisted {processed_count}/{len(seeds)} stores", flush=True)
 
-                print(f"Progress: persisted {processed_count}/{len(seeds)} stores")
+            print(f"Crawled {success_count}/{len(seeds)} stores successfully", flush=True)
 
-            print(f"Crawled {success_count}/{len(seeds)} stores successfully")
+        if mark_removed:
+            print(f"Marked {removed_marked[0]} delisted product(s) unavailable.")
 
         count_status = getattr(repo, "count_run_store_status", None)
         if callable(count_status):
@@ -2268,6 +3179,21 @@ def main() -> int:
             dry_run=getattr(args, "dry_run", False),
         )
     if args.command == "crawl-stores":
+        # Shard from CLI flags, falling back to Cloud Run Jobs' per-task env vars
+        # so `--tasks N` automatically fans Phase 2 out into N disjoint shards.
+        shard_index = args.shard_index
+        if shard_index is None:
+            shard_index = int(os.environ.get("CLOUD_RUN_TASK_INDEX", "0") or 0)
+        shard_count = args.shard_count
+        if shard_count is None:
+            shard_count = int(os.environ.get("CLOUD_RUN_TASK_COUNT", "1") or 1)
+        if shard_count < 1:
+            shard_count = 1
+        if not (0 <= shard_index < shard_count):
+            raise SystemExit(
+                f"Invalid shard: index={shard_index} count={shard_count} "
+                f"(need 0 <= index < count)."
+            )
         return run_crawl(
             args.limit,
             run_id=args.run_id,
@@ -2275,11 +3201,43 @@ def main() -> int:
             phase=args.phase,
             skip_image_upload=args.skip_image_upload,
             csv_path=getattr(args, "csv", None),
+            shard_index=shard_index,
+            shard_count=shard_count,
+            mark_removed=getattr(args, "mark_removed", False),
+            removed_min_coverage=getattr(args, "min_coverage", 0.5),
         )
     if args.command == "rebuild-branches":
         return run_rebuild_branches(
             limit=getattr(args, "limit", None),
             skip_geocode=getattr(args, "skip_geocode", False),
+            include_missing=getattr(args, "include_missing", False),
+            domain_filter=getattr(args, "domain", None),
+            dry_run=getattr(args, "dry_run", False),
+        )
+    if args.command == "refresh-products":
+        return run_refresh_products(
+            limit=getattr(args, "limit", None),
+            domain_filter=getattr(args, "domain", None),
+            dry_run=getattr(args, "dry_run", False),
+            mark_removed=not getattr(args, "no_mark_removed", False),
+            min_coverage=getattr(args, "min_coverage", 0.5),
+        )
+    if args.command == "recapture-policies":
+        return run_recapture_policies(
+            limit=getattr(args, "limit", None),
+            domain_filter=getattr(args, "domain", None),
+            dry_run=getattr(args, "dry_run", False),
+            only_broken=getattr(args, "only_broken", False),
+            clear_unfixable=getattr(args, "clear_unfixable", False),
+        )
+    if args.command == "prune-stores":
+        return run_prune_stores(execute=getattr(args, "execute", False))
+    if args.command == "prune-nonfashion":
+        return run_prune_nonfashion(
+            limit=getattr(args, "limit", None),
+            batch_size=getattr(args, "batch_size", 500),
+            execute=getattr(args, "execute", False),
+            aggressive=getattr(args, "aggressive", False),
         )
 
     return 1

@@ -18,10 +18,18 @@ class Settings(BaseSettings):
     supabase_storage_bucket: str = Field(alias="SUPABASE_STORAGE_BUCKET")
     supabase_storage_path: str = Field(alias="SUPABASE_STORAGE_PATH")
 
+    # Direct Postgres connection string (psycopg). All table reads/writes go
+    # through this; the Supabase REST API is no longer used for table I/O.
+    database_url: str = Field(default="", alias="DATABASE_URL")
+    db_connect_timeout_sec: int = Field(default=10, alias="DB_CONNECT_TIMEOUT_SEC")
+
     persistence_target: str = Field(default="supabase", alias="PERSISTENCE_TARGET")
     local_output_path: str = Field(default="./out/scrape_results.json", alias="LOCAL_OUTPUT_PATH")
 
-    input_csv_path: str = Field(alias="INPUT_CSV_PATH")
+    # Folder holding the per-store TSV seed files. Every *.tsv in this directory
+    # is parsed and merged by url. Each row is: url \t store_name \t addr1 \t addr2 ...
+    input_tsv_dir: str = Field(default="./data/stores", alias="INPUT_TSV_DIR")
+    input_csv_path: str = Field(default="./data/stores.tsv", alias="INPUT_CSV_PATH")
     input_csv_has_header: bool = Field(default=True, alias="INPUT_CSV_HAS_HEADER")
     input_csv_url_column: str = Field(default="store_url", alias="INPUT_CSV_URL_COLUMN")
     input_csv_source_id_column: str = Field(default="source_id", alias="INPUT_CSV_SOURCE_ID_COLUMN")
@@ -34,7 +42,38 @@ class Settings(BaseSettings):
     crawl_global_qps: int = Field(default=8, alias="CRAWL_GLOBAL_QPS")
     crawl_request_timeout_sec: int = Field(default=25, alias="CRAWL_REQUEST_TIMEOUT_SEC")
     crawl_connect_timeout_sec: int = Field(default=10, alias="CRAWL_CONNECT_TIMEOUT_SEC")
+    # Hard wall-clock ceiling on a SINGLE http request. httpx's read timeout is
+    # per-read, so a server that slow-streams one byte at a time (a Cloudflare
+    # "Just a moment" interstitial) resets it forever and the request hangs
+    # indefinitely. This total ceiling cancels such a request and lets the crawl
+    # fall back / move on. Must be > crawl_request_timeout_sec.
+    crawl_request_total_timeout_sec: int = Field(
+        default=60, alias="CRAWL_REQUEST_TOTAL_TIMEOUT_SEC"
+    )
+    # The pre-crawl orphan-storage audit (see _run_orphan_preflight) walks the
+    # ENTIRE storage bucket via the Supabase Storage API before scraping starts,
+    # and then auto-deletes orphaned objects. On a large bucket this can take a
+    # very long time (or hang behind Cloudflare), wedging the whole crawl. Gate it
+    # so it can be skipped, and cap it so it can never block the crawl indefinitely.
+    crawl_orphan_preflight_enabled: bool = Field(
+        default=True, alias="CRAWL_ORPHAN_PREFLIGHT_ENABLED"
+    )
+    crawl_orphan_preflight_timeout_sec: int = Field(
+        default=120, alias="CRAWL_ORPHAN_PREFLIGHT_TIMEOUT_SEC"
+    )
+    # --phase both processes stores in two concurrent lanes so one giant store no
+    # longer blocks the rest: small stores first (higher concurrency, they finish
+    # fast), then large stores (lower concurrency to avoid multiplying CDN 429s).
+    # A store with >= crawl_large_store_min_products rows in the DB goes to the
+    # large lane. Safe to run concurrently because every Repository call opens its
+    # own connection; keep concurrency modest to stay under the pooler's limit.
+    crawl_small_store_concurrency: int = Field(default=5, alias="CRAWL_SMALL_STORE_CONCURRENCY")
+    crawl_large_store_concurrency: int = Field(default=3, alias="CRAWL_LARGE_STORE_CONCURRENCY")
+    crawl_large_store_min_products: int = Field(default=3000, alias="CRAWL_LARGE_STORE_MIN_PRODUCTS")
     crawl_http2_enabled: bool = Field(default=True, alias="CRAWL_HTTP2_ENABLED")
+    # Verify TLS certs on crawl fetches. Default True (secure); set CRAWL_SSL_VERIFY=false
+    # ONLY to scrape stores with broken/expired certs (skips MITM protection).
+    crawl_ssl_verify: bool = Field(default=True, alias="CRAWL_SSL_VERIFY")
     crawl_http_max_connections: int = Field(default=100, alias="CRAWL_HTTP_MAX_CONNECTIONS")
     crawl_http_max_keepalive_connections: int = Field(
         default=20,
@@ -65,8 +104,15 @@ class Settings(BaseSettings):
         alias="SHOPIFY_PRODUCTS_MAX_ITEMS_PER_STORE",
     )
 
+    # CLIP/SigLIP encoder used for product classification and gender scoring.
+    # Default is the fashion-specialized Marqo-FashionSigLIP (loaded via open_clip
+    # hf-hub). For a plain OpenCLIP checkpoint set CLIP_PRETRAINED too (e.g.
+    # CLIP_MODEL_NAME=ViT-B-32, CLIP_PRETRAINED=laion2b_s34b_b79k).
+    clip_model_name: str = Field(default="hf-hub:Marqo/marqo-fashionSigLIP", alias="CLIP_MODEL_NAME")
+    clip_pretrained: str = Field(default="", alias="CLIP_PRETRAINED")
+
     image_validation_enabled: bool = Field(default=True, alias="IMAGE_VALIDATION_ENABLED")
-    image_validation_concurrency: int = Field(default=4, alias="IMAGE_VALIDATION_CONCURRENCY")
+    image_validation_concurrency: int = Field(default=2, alias="IMAGE_VALIDATION_CONCURRENCY")
     image_validation_attempt_timeout_sec: float = Field(
         default=6.0,
         alias="IMAGE_VALIDATION_ATTEMPT_TIMEOUT_SEC",
@@ -80,13 +126,17 @@ class Settings(BaseSettings):
         alias="IMAGE_VALIDATION_QUEUE_MAX_RETRIES",
     )
     phase2_upload_concurrency: int = Field(default=8, alias="PHASE2_UPLOAD_CONCURRENCY")
+    # How many staged stores Phase 2 pools per batch. Image bytes are bounded by
+    # the chunk size + byte cache (not the batch), so a larger batch mainly keeps
+    # validation/upload saturated across store boundaries at a small metadata cost.
+    phase2_store_batch_size: int = Field(default=6, alias="PHASE2_STORE_BATCH_SIZE")
     phase2_db_upsert_batch_size: int = Field(default=500, alias="PHASE2_DB_UPSERT_BATCH_SIZE")
     image_validation_max_retries: int = Field(default=2, alias="IMAGE_VALIDATION_MAX_RETRIES")
     fetcher_byte_cache_max_mb: int = Field(default=256, alias="FETCHER_BYTE_CACHE_MAX_MB")
     fetcher_disk_cache_enabled: bool = Field(default=True, alias="FETCHER_DISK_CACHE_ENABLED")
     fetcher_disk_cache_dir: str = Field(default=".aisley_image_cache", alias="FETCHER_DISK_CACHE_DIR")
-    fetcher_disk_cache_max_mb: int = Field(default=2048, alias="FETCHER_DISK_CACHE_MAX_MB")
-    image_min_width: int = Field(default=650, alias="IMAGE_MIN_WIDTH")
+    fetcher_disk_cache_max_mb: int = Field(default=512, alias="FETCHER_DISK_CACHE_MAX_MB")
+    image_min_width: int = Field(default=600, alias="IMAGE_MIN_WIDTH")
     image_min_height: int = Field(default=800, alias="IMAGE_MIN_HEIGHT")
     postprocess_product_chunk_size: int = Field(
         default=200,
@@ -104,6 +154,12 @@ class Settings(BaseSettings):
         default=False,
         alias="PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY",
     )
+    # First-image product classifier samples up to this many lead images per
+    # item and keeps the item if ANY scores as a product photo (max over images).
+    product_validation_max_images: int = Field(
+        default=3,
+        alias="PRODUCT_VALIDATION_MAX_IMAGES",
+    )
     phase2_first_image_product_prob_threshold: float = Field(
         default=0.5,
         alias="PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD",
@@ -114,6 +170,18 @@ class Settings(BaseSettings):
 
     classify_require_ecom_signal: bool = Field(default=True, alias="CLASSIFY_REQUIRE_ECOM_SIGNAL")
 
+    # Set GEOCODING_ENABLED=false to skip branch-address geocoding (e.g. when
+    # re-running a store whose branches already have coordinates — the upsert
+    # preserves existing lat/long via coalesce, so no geocode call is needed).
+    geocoding_enabled: bool = Field(default=True, alias="GEOCODING_ENABLED")
+
+    # TSV-source-of-truth prune of stores not in any TSV (products cascade).
+    # Set PRUNE_NONTSV_STORES=false to never delete stores on a full crawl (e.g.
+    # a recovery re-scrape). PRUNE_MAX_STORES caps how many a single crawl may
+    # prune before it refuses — a guard against an incomplete TSV wiping the catalog.
+    prune_nontsv_stores: bool = Field(default=True, alias="PRUNE_NONTSV_STORES")
+    prune_max_stores: int = Field(default=25, alias="PRUNE_MAX_STORES")
+
     @field_validator(
         "crawl_global_concurrency",
         "crawl_store_batch_size",
@@ -123,7 +191,9 @@ class Settings(BaseSettings):
         "crawl_http_max_keepalive_connections",
         "image_validation_concurrency",
         "phase2_upload_concurrency",
+        "phase2_store_batch_size",
         "phase2_db_upsert_batch_size",
+        "product_validation_max_images",
     )
     @classmethod
     def positive_int(cls, value: int) -> int:

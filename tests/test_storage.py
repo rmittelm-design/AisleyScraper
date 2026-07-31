@@ -1,3 +1,4 @@
+import aisley_scraper.storage as storage_mod
 from aisley_scraper.config import Settings
 from aisley_scraper.storage import StorageUploader
 
@@ -13,43 +14,25 @@ def _settings() -> Settings:
     )
 
 
-def test_object_path_uses_env_prefix() -> None:
+def test_object_path_from_public_url_roundtrips() -> None:
     uploader = StorageUploader(_settings())
-    path = uploader._object_path(store_id=12, product_id="999", index=2, ext="jpg")
-    assert path == "aisley/12/999/2.jpg"
+    public = "https://x.supabase.co/storage/v1/object/public/product-images/aisley/12/999/2.jpg"
+    assert uploader._object_path_from_public_url(public) == "aisley/12/999/2.jpg"
 
 
-def test_public_url_uses_bucket_and_path() -> None:
+def test_object_path_from_public_url_ignores_non_supabase_urls() -> None:
     uploader = StorageUploader(_settings())
-    url = uploader._public_url("aisley/12/999/2.jpg")
-    assert url == "https://x.supabase.co/storage/v1/object/public/product-images/aisley/12/999/2.jpg"
+    # A Shopify CDN URL is not a Supabase storage object -> nothing to delete.
+    assert uploader._object_path_from_public_url("https://cdn.shopify.com/x.jpg") is None
 
 
-def test_sync_does_not_delete_before_upload_success(monkeypatch) -> None:
+def test_delete_images_noop_when_no_supabase_objects(monkeypatch) -> None:
     uploader = StorageUploader(_settings())
-    delete_calls: list[list[str]] = []
 
-    def _fake_delete_images(public_urls: list[str]) -> None:
-        delete_calls.append(list(public_urls))
+    class _BoomClient:
+        def __init__(self, *a, **k) -> None:
+            raise AssertionError("httpx.Client must not be created when there is nothing to delete")
 
-    def _fake_upload_image_from_url(image_url: str, store_id: int, product_id: str, index: int) -> str:
-        _ = (image_url, store_id, product_id, index)
-        raise RuntimeError("synthetic upload failure")
-
-    monkeypatch.setattr(uploader, "delete_images", _fake_delete_images)
-    monkeypatch.setattr(uploader, "upload_image_from_url", _fake_upload_image_from_url)
-
-    try:
-        uploader.sync_product_images(
-            current_source_urls=["https://cdn.example.com/new.jpg"],
-            existing_source_urls=["https://cdn.example.com/old.jpg"],
-            existing_supabase_urls=["https://x.supabase.co/storage/v1/object/public/product-images/aisley/1/p/1.jpg"],
-            store_id=1,
-            product_id="p",
-        )
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("expected sync_product_images to propagate upload failure")
-
-    assert delete_calls == []
+    monkeypatch.setattr(storage_mod.httpx, "Client", _BoomClient)
+    # All-foreign URLs resolve to zero object paths -> early return, no HTTP.
+    uploader.delete_images(["https://cdn.shopify.com/only-source.jpg"])

@@ -1,0 +1,25 @@
+# Keep the Cloud Build context small. The Dockerfile only COPYs:
+#   pyproject.toml README.md src/ data/stores/ cloud/
+# Everything else here is excluded from the upload.
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.env
+.env.*
+.aisley_image_cache/
+.aisley_active_run_id
+*.log
+.DS_Store
+**/.DS_Store
+.vscode/
+tests/
+scripts/
+# Loose data exports not needed in the image (only data/stores/ is COPYed).
+data/*.tsv
+data/*.numbers
+data/*.csv

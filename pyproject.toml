@@ -18,6 +18,10 @@ dependencies = [
   "opencv-python-headless>=4.10.0.84",
   "torch>=2.4.0",
   "open-clip-torch>=2.26.0",
+  # Required by Marqo-FashionSigLIP (open_clip hf-hub SigLIP checkpoint + tokenizer).
+  "transformers>=4.40.0",
+  "sentencepiece>=0.2.0",
+  "protobuf>=4.25.0",
   "google-cloud-vision>=3.8.0",
   "google-auth>=2.35.0",
   "geopy>=2.4.1",

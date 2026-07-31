@@ -1,6 +1,14 @@
 # Aisley Scraper
 
-Env-driven Shopify store scraper that ingests URLs from TSV and persists store + product data to Supabase Postgres.
+Env-driven Shopify store scraper that ingests store URLs from a folder of TSV files and persists store + product data **directly to Postgres** via `psycopg` (`DATABASE_URL`). Supabase is used only for image storage (Storage bucket), not for table reads/writes.
+
+Key behaviors:
+
+- **Direct-DB**: all `shopify_stores` / `shopify_products` (and staging / run-tracking) reads and writes use a raw Postgres connection — no Supabase REST/PostgREST.
+- **One folder of TSV seeds**: every `*.tsv` in `INPUT_TSV_DIR` (default `./data/stores`) is parsed and merged by url.
+- **Store branches**: each TSV row is `url <tab> store_name <tab> addr1 <tab> addr2 …`. Products are scraped once; one `shopify_stores` row is written per branch address (same url + name, each branch's own address + geocoded lat/long), and scraped products link to the **first** branch (third column). Online/address-less stores collapse to a single row.
+- **Non-apparel filtering**: scraped items are dropped when they match (a) kids/children terms — kid/child/boy/girl/toddler/baby/infant/newborn (aggressive substring on name/url/handle), or (b) non-apparel categories — furniture, boxes, pet/petwear, gift cards/cards, puzzles, sundries, bar goodies, candles, lighters, catchalls, books/coffee-table books, home décor, picture frames, serveware, soaps, diffusers, towels/tea towels, drinkware, beauty (perfume/serum/balm/etc.) (whole-word/phrase match on name/url/handle/product_type, so apparel like "spring", "cardigan", "petite" is preserved). **Jewelry and watches are intentionally kept.**
+- **Shipping/returns**: both a **return/refund policy** and a **shipping/delivery policy** are sought independently for each store (canonical Shopify `/policies/*`, common `/pages/*`, combined shipping+returns pages, then matching homepage links). Each is captured with its own length budget so one can't crowd out the other, and stored in `shopify_stores.shipping_returns` (labelled `RETURNS:` / `SHIPPING:` sections) and `shopify_stores.shipping_returns_url` (the page URL(s), `|`-joined).
 
 ## Quick start
 
@@ -22,20 +30,26 @@ cd /Users/ronimittelman/Desktop/Projects/Projects/AisleyScraper
 
 	This installs image-validation dependencies used at runtime, including:
 	`opencv-python-headless` (`cv2`) and `google-cloud-vision`.
-3. Run `aisley-scraper ingest-stores --csv ./data/NYC_stores.tsv`.
+3. Put your store TSV files in `INPUT_TSV_DIR` (default `./data/stores/`). Each row is
+   `url <tab> store_name <tab> addr1 <tab> addr2 …` (a bare-url row with no name/address is fine — the name is taken from the scraped homepage). The crawl reads **all** `*.tsv` in that folder and merges them by url.
 
-	Note: the CLI flag is still named `--csv` for backward compatibility, but the loader expects tab-delimited TSV input.
+	The standalone `ingest-stores --csv <path>` command still loads a single TSV file (the `--csv` flag name is kept for backward compatibility).
 4. Run `aisley-scraper crawl-stores`.
 
 If you are upgrading an existing deployment, apply migrations in order before crawling:
 
 - `supabase/migrations/20260313120000_add_crawl_store_runs.sql`
 - `supabase/migrations/20260314000000_add_staging_tables.sql`
+- `supabase/migrations/20260323160000_add_store_lat_long.sql`
+- `supabase/migrations/20260323170000_add_lat_long_to_stores_staging.sql`
+- `supabase/migrations/20260615120000_branch_stores_and_shipping_returns.sql` — drops the `website` unique constraint in favor of `unique(website, address)` and adds `shipping_returns` / `shipping_returns_url`.
+
+`crawl-stores` also calls `ensure_schema()` at startup, which applies these additive/idempotent changes automatically — but applying the migration explicitly is recommended for production.
 
 Restart behavior for `crawl-stores`:
 
-- Crawl source is DB-first: existing `shopify_stores` are processed first, then unseen TSV stores are appended.
-- Use `--csv <path>` with `crawl-stores` to run Phase 1 from that TSV only (no DB-first merge).
+- Crawl source is DB-first: existing `shopify_stores` are processed first, then unseen stores from the TSV folder are appended.
+- Use `--csv <path>` with `crawl-stores` to run Phase 1 from that single TSV only (no DB-first merge, no folder scan).
 - A run id is persisted in `.aisley_active_run_id` by default, so restarts resume from pending/failed stores in the same run.
 - Use `--fresh` to start a new run id.
 - Use `--run-id <id>` to explicitly resume a specific run.
@@ -83,7 +97,7 @@ aisley-scraper crawl-stores --skip-image-upload
 
 ## Two-Phase Pipeline (`--phase`)
 
-By default (`--phase both`) the scraper fetches, enriches (image validation + CLIP gender scoring), and writes to `shopify_stores` / `shopify_products` all in one pass per store.
+By default (`--phase both`) the scraper fetches, validates product images (fashion/non-fashion classifier), and writes to `shopify_stores` / `shopify_products` all in one pass per store. (CLIP gender scoring has been removed; `gender_probs_csv` is always `NULL`.)
 
 Image uploads are enabled by default in `--phase both` and `--phase 2`; use `--skip-image-upload` to disable uploads for that run.
 
@@ -94,8 +108,12 @@ The `--phase` flag splits this into two independent stages, which lets Phase 1 r
 Fetches product JSON from all stores and writes raw data to intermediate tables (`shopify_stores_staging`, `shopify_products_staging`). No images are uploaded, no CLIP scoring is performed, and `shopify_stores` / `shopify_products` are not touched. Each store is marked `scraped` in `crawl_store_runs` when done.
 
 Important: Phase 1 relies on each store exposing a public Shopify JSON endpoint at `/products.json`.
-If a site returns `404` or `410` for `/products.json`, that store is marked `failed` for the run and is not staged.
+If a site returns `404` or `410` for `/products.json` on the **first** page, that store is marked `failed` for the run and is not staged.
 This can happen even when the homepage URL opens normally in a browser.
+
+Pagination is resilient past page 1. If a store returns a `4xx`/non-JSON response at a **deep** page (some shops answer `400` past their last page instead of an empty list), or repeats the same products on every page, Phase 1 treats that as end-of-catalog: it stops paginating and keeps everything scraped so far instead of failing the whole store. Only a failure on page 1 fails the store.
+
+Broken/expired TLS certificates: set `CRAWL_SSL_VERIFY=false` to scrape stores whose certs fail verification (applies to the httpx clients, the curl fallback `-k`, and curl_cffi). Default is `true` (secure) — only disable it for a run that specifically targets known broken-cert stores, since it skips MITM protection for every fetch in that run.
 
 ```bash
 aisley-scraper crawl-stores --phase 1 --fresh
@@ -110,7 +128,7 @@ CRAWL_STORE_BATCH_SIZE=10
 
 ### Phase 2 — enrich and persist
 
-Reads each staged store from the staging tables, runs image validation and CLIP gender scoring (unless fast validation mode is enabled), then writes the enriched rows to `shopify_stores` and `shopify_products`. Staging rows are deleted after each successful store. The run id is read automatically from `.aisley_active_run_id` (written by Phase 1), or you can pass `--run-id` explicitly.
+Reads each staged store from the staging tables, runs image validation (fashion/non-fashion classifier), then writes the enriched rows to `shopify_stores` and `shopify_products`. Staging rows are deleted after each successful store. The run id is read automatically from `.aisley_active_run_id` (written by Phase 1), or you can pass `--run-id` explicitly.
 
 ```bash
 aisley-scraper crawl-stores --phase 2
@@ -141,19 +159,32 @@ PHASE2_DB_UPSERT_BATCH_SIZE=500
 POSTPROCESS_PRODUCT_CHUNK_SIZE=150
 ```
 
+#### Images validated per product (`PHASE2_MAX_IMAGES_PER_PRODUCT`)
+
+In full-enrich mode (`PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=false`), Phase 2 validates up to `PHASE2_MAX_IMAGES_PER_PRODUCT` lead images per product (default `5`) and keeps the product if **any** of them passes the classifier. Set `PHASE2_MAX_IMAGES_PER_PRODUCT=1` to validate only the first image (fastest; the trade-off is that a valid item with a non-product lead image — e.g. a size chart first — is dropped).
+
+Either way, the **full image gallery is restored** before the product is written to production. Validation only decides whether to keep the product; it never trims a kept product's `images`.
+
+A typical full-enrich run (non-default `.env` values made explicit):
+
+```bash
+PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=false \
+PHASE2_MAX_IMAGES_PER_PRODUCT=1 \
+FETCHER_DISK_CACHE_ENABLED=false \
+CRAWL_SSL_VERIFY=false \
+aisley-scraper crawl-stores --phase 2 --run-id <run-id>
+```
+
 #### Fast validation mode (`PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY`)
 
-By default Phase 2 runs full image validation (size, quality, sharpness, CLIP product check) on all images per product, then computes CLIP gender probabilities (`gender_probs_csv`). This can be slow under unstable CDN conditions.
+By default Phase 2 runs full image validation (size, quality, sharpness, CLIP product check) on all images per product. This can be slow under unstable CDN conditions.
 
 Set `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true` to enable a lightweight alternative:
 
-- Only the **first image** per product is fetched and checked.
-- The check is a single CLIP product-photo classifier against a configurable threshold (`PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD`, default `0.5`).
-- Products whose first image is clearly not a product photo (below threshold) are dropped; products with transient fetch/timeout failures are preserved.
-- Full image quality checks (blur, brightness, sharpness) and size checks are **skipped**.
-- **CLIP gender scoring is skipped entirely.** Products are persisted to `shopify_products` with `gender_probs_csv = NULL`.
-
-This mode is useful for a fast initial ingestion pass when gender scoring is not yet required.
+- The first **K** images per product are checked (`PRODUCT_VALIDATION_MAX_IMAGES`, default `3`); the item is kept if **any** scores as a product photo (max over images).
+- The check is the CLIP/SigLIP product-photo classifier against a configurable threshold (`PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD`).
+- Products whose sampled images are all clearly not product photos (below threshold) are dropped; products with transient fetch/timeout failures are preserved.
+- A lightweight size + blur gate is applied; full brightness/contrast checks are skipped.
 
 Relevant env settings:
 
@@ -202,16 +233,52 @@ FETCHER_BYTE_CACHE_MAX_MB=256
 - `FETCHER_DISK_CACHE_MAX_MB` sets a hard cap for the on-disk cache; oldest cached files are evicted once the directory exceeds this size.
 - Old cache files from prior runs are cleared automatically at crawl startup, and current-run cache files are deleted during normal batch cleanup.
 
-### Skip-upsert optimisation
+### Skip-validation optimisation
 
-Both `--phase both` and `--phase 2` skip the DB upsert for products whose images and gender scores have not changed since the last run — only metadata fields (price, availability, etc.) require a write when images are unchanged. This significantly reduces Supabase write traffic on re-crawls of large catalogs.
+On a re-crawl, products whose image URLs are unchanged since the last run skip the expensive step — image download and CLIP validation (`_needs_enrichment`) — **not** the DB write. Their scraped metadata (price, availability, description, sizes, etc.) is still upserted, so metadata stays current while unchanged-image products cost no image or CLIP work. On the product upsert only `gender_label` / `gender_probs_csv` are preserved (via `coalesce`); every other column is overwritten from the fresh scrape.
+
+### Refresh metadata only (`refresh-products`)
+
+To refresh metadata on **existing** `shopify_products` rows without any staging, image download, or CLIP, use:
+
+```bash
+aisley-scraper refresh-products --domain <domain>   # one store; omit --domain for all
+aisley-scraper refresh-products --domain <domain> --dry-run   # scrape + report, no writes
+```
+
+It re-scrapes each store's `products.json` (the same lightweight fetch as Phase 1) and updates only scraped metadata — `item_name`, `description`, `price_cents`, `unavailable`, `sizes`, `colors`, `brand`, `product_type`, `sku`, `product_handle`, `product_url`, `last_seen_at` — **in place**. It deliberately does **not** touch `images` / `supabase_images` (preserving the CLIP-validated set) or gender labels, and **never inserts**: a product not already in production is skipped, because a genuinely new item needs the full crawl's image validation. Use it to keep prices/availability/descriptions current far more cheaply than a full re-crawl.
+
+**Delisted products.** A production product that is **absent from the scrape** (removed from the store's catalog) is flagged `unavailable = true`. (A sold-out-but-still-listed item is handled separately — Shopify keeps it in `products.json` with `available:false`.) Two guards prevent a bad scrape from wrongly flagging a live catalog:
+
+1. **Completeness** — removal marking runs only when the scrape reached the *true end* of the catalog. If pagination stopped because of the per-store item cap, a fetch error, or an anomalous `200` that lacks a products array (a WAF/block), the scrape is treated as incomplete and marking is **skipped** — the un-scraped tail is not actually gone.
+2. **Coverage** — even on a complete scrape, if it re-found less than `--min-coverage` (default `0.5`) of the store's existing products, marking is skipped.
+
+A wrongly-flagged item also self-corrects on the next successful scrape (its refresh restores availability).
+
+```bash
+aisley-scraper refresh-products                      # all stores
+aisley-scraper refresh-products --dry-run            # all stores, report only
+aisley-scraper refresh-products --no-mark-removed    # metadata only; don't flag delisted
+aisley-scraper refresh-products --min-coverage 0.8   # stricter guard before flagging
+```
+
+**Full re-scrape + mark removed in one pass.** To *also add newly-listed products* (which need image validation) while flagging delisted ones, run the full crawl with `--mark-removed` — same two guards apply:
+
+```bash
+aisley-scraper crawl-stores --mark-removed                  # add new + update + flag delisted
+aisley-scraper crawl-stores --mark-removed --min-coverage 0.8
+```
+
+`--mark-removed` applies to `--phase both` (the live scrape); it is ignored for `--phase 2` because staged data does not record whether the Phase 1 scrape reached the end of the catalog.
 
 ### Staging tables
 
 | Table | Purpose |
 |---|---|
-| `shopify_stores_staging` | Raw store profile per `(run_id, website)` |
+| `shopify_stores_staging` | Raw store profile per `(run_id, website)`, including `shipping_returns` / `shipping_returns_url` |
 | `shopify_products_staging` | Raw product rows per `(run_id, website, product_id)` — no `supabase_images` or `gender_probs_csv` |
+
+Branch fan-out happens at Phase 2 (the production write), not in staging: staging holds one row per `(run_id, website)`, and Phase 2 reads the branch addresses from the TSV folder to create one `shopify_stores` row per branch.
 
 Staging rows are automatically removed after a successful Phase 2 persist, so they never accumulate across runs.
 
@@ -221,24 +288,27 @@ Update these required values in `.env`:
 
 Note: `.env.example` is only a template. Runtime values are loaded from `.env`.
 
-- `SUPABASE_URL`: your Supabase project URL (for example `https://xxxx.supabase.co`).
-- `SUPABASE_SERVICE_ROLE_KEY`: backend service role key (used for Storage uploads).
+- `DATABASE_URL`: **required.** Direct Postgres connection string used for all table reads/writes (e.g. `postgresql://postgres:PASSWORD@db.<ref>.supabase.co:5432/postgres?sslmode=require`). The password is embedded in this string — there is no separate password variable. For Supabase, copy it from Dashboard → Settings → Database (use the connection pooler host if the direct host is unreachable). The host is auto-pinned to IPv4 at connect time.
+- `DB_CONNECT_TIMEOUT_SEC` (optional): psycopg connect timeout in seconds. Default `10`.
+- `INPUT_TSV_DIR`: folder of per-store TSV seed files (all `*.tsv` merged by url). Default `./data/stores`.
+- `SUPABASE_URL`: your Supabase project URL — used **only** for Storage (image uploads), not table I/O.
+- `SUPABASE_SERVICE_ROLE_KEY`: service role key — used **only** for Storage uploads (this is *not* the database password).
 - `SUPABASE_STORAGE_BUCKET`: bucket name for uploaded product images.
 - `SUPABASE_STORAGE_PATH`: folder prefix inside the bucket (for example `aisley`).
-- `PERSISTENCE_TARGET`: `supabase` (default) or `local`.
+- `PERSISTENCE_TARGET`: `supabase` (default; direct-DB + Storage) or `local`.
 - `LOCAL_OUTPUT_PATH`: local JSON output path used when `PERSISTENCE_TARGET=local`.
-- `INPUT_CSV_PATH`: path to your input TSV file.
-- `USER_AGENT` (optional): crawler user agent with contact info. If unset, the crawler uses a browser-like default user agent.
+- `INPUT_CSV_PATH` (optional): single TSV file used only by `ingest-stores` and the `--csv` override; the crawl uses `INPUT_TSV_DIR`.
 - `USER_AGENT` (optional): crawler user agent with contact info. If unset, the crawler uses a browser-like default user agent.
 
 Recommended preflight checks:
 
+- Ensure `DATABASE_URL` points at a reachable Postgres and that the schema migrations are applied (or rely on the automatic `ensure_schema()` at crawl startup).
 - Ensure the storage bucket exists in Supabase and is readable if you plan to use public URLs.
-- Ensure your TSV has `url` as the first column (or as a header column if `INPUT_CSV_HAS_HEADER=true`).
+- Place your store TSV files in `INPUT_TSV_DIR`. Each row's first column is the store url; an optional second column is the store name; columns 3+ are branch addresses (one `shopify_stores` row is created per branch).
 - Optionally tune crawl parameters (`CRAWL_GLOBAL_CONCURRENCY`, `CRAWL_STORE_BATCH_SIZE`, `CRAWL_GLOBAL_QPS`) before large runs.
 - Default concurrency is conservative for long-run stability: `CRAWL_GLOBAL_CONCURRENCY=15`, `CRAWL_STORE_BATCH_SIZE=3`, `IMAGE_VALIDATION_CONCURRENCY=4`.
 - If the OS kills the process during heavy runs, try `CRAWL_STORE_BATCH_SIZE=1`, `CRAWL_GLOBAL_CONCURRENCY=2`, and `IMAGE_VALIDATION_CONCURRENCY=1`.
-- For very large catalogs, lower `POSTPROCESS_PRODUCT_CHUNK_SIZE` (default `200`) to bound peak memory during image verification and gender enrichment batches.
+- For very large catalogs, lower `POSTPROCESS_PRODUCT_CHUNK_SIZE` (default `200`) to bound peak memory during image verification batches.
 - Optional: set `CRAWL_RUN_STATE_PATH` to change where the active run id is stored (default `.aisley_active_run_id`).
 - Optional: set `CRAWL_STALL_LOG_INTERVAL_SEC` (default `60`) to control how often long-running crawl/persist heartbeat warnings are printed; set `0` to disable.
 - Optional: set `FETCHER_DISK_CACHE_ENABLED` to enable or disable the temporary on-disk image cache used during validation/upload reuse. Default is `true`.
@@ -246,11 +316,11 @@ Recommended preflight checks:
 - Optional: set `FETCHER_DISK_CACHE_MAX_MB` to cap total on-disk cached image bytes before oldest files are evicted. Default is `2048`.
 - Optional: set `FETCHER_BYTE_CACHE_MAX_MB` to cap the in-memory portion of the fetch cache. Default is `256`.
 - Optional: set `PHASE2_UPLOAD_CONCURRENCY` to control Stage 3 upload/sync parallelism in `--phase 2`. Default is `8`.
-- Optional: set `PHASE2_DB_UPSERT_BATCH_SIZE` to control how many products are upserted per Supabase REST request in Phase 2 Stage 3. Default is `500`.
-- Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true` to skip full image quality checks and gender scoring in Phase 2, checking only whether the first product image looks like a product photo. Products are persisted with `gender_probs_csv = NULL`. Default is `false`.
+- Optional: set `PHASE2_DB_UPSERT_BATCH_SIZE` to control how many products are upserted per batched Postgres `executemany` in Phase 2 Stage 3. Default is `500`.
+- Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true` to skip full image quality checks in Phase 2, checking only whether the first few product images look like a product photo (kept if any does). Default is `false`. Tune `PRODUCT_VALIDATION_MAX_IMAGES` (default `3`) for how many lead images are sampled.
 - Optional: set `PHASE2_FIRST_IMAGE_PRODUCT_PROB_THRESHOLD` to control the minimum CLIP product-photo probability required when `PHASE2_FIRST_IMAGE_PRODUCT_VALIDATION_ONLY=true`. Products below this threshold are dropped. Must be in `[0, 1]`. Default is `0.5` (current recommended runtime value: `0.90`).
 - Optional: set `HF_TOKEN` to authenticate Hugging Face model downloads (higher limits, fewer unauthenticated warnings).
-- Writes use Supabase REST (`/rest/v1`) with `SUPABASE_SERVICE_ROLE_KEY`.
+- Table reads/writes go directly to Postgres (`DATABASE_URL`) via `psycopg`; `SUPABASE_*` is used only for image Storage.
 
 Local mode notes:
 
@@ -357,6 +427,19 @@ IMAGE_VALIDATION_CONCURRENCY=1
 - Running `aisley-scraper crawl-stores` (without `--fresh`) resumes from pending/failed stores in the active run id.
 - Use `--fresh` only when you intentionally want to start a new run id.
 
+### Phase 2 stalls / `ECHECKOUTTIMEOUT` / `get_staged_store … froze (>25s)`
+
+On a long Phase 2 run against a **cross-region** Supabase pooler, reads can intermittently freeze: the pooler stops responding and connections can't be checked out (`psycopg.errors.InternalError_: (ECHECKOUTTIMEOUT) unable to check out connection from the pool`), and stores fail with `Phase 2 stage 1 failed … get_staged_store[…] froze (>25s)`. The process can sit at 0% CPU, stalled. This is a pooler/network issue, not a data problem — finished stores are already committed.
+
+Mitigations:
+
+- **Re-run.** Phase 2 is idempotent and per-store: staging rows are deleted as each store completes. Stop the stalled run and re-run the same `--phase 2 --run-id <id>`; it processes only the stores still in staging, chipping away across runs. `stores still staged = 0` means done.
+- **Don't poll the DB concurrently.** A separate `while true` count loop competes for the same connection pool and can starve the run (and itself hit `ECHECKOUTTIMEOUT`). Watch the run's log instead.
+- **Reduce pool pressure** with a smaller `PHASE2_STORE_BATCH_SIZE` (fewer concurrent DB connections).
+- **Avoid the cross-region pooler for big runs:** run from a machine in the DB's region, or use the direct (non-pooler) connection. Writes don't freeze — only reads do.
+
+Tip: when piping output through `tee`, Python block-buffers stdout, so the progress `print()`s (store count, `validation chunk X/Y`) lag behind the `stderr` log lines. Prepend `PYTHONUNBUFFERED=1` and/or send logs to a file (`… 2> run.log`) to see clean, live progress.
+
 ### `Phase 2: no staged websites to process`
 
 This means the selected run id has no rows left in `shopify_stores_staging`.
@@ -386,9 +469,9 @@ When this number is below the TSV row count, check run status counts:
 ```bash
 python - <<'PY'
 from aisley_scraper.config import get_settings
-from aisley_scraper.db.supabase_rest_repository import SupabaseRestRepository
+from aisley_scraper.db.repository import Repository
 
-repo = SupabaseRestRepository(get_settings())
+repo = Repository(get_settings())
 run_id = "<run-id>"
 for status in ["pending", "scraped", "failed", "completed"]:
 	print(status, repo.count_run_store_status(run_id=run_id, status=status))
@@ -405,8 +488,12 @@ If you need all rows to stage, remove known non-`/products.json` domains from th
 
 ## Requirements handled
 
-- Store profile extraction: store name, website, instagram (online), or address (offline).
+- Store profile extraction: store name (from the TSV, or the scraped homepage `<title>` when the TSV omits it), website, instagram (online), or address (offline).
+- Store branches: one `shopify_stores` row per branch address from the TSV (same url + name, each with its own address and geocoded `lat`/`long`); products are scraped once and linked to the first branch.
+- Shipping/returns capture: both the return/refund policy and the shipping/delivery policy are located independently (Shopify `/policies/*`, common `/pages/*`, combined pages, homepage links) and stored in `shopify_stores.shipping_returns` (labelled `RETURNS:`/`SHIPPING:` sections, each length-capped) and `shopify_stores.shipping_returns_url` (`|`-joined source urls).
 - Product extraction: item name, description, `sku`, `price_cents` (integer), `updated_at`, images, sizes/colors/brand only when explicitly present and associated with product image context.
 - Product extraction also includes `gender_label` (`male` / `female` / `unisex`) only when explicitly present in scraped product data.
+- Kids/children exclusion: items whose name/url/handle contain kid/child/boy/girl/toddler/baby/infant/newborn are dropped (aggressive substring match).
+- Non-apparel category exclusion: items matching furniture, boxes, pet/petwear, gift cards/cards, puzzles, sundries, bar goodies, candles, lighters, catchalls, books, home décor, picture frames, serveware, soaps, diffusers, towels, drinkware, and beauty/personal-care (perfume, serum, balm, shampoo, etc.) are dropped via whole-word/phrase matching on name/url/handle/product_type — so apparel terms that merely contain those substrings (cardigan, spring, petite, herringbone, box pleat) are preserved. Jewelry and watches are intentionally NOT filtered (kept).
 - Image persistence: scraped source image URLs are kept in `products.images`. `products.supabase_images` is populated during Phase 2 unless `--skip-image-upload` is used.
-- Supabase persistence with idempotent upserts.
+- Direct Postgres persistence (`psycopg`, `DATABASE_URL`) with idempotent upserts; Supabase used only for image Storage.

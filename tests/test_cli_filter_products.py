@@ -94,7 +94,7 @@ def test_filter_shopify_products_deletes_only_low_score_rows(monkeypatch) -> Non
         return True, None, 0.88
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
-    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
+    monkeypatch.setattr(cli, "Repository", _FakeRepo)
     monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
     monkeypatch.setattr(
         cli,
@@ -124,7 +124,7 @@ def test_filter_shopify_products_matches_phase2_hard_failure_drop(monkeypatch) -
         return True, "fetch_error", None
 
     monkeypatch.setattr(cli, "get_settings", lambda: settings)
-    monkeypatch.setattr(cli, "SupabaseRestRepository", _FakeRepo)
+    monkeypatch.setattr(cli, "Repository", _FakeRepo)
     monkeypatch.setattr(cli, "Fetcher", _FakeFetcher)
     monkeypatch.setattr(
         cli,

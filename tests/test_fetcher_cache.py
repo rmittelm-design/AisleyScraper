@@ -8,9 +8,8 @@ from aisley_scraper.config import Settings
 from aisley_scraper.crawl.fetcher import Fetcher
 
 
-def test_fetcher_preserves_disk_cache_on_memory_clear_and_close(tmp_path) -> None:
-    cache_dir = tmp_path / "cache"
-    settings = Settings(
+def _disk_cache_settings(cache_dir) -> Settings:
+    return Settings(
         LOG_LEVEL="INFO",
         SUPABASE_URL="https://x.supabase.co",
         SUPABASE_SERVICE_ROLE_KEY="key",
@@ -24,7 +23,10 @@ def test_fetcher_preserves_disk_cache_on_memory_clear_and_close(tmp_path) -> Non
         FETCHER_BYTE_CACHE_MAX_MB=10,
     )
 
-    fetcher = Fetcher(settings)
+
+def test_fetcher_can_preserve_disk_cache_on_close_when_requested(tmp_path) -> None:
+    cache_dir = tmp_path / "cache"
+    fetcher = Fetcher(_disk_cache_settings(cache_dir))
     url = "https://cdn.example.com/example.jpg"
     content = b"example-bytes"
 
@@ -37,9 +39,102 @@ def test_fetcher_preserves_disk_cache_on_memory_clear_and_close(tmp_path) -> Non
     assert cached == content
     assert list(cache_dir.glob("*.img"))
 
-    asyncio.run(fetcher.close())
+    # Opt-out keeps the disk cache for a subsequent fetcher in the same process.
+    asyncio.run(fetcher.close(clear_disk_cache=False))
 
     assert list(cache_dir.glob("*.img"))
+
+
+def test_fetcher_clears_disk_cache_on_close_by_default(tmp_path) -> None:
+    cache_dir = tmp_path / "cache"
+    fetcher = Fetcher(_disk_cache_settings(cache_dir))
+
+    fetcher._write_disk_cache("https://cdn.example.com/a.jpg", b"aaaa")
+    fetcher._write_disk_cache("https://cdn.example.com/b.jpg", b"bbbb")
+    assert list(cache_dir.glob("*.img"))
+
+    # Default teardown reclaims the disk so the cache doesn't linger between runs.
+    asyncio.run(fetcher.close())
+
+    assert not list(cache_dir.glob("*.img"))
+    assert fetcher._disk_cache_size == 0
+
+
+def test_disk_cache_evicts_to_low_water_and_tracks_size(tmp_path) -> None:
+    cache_dir = tmp_path / "cache"
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        FETCHER_DISK_CACHE_ENABLED=True,
+        FETCHER_DISK_CACHE_DIR=str(cache_dir),
+        FETCHER_BYTE_CACHE_MAX_MB=10,
+    )
+
+    fetcher = Fetcher(settings)
+    # Shrink the cap to byte scale so we can exercise eviction cheaply.
+    fetcher._disk_cache_max_bytes = 1000
+    payload = b"x" * 200
+
+    for i in range(20):
+        fetcher._write_disk_cache(f"https://cdn.example.com/{i}.jpg", payload)
+
+    on_disk = sum(p.stat().st_size for p in cache_dir.glob("*.img"))
+    # Never exceeds the cap, and eviction trims down to ~80% (the low-water mark)
+    # rather than scanning + deleting on every single write.
+    assert on_disk <= 1000
+    assert on_disk <= int(1000 * 0.8) + len(payload)
+    # The running counter stays in sync with what is actually on disk.
+    assert fetcher._disk_cache_size == on_disk
+
+
+def test_disk_cache_write_recreates_vanished_dir(tmp_path) -> None:
+    import shutil
+
+    cache_dir = tmp_path / "cache"
+    fetcher = Fetcher(_disk_cache_settings(cache_dir))
+
+    # Simulate the cache dir being cleared out mid-run (a sibling run's startup
+    # cleanup, or iCloud/Dropbox sync) — the old code raised ENOENT on rename.
+    shutil.rmtree(cache_dir)
+    assert not cache_dir.exists()
+
+    fetcher._write_disk_cache("https://cdn.example.com/x.jpg", b"data")
+
+    assert list(cache_dir.glob("*.img"))
+    assert fetcher._disk_cache_size == len(b"data")
+
+
+def test_disk_cache_write_survives_full_disk(tmp_path, monkeypatch) -> None:
+    cache_dir = tmp_path / "cache"
+    settings = Settings(
+        LOG_LEVEL="INFO",
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        PERSISTENCE_TARGET="supabase",
+        FETCHER_DISK_CACHE_ENABLED=True,
+        FETCHER_DISK_CACHE_DIR=str(cache_dir),
+        FETCHER_BYTE_CACHE_MAX_MB=10,
+    )
+    fetcher = Fetcher(settings)
+
+    from pathlib import Path
+
+    def _raise_enospc(self, _data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Path, "write_bytes", _raise_enospc)
+
+    # Must not raise — a full disk should degrade to memory-only caching.
+    fetcher._write_disk_cache("https://cdn.example.com/a.jpg", b"data")
+    assert fetcher._disk_cache_size == 0
 
 
 def test_fetcher_defaults_to_browser_user_agent_when_user_agent_is_empty() -> None:

@@ -7,8 +7,8 @@ from collections.abc import AsyncIterator
 from aisley_scraper.config import Settings
 from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.image_verifier import verify_product_images
+from aisley_scraper.extract.policies import fetch_shipping_returns
 from aisley_scraper.extract.shopify_products import extract_products_from_products_json
-from aisley_scraper.gender_probs import enrich_gender_probabilities_for_products
 from aisley_scraper.extract.store_profile import classify_store
 from aisley_scraper.models import ProductRecord, ScrapeResult, StoreSeed
 from aisley_scraper.normalize.products import normalize_product
@@ -25,44 +25,111 @@ def _apply_seed_store_metadata(store, seed: StoreSeed):
     return store
 
 
+async def _attach_shipping_returns(store, base: str, fetcher: Fetcher, settings: Settings, homepage_html: str | None) -> None:
+    """Best-effort capture of the store's returns/shipping policy text + url."""
+    try:
+        text, url = await fetch_shipping_returns(
+            base, fetcher, settings, homepage_html=homepage_html
+        )
+        store.shipping_returns = text
+        store.shipping_returns_url = url
+    except Exception as exc:
+        logger.warning("Failed to capture shipping/returns for %s: %s", base, exc)
+
+
 async def _fetch_all_products(
     *,
     base: str,
     settings: Settings,
     fetcher: Fetcher,
-) -> list[ProductRecord]:
+) -> tuple[list[ProductRecord], bool]:
+    """Return ``(kept_products, catalog_complete)``.
+
+    ``catalog_complete`` is True only when pagination reached a genuine end of
+    the catalog — a well-formed products.json with an explicitly-empty products
+    list, or a store that repeats pages (all unique products already seen). It
+    is False when pagination stopped for any reason that leaves an unknown tail:
+    a fetch error mid-run, the per-store item cap, an anomalous 200 lacking a
+    products array (a WAF/block), or exhausting max_pages. Callers must NOT
+    reconcile removals (mark absent products unavailable) on an incomplete
+    scrape — the un-scraped tail is not actually gone.
+    """
     page_limit = max(1, settings.shopify_products_page_limit)
     max_pages = max(1, settings.shopify_products_max_pages)
     max_items_per_store = max(0, settings.shopify_products_max_items_per_store)
 
-    all_products: list[ProductRecord] = []
+    # Returns products that PASS filtering (kids/non-apparel/cosmetics + the
+    # min-images rule). The per-store cap counts only these kept products, so
+    # filtered-out items don't consume the budget — i.e. the cutoff is applied
+    # AFTER filtering. CLIP image validation runs later and may reduce further.
+    kept: list[ProductRecord] = []
     seen_product_ids: set[str] = set()
+    complete = False
 
     for page in range(1, max_pages + 1):
         products_url = f"{base}/products.json?limit={page_limit}&page={page}"
-        payload = await fetcher.get_json(products_url)
+        try:
+            payload = await fetcher.get_json(products_url)
+        except Exception as exc:  # noqa: BLE001 - end-of-catalog, keep what we have
+            # Some stores return a 4xx (or non-JSON) PAST their last page instead of
+            # an empty list, and a few rate-limit deep pagination. Treat that as the
+            # end of the catalog and keep whatever we've already scraped rather than
+            # failing the entire store (which previously dropped big shops like
+            # kith/feature/charmingcharlie that 400'd at a deep page).
+            if page == 1:
+                raise  # genuine failure on the first page -> let the store fail
+            logger.warning(
+                "Stopping pagination for %s at page %s (%s); keeping %s products so far",
+                base,
+                page,
+                exc,
+                len(kept),
+            )
+            break
         extracted = extract_products_from_products_json(payload, settings, base_url=base)
 
+        new_this_page = 0
         for product in extracted:
             if product.product_id in seen_product_ids:
                 continue
+            new_this_page += 1
             seen_product_ids.add(product.product_id)
-            all_products.append(product)
+            normalized = normalize_product(product)
+            if normalized is None:
+                continue
+            kept.append(normalized)
 
-            if max_items_per_store > 0 and len(all_products) >= max_items_per_store:
+            if max_items_per_store > 0 and len(kept) >= max_items_per_store:
                 logger.warning(
-                    "Reached per-store product cap for %s: collected=%s cap=%s",
+                    "Reached per-store product cap (after filtering) for %s: kept=%s cap=%s",
                     base,
-                    len(all_products),
+                    len(kept),
                     max_items_per_store,
                 )
-                return all_products
+                # Truncated by the cap -> catalog is NOT fully known.
+                return kept, False
 
         products_raw = payload.get("products", []) if isinstance(payload, dict) else []
         if not isinstance(products_raw, list) or not products_raw:
+            # Genuine end only when the response is a well-formed products.json
+            # with an explicitly-empty list. A 200 lacking the key (block/anomaly)
+            # is NOT a real end, so leave complete=False.
+            if isinstance(payload, dict) and "products" in payload:
+                complete = True
+            break
+        # Some stores ignore the ?page param and return the SAME products on every
+        # page; without this guard they'd paginate to max_pages (or until a 4xx).
+        # Stop once a page contributes no new product ids.
+        if new_this_page == 0:
+            logger.warning(
+                "No new products on page %s for %s; stopping (store repeats pages)",
+                page,
+                base,
+            )
+            complete = True
             break
 
-    return all_products
+    return kept, complete
 
 
 async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) -> ScrapeResult:
@@ -70,17 +137,15 @@ async def scrape_store(seed: StoreSeed, settings: Settings, fetcher: Fetcher) ->
     homepage = await fetcher.get_text(base)
     store = classify_store(homepage, base, settings)
     store = _apply_seed_store_metadata(store, seed)
+    await _attach_shipping_returns(store, base, fetcher, settings, homepage)
 
-    extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
-    await verify_product_images(products=extracted, fetcher=fetcher, settings=settings)
-    await enrich_gender_probabilities_for_products(
-        products=extracted,
-        fetcher=fetcher,
-        concurrency=settings.image_validation_concurrency,
-    )
-    products = [normalized for p in extracted if p.images if (normalized := normalize_product(p)) is not None]
+    # _fetch_all_products already returns filtered + capped products.
+    products, complete = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
+    # CLIP image validation trims each product's images to validated ones and
+    # drops products left with none (mutates the list in place).
+    await verify_product_images(products=products, fetcher=fetcher, settings=settings)
 
-    return ScrapeResult(store=store, products=products)
+    return ScrapeResult(store=store, products=products, scrape_complete=complete)
 
 
 async def scrape_many(seeds: list[StoreSeed], settings: Settings) -> list[tuple[StoreSeed, ScrapeResult | Exception]]:
@@ -116,10 +181,16 @@ async def scrape_many_stream(
                 homepage = await fetcher.get_text(base)
                 store = classify_store(homepage, base, settings)
                 store = _apply_seed_store_metadata(store, seed)
+                await _attach_shipping_returns(store, base, fetcher, settings, homepage)
 
-                extracted = await _fetch_all_products(base=base, settings=settings, fetcher=fetcher)
-                products = [normalized for p in extracted if p.images if (normalized := normalize_product(p)) is not None]
-                return seed, ScrapeResult(store=store, products=products)
+                # _fetch_all_products already returns filtered + capped products
+                # (image validation is deferred to phase 2 in this path).
+                products, complete = await _fetch_all_products(
+                    base=base, settings=settings, fetcher=fetcher
+                )
+                return seed, ScrapeResult(
+                    store=store, products=products, scrape_complete=complete
+                )
             except Exception as exc:
                 return seed, exc
 

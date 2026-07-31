@@ -114,7 +114,9 @@ def test_verify_product_images_drops_products_on_hard_validation_failures(monkey
     assert products == []
 
 
-def test_verify_first_image_product_validation_uses_first_image_only(monkeypatch) -> None:
+def test_verify_first_image_product_validation_keeps_if_any_sampled_image_passes(monkeypatch) -> None:
+    # A non-product lead image must NOT drop the item when a later sampled image
+    # is a valid product photo (max-over-images).
     called_urls: list[str] = []
 
     class _FakeFetcher:
@@ -122,12 +124,14 @@ def test_verify_first_image_product_validation_uses_first_image_only(monkeypatch
             called_urls.append(image_url)
             return image_url.encode("utf-8")
 
-    def _fake_validate_product_photo_only(*, content: bytes, filename: str, min_product_prob: float):
+    def _fake_validate_product_photo_only(
+        *, content: bytes, filename: str, min_product_prob: float, **_kwargs
+    ):
         _ = (filename, min_product_prob)
         text = content.decode("utf-8")
         if text.endswith("first.jpg"):
             raise image_verifier.ImageValidationFailure("not_a_product_photo", "not product")
-        return {"ok": True}
+        return {"ok": True, "product": {"product_prob": 0.97}}
 
     monkeypatch.setattr(image_verifier, "validate_product_photo_only", _fake_validate_product_photo_only)
 
@@ -149,8 +153,48 @@ def test_verify_first_image_product_validation_uses_first_image_only(monkeypatch
         )
     )
 
+    # Item kept (second image passed); both lead images were sampled.
+    assert len(products) == 1
+    assert called_urls == [
+        "https://cdn.example.com/first.jpg",
+        "https://cdn.example.com/second.jpg",
+    ]
+
+
+def test_verify_first_image_product_validation_drops_only_when_all_sampled_fail(monkeypatch) -> None:
+    class _FakeFetcher:
+        async def get_bytes(self, image_url: str) -> bytes:
+            return image_url.encode("utf-8")
+
+    def _fake_validate_product_photo_only(
+        *, content: bytes, filename: str, min_product_prob: float, **_kwargs
+    ):
+        _ = (content, filename, min_product_prob)
+        raise image_verifier.ImageValidationFailure(
+            "not_a_product_photo", "not product", {"product_prob": 0.2}
+        )
+
+    monkeypatch.setattr(image_verifier, "validate_product_photo_only", _fake_validate_product_photo_only)
+
+    products = [
+        ProductRecord(
+            product_id="1",
+            product_handle="a",
+            item_name="A",
+            description=None,
+            images=["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
+        )
+    ]
+
+    asyncio.run(
+        image_verifier.verify_first_image_product_validation(
+            products=products,
+            fetcher=_FakeFetcher(),
+            settings=_settings(),
+        )
+    )
+
     assert products == []
-    assert called_urls == ["https://cdn.example.com/first.jpg"]
 
 
 def test_verify_first_image_product_validation_preserves_on_timeout(monkeypatch) -> None:
@@ -159,7 +203,9 @@ def test_verify_first_image_product_validation_preserves_on_timeout(monkeypatch)
             _ = image_url
             raise asyncio.TimeoutError()
 
-    def _fake_validate_product_photo_only(*, content: bytes, filename: str, min_product_prob: float):
+    def _fake_validate_product_photo_only(
+        *, content: bytes, filename: str, min_product_prob: float, **_kwargs
+    ):
         _ = (content, filename, min_product_prob)
         return {"ok": True}
 

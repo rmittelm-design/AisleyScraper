@@ -26,6 +26,39 @@ def canonical_website(url: str) -> str:
     return f"https://{domain}" if domain else (url or "").strip()
 
 
+def _removal_plan(
+    *,
+    scraped_count: int,
+    production_count: int,
+    matched_count: int,
+    missing: list[str],
+    available_ids: set[str],
+    min_coverage: float,
+) -> tuple[list[str], str | None]:
+    """Decide which delisted products to flag ``unavailable`` (pure, no DB).
+
+    Shared by ``refresh-products`` and the full crawl so the safety guard has a
+    single definition. Returns ``(to_flag, skip_reason)``:
+
+    - Nothing missing -> nothing to do.
+    - Scrape returned no products -> skip (a bot-block/error, not an empty store).
+    - Scrape re-found less than ``min_coverage`` of production -> skip (likely a
+      partial/blocked fetch; flagging would wrongly mark much of the catalog).
+    - Otherwise flag the missing products that are currently available.
+    """
+    if not missing:
+        return [], None
+    if scraped_count == 0:
+        return [], "scrape returned no products"
+    if production_count and (matched_count / production_count) < min_coverage:
+        pct = matched_count / production_count
+        return [], (
+            f"scrape covered {pct:.0%} of catalog "
+            f"(< {min_coverage:.0%}); likely partial/blocked"
+        )
+    return [pid for pid in missing if pid in available_ids], None
+
+
 class Repository:
     """Direct Postgres (psycopg) repository.
 
@@ -55,6 +88,17 @@ class Repository:
             force_ipv4_conninfo(self._dsn),
             prepare_threshold=None,
             connect_timeout=self._connect_timeout,
+            # Cross-region (residential -> Supabase pooler) connections can freeze
+            # mid-scan: the socket stays "open" but no data flows and the read
+            # blocks forever (0% CPU). TCP keepalives + tcp_user_timeout make the
+            # OS surface a frozen/dead path as an OperationalError within ~30s, so
+            # callers can reconnect and resume instead of wedging. These fire only
+            # on an unresponsive path, never on a slow-but-live query.
+            keepalives=1,
+            keepalives_idle=15,
+            keepalives_interval=5,
+            keepalives_count=3,
+            tcp_user_timeout=30000,
         )
 
     # ── Schema ────────────────────────────────────────────────────────────────
@@ -506,6 +550,63 @@ class Repository:
             )
         return profiles
 
+    def update_store_policies(
+        self, website: str, shipping_returns: str | None, shipping_returns_url: str | None
+    ) -> int:
+        """Set shipping_returns/url on EVERY row of this website's domain.
+
+        Branch rows share one store's policy, so all of a domain's rows are
+        written together. Matched by www/scheme-insensitive domain (like
+        ``sync_store_branches``) so http/https/www variants are all updated.
+        Returns the number of rows written.
+        """
+        domain = _domain_key(website)
+        if not domain:
+            return 0
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select id, website from shopify_stores where website ilike %s;",
+                    (f"%{domain}%",),
+                )
+                ids = [int(sid) for sid, site in cur.fetchall() if _domain_key(site) == domain]
+                if not ids:
+                    return 0
+                cur.execute(
+                    "update shopify_stores set shipping_returns = %s, "
+                    "shipping_returns_url = %s where id = any(%s);",
+                    (shipping_returns, shipping_returns_url, ids),
+                )
+                written = cur.rowcount
+            conn.commit()
+        return int(written)
+
+    def delete_stores_not_in_domains(self, keep_domains: set[str]) -> tuple[int, list[str]]:
+        """Delete every ``shopify_stores`` row whose www/scheme-insensitive domain
+        is NOT in ``keep_domains`` (the TSV is the source of truth). Products
+        cascade via the FK. Returns ``(rows_deleted, removed_domains)``.
+
+        No-op if ``keep_domains`` is empty — refuses to wipe the table against an
+        empty/missing TSV set.
+        """
+        if not keep_domains:
+            return 0, []
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("select id, website from shopify_stores;")
+                rows = cur.fetchall()
+                to_delete: list[int] = []
+                removed_domains: set[str] = set()
+                for sid, website in rows:
+                    domain = _domain_key(website)
+                    if domain not in keep_domains:
+                        to_delete.append(int(sid))
+                        removed_domains.add(domain)
+                if to_delete:
+                    cur.execute("delete from shopify_stores where id = any(%s);", (to_delete,))
+            conn.commit()
+        return len(to_delete), sorted(removed_domains)
+
     # ── Crawl run tracking ────────────────────────────────────────────────────
     def initialize_crawl_run(self, *, run_id: str, websites: list[str]) -> None:
         if not websites:
@@ -669,12 +770,253 @@ class Repository:
                 cur.executemany(sql, params)
             conn.commit()
 
+    def update_products_metadata(
+        self,
+        website: str,
+        products: list[ProductRecord],
+        *,
+        dry_run: bool = False,
+        mark_removed: bool = True,
+        min_coverage: float = 0.5,
+    ) -> dict[str, int | str | None]:
+        """Refresh scraped metadata on EXISTING shopify_products rows for a domain.
+
+        For each scraped product already in production, overwrites only metadata
+        sourced from the fresh scrape (name, description, price, availability,
+        sizes, colors, brand, product_type, sku, handle, url) plus last_seen_at.
+        Deliberately does NOT touch images / supabase_images (preserving the
+        CLIP-validated set) or gender_* columns, and never INSERTs — a genuinely
+        new product needs image validation via the full crawl.
+
+        When ``mark_removed`` is set, production products NOT present in the scrape
+        (delisted from the store's catalog) are flagged ``unavailable = true`` —
+        BUT only if the scrape looks complete. The scraped/filtered set is a
+        superset of production, so a healthy scrape re-finds nearly all of
+        production; if it re-finds fewer than ``min_coverage`` of the store's
+        products (or returns nothing at all), the scrape is treated as
+        partial/bot-blocked and the removal marking is skipped, so a bad fetch
+        can't wrongly flag a whole catalog. A wrongly-flagged item self-corrects
+        on the next successful run (its metadata refresh restores availability).
+
+        Matched by domain (all branch rows) + product_id, like sync_store_branches.
+        Returns a summary dict.
+        """
+        result: dict[str, int | str | None] = {
+            "production": 0,
+            "scraped": len(products),
+            "updated": 0,
+            "missing": 0,
+            "marked_unavailable": 0,
+            "mark_skipped_reason": None,
+        }
+        domain = _domain_key(website)
+        if not domain:
+            return result
+        by_id: dict[str, ProductRecord] = {}
+        for product in products:
+            by_id[product.product_id] = product  # last wins; scrape already deduped
+        scraped_ids = set(by_id)
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select id, website from shopify_stores where website ilike %s;",
+                    (f"%{domain}%",),
+                )
+                store_ids = [
+                    int(sid) for sid, site in cur.fetchall() if _domain_key(site) == domain
+                ]
+                if not store_ids:
+                    return result
+
+                cur.execute(
+                    "select product_id, unavailable from shopify_products "
+                    "where store_id = any(%s);",
+                    (store_ids,),
+                )
+                prod_rows = cur.fetchall()
+                production_ids = {row[0] for row in prod_rows}
+                available_ids = {row[0] for row in prod_rows if not row[1]}
+                result["production"] = len(production_ids)
+
+                matched = [pid for pid in production_ids if pid in scraped_ids]
+                missing = [pid for pid in production_ids if pid not in scraped_ids]
+                result["updated"] = len(matched)
+                result["missing"] = len(missing)
+
+                # Decide whether the "removed -> unavailable" marking is trustworthy.
+                to_flag: list[str] = []
+                if mark_removed:
+                    to_flag, reason = _removal_plan(
+                        scraped_count=len(products),
+                        production_count=len(production_ids),
+                        matched_count=len(matched),
+                        missing=missing,
+                        available_ids=available_ids,
+                        min_coverage=min_coverage,
+                    )
+                    result["mark_skipped_reason"] = reason
+                    result["marked_unavailable"] = len(to_flag)
+
+                if dry_run:
+                    return result
+
+                if matched:
+                    meta_sql = """
+                    update shopify_products set
+                        product_handle = %s,
+                        product_url = %s,
+                        item_name = %s,
+                        description = %s,
+                        sku = %s,
+                        updated_at = %s,
+                        price_cents = %s,
+                        sizes = %s,
+                        colors = %s,
+                        brand = %s,
+                        product_type = %s,
+                        unavailable = %s,
+                        last_seen_at = now()
+                    where store_id = any(%s) and product_id = %s;
+                    """
+                    params = [
+                        (
+                            p.product_handle,
+                            p.product_url,
+                            p.item_name,
+                            p.description,
+                            p.sku,
+                            p.updated_at,
+                            p.price_cents,
+                            Jsonb(list(p.sizes)),
+                            Jsonb(list(p.colors)),
+                            p.brand,
+                            p.product_type,
+                            p.unavailable,
+                            store_ids,
+                            pid,
+                        )
+                        for pid, p in ((pid, by_id[pid]) for pid in matched)
+                    ]
+                    cur.executemany(meta_sql, params)
+
+                if to_flag:
+                    # Delisted products: only flip availability. last_seen_at is
+                    # left as-is (they were NOT seen this run — a useful signal).
+                    cur.execute(
+                        "update shopify_products set unavailable = true "
+                        "where store_id = any(%s) and product_id = any(%s);",
+                        (store_ids, to_flag),
+                    )
+            conn.commit()
+        return result
+
+    def mark_removed_products_unavailable(
+        self,
+        website: str,
+        scraped_product_ids,
+        *,
+        min_coverage: float = 0.5,
+        dry_run: bool = False,
+    ) -> dict[str, int | str | None]:
+        """Flag production products absent from a store's scraped catalog.
+
+        Given the FULL set of product ids seen in a store's scrape (pre-CLIP, so
+        a CLIP-rejected-but-still-listed item counts as present), mark every
+        production product NOT in that set as ``unavailable = true`` — guarded by
+        ``_removal_plan`` against partial/blocked scrapes. Used by the full crawl
+        to reconcile removals in the same pass as adding/updating products.
+        Returns a summary dict. Only flips currently-available rows.
+        """
+        scraped = set(scraped_product_ids)
+        result: dict[str, int | str | None] = {
+            "production": 0,
+            "scraped": len(scraped),
+            "matched": 0,
+            "missing": 0,
+            "marked_unavailable": 0,
+            "mark_skipped_reason": None,
+        }
+        domain = _domain_key(website)
+        if not domain:
+            return result
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select id, website from shopify_stores where website ilike %s;",
+                    (f"%{domain}%",),
+                )
+                store_ids = [
+                    int(sid) for sid, site in cur.fetchall() if _domain_key(site) == domain
+                ]
+                if not store_ids:
+                    return result
+
+                cur.execute(
+                    "select product_id, unavailable from shopify_products "
+                    "where store_id = any(%s);",
+                    (store_ids,),
+                )
+                prod_rows = cur.fetchall()
+                production_ids = {row[0] for row in prod_rows}
+                available_ids = {row[0] for row in prod_rows if not row[1]}
+                result["production"] = len(production_ids)
+                matched = [pid for pid in production_ids if pid in scraped]
+                missing = [pid for pid in production_ids if pid not in scraped]
+                result["matched"] = len(matched)
+                result["missing"] = len(missing)
+
+                to_flag, reason = _removal_plan(
+                    scraped_count=len(scraped),
+                    production_count=len(production_ids),
+                    matched_count=len(matched),
+                    missing=missing,
+                    available_ids=available_ids,
+                    min_coverage=min_coverage,
+                )
+                result["mark_skipped_reason"] = reason
+                result["marked_unavailable"] = len(to_flag)
+
+                if dry_run or not to_flag:
+                    return result
+                cur.execute(
+                    "update shopify_products set unavailable = true "
+                    "where store_id = any(%s) and product_id = any(%s);",
+                    (store_ids, to_flag),
+                )
+            conn.commit()
+        return result
+
     def delete_product(self, store_id: int, product_id: str) -> None:
         sql = "delete from shopify_products where store_id = %s and product_id = %s;"
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (store_id, product_id))
             conn.commit()
+
+    def delete_products_by_ids(self, ids: list[int]) -> int:
+        """Delete many products in one statement by their primary-key ids."""
+        if not ids:
+            return 0
+        sql = "delete from shopify_products where id = any(%s);"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, ([int(i) for i in ids],))
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
+
+    def delete_item_embeddings_batch(self, item_uuids: list[str]) -> int:
+        if not item_uuids:
+            return 0
+        sql = "delete from item_embeddings where item_uuid = any(%s::uuid[]);"
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, ([str(u) for u in item_uuids],))
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
 
     def iter_linked_supabase_image_paths(self, public_prefix: str) -> set[str]:
         """Return every storage object path referenced by shopify_products.supabase_images.
@@ -769,6 +1111,42 @@ class Repository:
                     "product_id": row[2],
                     "item_uuid": str(row[3]) if row[3] is not None else None,
                     "images": list(row[4] or []),
+                }
+            )
+        return out
+
+    def list_products_for_category_scan(
+        self, *, limit: int, after_id: int | None = None
+    ) -> list[dict[str, object]]:
+        """Page through saved products with the fields needed to re-apply the
+        non-apparel / cosmetics keyword filter (``prune-nonfashion``)."""
+        cols = (
+            "id, store_id, product_id, item_name, product_url, product_handle, "
+            "product_type, item_uuid, supabase_images"
+        )
+        if after_id is None:
+            sql = f"select {cols} from shopify_products order by id asc limit %s;"
+            params: tuple[object, ...] = (max(1, limit),)
+        else:
+            sql = f"select {cols} from shopify_products where id > %s order by id asc limit %s;"
+            params = (max(0, after_id), max(1, limit))
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        out: list[dict[str, object]] = []
+        for row in rows:
+            out.append(
+                {
+                    "id": row[0],
+                    "store_id": row[1],
+                    "product_id": row[2],
+                    "item_name": row[3],
+                    "product_url": row[4],
+                    "product_handle": row[5],
+                    "product_type": row[6],
+                    "item_uuid": str(row[7]) if row[7] is not None else None,
+                    "supabase_images": list(row[8] or []),
                 }
             )
         return out

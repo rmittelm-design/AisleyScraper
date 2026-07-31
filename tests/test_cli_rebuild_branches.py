@@ -37,6 +37,10 @@ def _install_fakes(monkeypatch, seeds, profiles, captured):
                              [(b.lat, b.long) for b in branches]))
             return list(range(100, 100 + len(branches)))
 
+        def upsert_store(self, store):
+            captured.append(("upsert", store.website, store.address))
+            return 1
+
     monkeypatch.setattr(cli, "Repository", _FakeRepo)
 
 
@@ -66,6 +70,48 @@ def test_rebuild_branches_fans_out_all_addresses_for_existing_store(monkeypatch)
     assert website == "http://www.corridornyc.com"  # matched across scheme/www by domain
     assert addresses == ["A St", "B St", "C St"]     # ALL branches, not just the first
     assert coords == [(1.0, 2.0), (1.0, 2.0), (1.0, 2.0)]  # geocoded
+
+
+def test_rebuild_branches_include_missing_creates_missing_and_addressless(monkeypatch) -> None:
+    seeds = [
+        StoreSeed(store_url="https://corridornyc.com/", store_name="Corridor",
+                  addresses=["A St", "B St"]),
+        StoreSeed(store_url="https://notindb.com/", store_name="NotInDB",
+                  addresses=["X St", "Y St"]),
+        StoreSeed(store_url="https://onlineonly.com/", store_name="Online", addresses=[]),
+    ]
+    profiles = [
+        StoreProfile(store_name="Corridor", website="https://corridornyc.com",
+                     store_type="online", address="A St"),
+    ]
+    captured: list = []
+    _install_fakes(monkeypatch, seeds, profiles, captured)
+
+    rc = cli.run_rebuild_branches(include_missing=True)
+    assert rc == 0
+
+    synced_sites = [c[0] for c in captured if c[0] != "upsert"]
+    upserts = [c for c in captured if c[0] == "upsert"]
+    # Existing (corridornyc) AND missing-with-addresses (notindb) are both synced.
+    assert any("corridornyc" in w for w in synced_sites)
+    assert any("notindb" in w for w in synced_sites)
+    # Address-less missing store gets a single upserted row.
+    assert any("onlineonly" in c[1] for c in upserts)
+
+
+def test_rebuild_branches_default_skips_missing_stores(monkeypatch) -> None:
+    seeds = [
+        StoreSeed(store_url="https://notindb.com/", store_name="NotInDB",
+                  addresses=["X St"]),
+        StoreSeed(store_url="https://onlineonly.com/", store_name="Online", addresses=[]),
+    ]
+    profiles: list = []  # nothing in production
+    captured: list = []
+    _install_fakes(monkeypatch, seeds, profiles, captured)
+
+    rc = cli.run_rebuild_branches()  # default (include_missing=False)
+    assert rc == 0
+    assert captured == []  # nothing created/reconciled without --include-missing
 
 
 def test_rebuild_branches_skip_geocode_leaves_coords_null(monkeypatch) -> None:
