@@ -26,6 +26,18 @@ def canonical_website(url: str) -> str:
     return f"https://{domain}" if domain else (url or "").strip()
 
 
+# When a scrape reached the true end of a store's catalog, we've seen the entire
+# live store, so a product missing from it is genuinely delisted no matter how much
+# the catalog shrank. There the coverage ratio (a proxy for "did we fetch the whole
+# catalog?") is redundant with the completeness signal the caller already checked,
+# so it drops to a low floor that only rejects a pathological near-empty "complete"
+# response (e.g. a server returning a truncated catalog that still paginated to an
+# end). Without this, a store that legitimately shrank below the strict floor keeps
+# its delisted products marked available forever (they never get re-seen, and the
+# reconcile that would flag them is skipped every run).
+_COMPLETE_SCRAPE_MIN_COVERAGE = 0.1
+
+
 def _removal_plan(
     *,
     scraped_count: int,
@@ -34,6 +46,7 @@ def _removal_plan(
     missing: list[str],
     available_ids: set[str],
     min_coverage: float,
+    scrape_complete: bool = False,
 ) -> tuple[list[str], str | None]:
     """Decide which delisted products to flag ``unavailable`` (pure, no DB).
 
@@ -42,19 +55,24 @@ def _removal_plan(
 
     - Nothing missing -> nothing to do.
     - Scrape returned no products -> skip (a bot-block/error, not an empty store).
-    - Scrape re-found less than ``min_coverage`` of production -> skip (likely a
-      partial/blocked fetch; flagging would wrongly mark much of the catalog).
+    - Scrape re-found less than the coverage floor of production -> skip (likely a
+      partial/blocked fetch; flagging would wrongly mark much of the catalog). The
+      floor is ``min_coverage`` when completeness is uncertain, but only
+      ``_COMPLETE_SCRAPE_MIN_COVERAGE`` when ``scrape_complete`` (the caller
+      confirmed the scrape reached the catalog's true end), so a store that
+      genuinely shrank still gets its delisted products reconciled.
     - Otherwise flag the missing products that are currently available.
     """
     if not missing:
         return [], None
     if scraped_count == 0:
         return [], "scrape returned no products"
-    if production_count and (matched_count / production_count) < min_coverage:
+    floor = _COMPLETE_SCRAPE_MIN_COVERAGE if scrape_complete else min_coverage
+    if production_count and (matched_count / production_count) < floor:
         pct = matched_count / production_count
         return [], (
             f"scrape covered {pct:.0%} of catalog "
-            f"(< {min_coverage:.0%}); likely partial/blocked"
+            f"(< {floor:.0%}); likely partial/blocked"
         )
     return [pid for pid in missing if pid in available_ids], None
 
@@ -847,6 +865,9 @@ class Repository:
                 # Decide whether the "removed -> unavailable" marking is trustworthy.
                 to_flag: list[str] = []
                 if mark_removed:
+                    # The caller only sets mark_removed when the scrape reached the
+                    # catalog's true end (mark_removed = mark_removed and complete),
+                    # so trust completeness over the strict coverage ratio here too.
                     to_flag, reason = _removal_plan(
                         scraped_count=len(products),
                         production_count=len(production_ids),
@@ -854,6 +875,7 @@ class Repository:
                         missing=missing,
                         available_ids=available_ids,
                         min_coverage=min_coverage,
+                        scrape_complete=True,
                     )
                     result["mark_skipped_reason"] = reason
                     result["marked_unavailable"] = len(to_flag)
@@ -918,6 +940,7 @@ class Repository:
         *,
         min_coverage: float = 0.5,
         dry_run: bool = False,
+        scrape_complete: bool = True,
     ) -> dict[str, int | str | None]:
         """Flag production products absent from a store's scraped catalog.
 
@@ -974,6 +997,7 @@ class Repository:
                     missing=missing,
                     available_ids=available_ids,
                     min_coverage=min_coverage,
+                    scrape_complete=scrape_complete,
                 )
                 result["mark_skipped_reason"] = reason
                 result["marked_unavailable"] = len(to_flag)

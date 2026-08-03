@@ -132,20 +132,44 @@ def test_removed_products_are_marked_unavailable(monkeypatch):
     assert "images" not in sql.lower() and "price_cents" not in sql.lower()
 
 
-def test_partial_scrape_does_not_flag_catalog(monkeypatch):
-    """Low coverage (bot-block/partial) must skip the removal marking entirely."""
+def test_pathologically_low_coverage_does_not_flag_catalog(monkeypatch):
+    """A near-empty scrape (below the complete-scrape floor) must still skip, so a
+    truncated response that paginated to an 'end' can't wipe a catalog."""
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[(f"P{i}", False) for i in range(20)],
+    )
+    repo = _repo(monkeypatch, cur)
+
+    r = repo.update_products_metadata("shop.example.com", [_product("P0")])  # 5% coverage
+
+    assert r["updated"] == 1 and r["missing"] == 19
+    assert r["marked_unavailable"] == 0
+    assert "partial" in str(r["mark_skipped_reason"])
+    assert _mark_update(cur) == []  # nothing flagged
+
+
+def test_complete_scrape_of_shrunk_store_flags_removals(monkeypatch):
+    """A store that legitimately shrank below the strict 50% floor still gets its
+    delisted products reconciled: the scrape reached the catalog's true end, so
+    completeness is trusted over the coverage ratio (the fix for stale-available
+    products that never get cleaned up when a store shrinks)."""
     cur = _FakeCursor(
         stores=[(10, "https://shop.example.com")],
         production=[(f"P{i}", False) for i in range(10)],
     )
     repo = _repo(monkeypatch, cur)
 
-    r = repo.update_products_metadata("shop.example.com", [_product("P0")])  # 10% coverage
+    # 20% coverage: below the old 0.5 floor (would have skipped) but above the 0.1
+    # complete-scrape floor -> the 8 missing available products ARE flagged.
+    r = repo.update_products_metadata(
+        "shop.example.com", [_product("P0"), _product("P1")]
+    )
 
-    assert r["updated"] == 1 and r["missing"] == 9
-    assert r["marked_unavailable"] == 0
-    assert "partial" in str(r["mark_skipped_reason"])
-    assert _mark_update(cur) == []  # nothing flagged
+    assert r["updated"] == 2 and r["missing"] == 8
+    assert r["marked_unavailable"] == 8
+    assert r["mark_skipped_reason"] is None
+    assert len(_mark_update(cur)) == 1
 
 
 def test_empty_scrape_never_flags(monkeypatch):
@@ -230,16 +254,44 @@ def test_mark_removed_flags_delisted_products(monkeypatch):
     assert len(marks) == 1 and marks[0][1] == ([10], ["P4"])
 
 
-def test_mark_removed_guard_skips_partial_scrape(monkeypatch):
+def test_mark_removed_guard_skips_pathologically_low_coverage(monkeypatch):
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[(f"P{i}", False) for i in range(20)],
+    )
+    repo = _repo(monkeypatch, cur)
+    r = repo.mark_removed_products_unavailable("shop.example.com", ["P0"])  # 5%
+    assert r["marked_unavailable"] == 0
+    assert "partial" in str(r["mark_skipped_reason"])
+    assert _mark_update(cur) == []
+
+
+def test_mark_removed_complete_scrape_flags_shrunk_store(monkeypatch):
+    """A complete scrape of a store that shrank a lot (20% coverage, under the old
+    0.5 floor) still reconciles its 8 delisted products."""
     cur = _FakeCursor(
         stores=[(10, "https://shop.example.com")],
         production=[(f"P{i}", False) for i in range(10)],
     )
     repo = _repo(monkeypatch, cur)
-    r = repo.mark_removed_products_unavailable("shop.example.com", ["P0"])  # 10%
+    r = repo.mark_removed_products_unavailable("shop.example.com", ["P0", "P1"])
+    assert r["marked_unavailable"] == 8
+    assert r["mark_skipped_reason"] is None
+
+
+def test_mark_removed_incomplete_scrape_keeps_strict_floor(monkeypatch):
+    """When completeness is NOT asserted (scrape_complete=False), the strict
+    min_coverage floor still applies, so a partial fetch can't wipe a catalog."""
+    cur = _FakeCursor(
+        stores=[(10, "https://shop.example.com")],
+        production=[(f"P{i}", False) for i in range(10)],
+    )
+    repo = _repo(monkeypatch, cur)
+    r = repo.mark_removed_products_unavailable(
+        "shop.example.com", ["P0", "P1"], scrape_complete=False
+    )  # 20% < 0.5 strict floor
     assert r["marked_unavailable"] == 0
     assert "partial" in str(r["mark_skipped_reason"])
-    assert _mark_update(cur) == []
 
 
 def test_mark_removed_empty_scrape_skips(monkeypatch):
