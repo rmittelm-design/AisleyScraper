@@ -376,6 +376,63 @@ def _homepage_policy_links(homepage_html: str, base_url: str) -> list[tuple[str,
     return links
 
 
+# Terms-of-service / T&C pages. Rejected as a whole (legal boilerplate), but a
+# store may leave its dedicated returns page empty and publish the real returns
+# policy inside T&C (dansonjewelers.com), so as a LAST resort we lift just the
+# returns section out of one of these.
+_TC_PATHS: tuple[str, ...] = (
+    "/policies/terms-of-service",
+    "/policies/terms-and-conditions",
+    "/pages/terms-of-service",
+    "/pages/terms-and-conditions",
+    "/pages/terms",
+)
+
+# Heading that begins the returns/refunds section within a T&C page.
+_RETURN_SECTION_START = re.compile(
+    r"returns?\s*(?:&|and)\s*exchanges?|exchanges?\s*(?:&|and)\s*returns?|"
+    r"returns?\s+(?:&|and)\s+refunds?|returns?\s+policy|refund\s+policy|"
+    r"return\s*(?:&|and)\s*exchange|exchange\s+and\s+return",
+    re.IGNORECASE,
+)
+
+# Unrelated legal sections that mark the END of the returns section in a T&C page.
+_TC_SECTION_END = re.compile(
+    r"privacy\s+polic|governing\s+law|intellectual\s+propert|"
+    r"limitation\s+of\s+liabilit|disclaimer|indemnif|dispute\s+resolution|"
+    r"terms\s+of\s+use|acceptance\s+of\s+terms|prohibited\s+use|"
+    r"changes\s+to\s+(?:these\s+)?terms",
+    re.IGNORECASE,
+)
+
+
+def _extract_returns_from_legal(text: str | None) -> str | None:
+    """Lift the returns/refunds section out of a T&C page body, or None.
+
+    The T&C page as a whole is legal boilerplate (rejected), but the returns
+    section inside it is a real policy. Extract from its heading up to the next
+    unrelated legal section (or the char cap). Because the result now LEADS with
+    returns wording it clears ``_is_legal_page_text``; we still require real
+    policy phrasing so a bare mention ("no refunds under these Terms") is not
+    mistaken for a policy.
+    """
+    if not text:
+        return None
+    start = _RETURN_SECTION_START.search(text)
+    if not start:
+        return None
+    section = text[start.start() :]
+    end = _TC_SECTION_END.search(section, 200)
+    if end:
+        section = section[: end.start()]
+    section = section[:_MAX_CHARS_PER_POLICY].strip()
+    if len(section) < _MIN_POLICY_CHARS:
+        return None
+    if not _looks_like_policy(section) or _is_legal_page_text(section):
+        return None
+    return section
+
+
 async def fetch_shipping_returns(
     base_url: str,
     fetcher: Fetcher,
@@ -476,6 +533,16 @@ async def fetch_shipping_returns(
                 and not _is_legal_page_text(text)
             ):
                 found[category] = (base, text)
+
+    # Last resort for returns: the store left its dedicated returns page empty
+    # but published the policy inside terms-of-service. Lift just the returns
+    # section (the T&C page as a whole is rejected above as legal boilerplate).
+    if "returns" not in found:
+        for path in _TC_PATHS:
+            section = _extract_returns_from_legal(await _page_text(f"{base}{path}"))
+            if section:
+                found["returns"] = (f"{base}{path}", section)
+                break
 
     returns = found.get("returns")
     shipping = found.get("shipping")

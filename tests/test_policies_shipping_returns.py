@@ -104,6 +104,69 @@ def test_returns_none_when_no_policy_pages():
     assert text is None and url is None
 
 
+# A store (dansonjewelers.com) whose dedicated returns page is empty but whose
+# real return policy lives inside terms-of-service, wrapped in legal boilerplate.
+_TC_WITH_RETURNS_HTML = (
+    "<html><body><main>"
+    "These Terms of Service govern your use of this website; by accessing it you "
+    "agree to be bound by these terms and conditions and all applicable laws. "
+    "RETURN POLICY. Your purchase, in new condition with the original receipt, "
+    "may be exchanged or returned for store credit within seven days of the "
+    "original purchase date. No returns are accepted after 7 days. Sale or "
+    "clearance merchandise is not returnable or exchangeable. "
+    "GOVERNING LAW. These terms are governed by the laws of the state of X, and "
+    "any dispute shall be resolved in its courts."
+    "</main></body></html>"
+)
+_TC_PURE_LEGAL_HTML = (
+    "<html><body><main>"
+    "These Terms of Service govern your use of this website. By accessing this "
+    "site you agree to these terms and conditions. GOVERNING LAW: these terms "
+    "are governed by the laws of the state. LIMITATION OF LIABILITY: we are not "
+    "liable for indirect damages. INTELLECTUAL PROPERTY: all content is ours."
+    "</main></body></html>"
+)
+
+
+def test_returns_lifted_from_terms_of_service_when_dedicated_page_empty():
+    base = "https://shop.example.com"
+    fetcher = _FakeFetcher(
+        {
+            # dedicated returns page exists but is empty (below _MIN_POLICY_CHARS)
+            f"{base}/policies/refund-policy": "<html><body><main></main></body></html>",
+            f"{base}/policies/terms-of-service": _TC_WITH_RETURNS_HTML,
+        }
+    )
+    text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is not None
+    assert "RETURNS:" in text
+    assert "return policy" in text.lower() and "seven days" in text.lower()
+    assert url == f"{base}/policies/terms-of-service"
+    # only the returns section is lifted, not the unrelated legal boilerplate
+    assert "governing law" not in text.lower()
+
+
+def test_pure_legal_terms_page_is_not_captured_as_returns():
+    base = "https://shop.example.com"
+    fetcher = _FakeFetcher({f"{base}/policies/terms-of-service": _TC_PURE_LEGAL_HTML})
+    text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is None and url is None
+
+
+def test_dedicated_returns_page_preferred_over_terms_fallback():
+    base = "https://shop.example.com"
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": _RETURN_HTML,  # "within 30 days"
+            f"{base}/policies/terms-of-service": _TC_WITH_RETURNS_HTML,  # "seven days"
+        }
+    )
+    text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert "RETURNS:" in text and url == f"{base}/policies/refund-policy"
+    # the T&C fallback must NOT run when a real returns page exists
+    assert "seven days" not in text.lower()
+
+
 # Regression: a storefront mega-nav wraps the policy. Before the content-container
 # fix, _clean_text returned <body> text and the menu ate the whole char budget,
 # so shipping_returns was stored as pure navigation (observed on doors.nyc).
