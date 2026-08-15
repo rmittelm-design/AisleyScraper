@@ -167,6 +167,65 @@ def test_dedicated_returns_page_preferred_over_terms_fallback():
     assert "seven days" not in text.lower()
 
 
+def test_shipping_scoring_favors_shipping_rich_text_over_returns():
+    """Shipping-slot scoring must prefer a shipping-rich page over a returns page
+    that merely name-drops 'shipping' (the shopalexis/boden bug)."""
+    returns = (
+        "Return policy: items may be returned or exchanged within 30 days for a full "
+        "refund to the original payment method. Return shipping is at your cost."
+    )
+    shipping = (
+        "Shipping policy: free standard shipping on US orders over $100. Express and "
+        "international shipping are calculated at checkout. Orders are dispatched with "
+        "tracking; delivery times vary by carrier and customs may apply."
+    )
+    # For the shipping category the shipping-rich text wins clearly...
+    assert policies._candidate_score(shipping, category="shipping") > policies._candidate_score(
+        returns, category="shipping"
+    )
+    # ...while the category-less (returns) score does not apply the shipping boost.
+    assert policies._candidate_score(returns) > 0
+
+
+_RETURNS_MENTIONS_SHIPPING = (
+    "<html><body><main>Return Policy. Items may be returned or exchanged within 30 "
+    "days of delivery for a full refund to your original payment method. Final sale "
+    "items are not returnable. Return shipping is the customer's responsibility."
+    "</main></body></html>"
+)
+_DEDICATED_SHIPPING = (
+    "<html><body><main>Shipping and Delivery. We ship within 2 business days. Free "
+    "standard shipping on US orders over $100. Express and international shipping are "
+    "calculated at checkout. Orders are dispatched with tracking; delivery times vary "
+    "by carrier and customs or duties may apply.</main></body></html>"
+)
+
+
+def test_shipping_slot_uses_dedicated_page_over_returns_page():
+    """A dedicated shipping page (custom slug, only found via a homepage link) must
+    win the shipping slot over a returns page that is also offered to it."""
+    base = "https://shop.example.com"
+    homepage = (
+        "<html><body>"
+        '<a href="/policies/refund-policy">Refund policy</a>'
+        '<a href="/pages/orders-delivery">Shipping and Delivery</a>'
+        "</body></html>"
+    )
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": _RETURNS_MENTIONS_SHIPPING,
+            f"{base}/pages/orders-delivery": _DEDICATED_SHIPPING,
+        }
+    )
+    text, url = asyncio.run(
+        policies.fetch_shipping_returns(base, fetcher, _settings(), homepage_html=homepage)
+    )
+    assert "SHIPPING:" in text
+    assert f"{base}/pages/orders-delivery" in url  # shipping from the dedicated page
+    ship = text.split("SHIPPING:")[-1].lower()
+    assert "at checkout" in ship or "dispatched" in ship  # real shipping content
+
+
 # Regression: a storefront mega-nav wraps the policy. Before the content-container
 # fix, _clean_text returned <body> text and the menu ate the whole char budget,
 # so shipping_returns was stored as pure navigation (observed on doors.nyc).

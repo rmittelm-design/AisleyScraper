@@ -233,12 +233,31 @@ _MAX_CANDIDATE_CHARS = 8000
 _STRONG_CANDIDATE_SCORE = 4.0
 
 
-def _candidate_score(text: str) -> float:
+# Shipping/delivery terms. Counting mentions separates a page that IS about
+# shipping (many) from a returns page that merely name-drops it once ("return
+# shipping is at your cost"). Used only to make the shipping slot shipping-aware.
+_SHIPPING_TERM = re.compile(
+    r"\bship\w*|deliver\w*|dispatch\w*|freight|postage|courier|carrier", re.IGNORECASE
+)
+
+
+def _shipping_richness(text: str) -> int:
+    return len(_SHIPPING_TERM.findall(text or ""))
+
+
+def _candidate_score(text: str, *, category: str | None = None) -> float:
     """Policy-signal DENSITY (distinct signals per 1000 chars), nav-penalised.
 
     Density — not a raw count — is what separates a policy from a menu: a
     sprawling nav blob accumulates a few incidental signals across thousands of
     characters, while a real policy is short and signal-dense.
+
+    For the ``shipping`` category the score is made shipping-AWARE: a dense
+    RETURNS page mentions "shipping" once and would otherwise out-score a store's
+    dedicated shipping/delivery page for the shipping slot (shopalexis' refund
+    page beating /pages/alexis-shipping-return-policy; boden's beating
+    /pages/orders-deliveries). Weighting by how shipping-rich the text is lets a
+    real shipping page win while a returns page (one mention) barely moves.
     """
     signals = _policy_signal_count(text)
     if signals < 2:
@@ -246,6 +265,8 @@ def _candidate_score(text: str) -> float:
     density = signals / max(1.0, len(text) / 1000.0)
     if _NAV_MARKERS.search(text[:400]):
         density *= 0.1
+    if category == "shipping":
+        density *= 1.0 + min(_shipping_richness(text), 12) / 2.0
     return density
 
 
@@ -510,7 +531,7 @@ async def fetch_shipping_returns(
             # first: a store may expose the same policy on several pages of
             # differing quality (pookieandsebastian's /pages/return-policy is
             # tighter than its /policies/refund-policy).
-            scored.append((_candidate_score(text), url, text))
+            scored.append((_candidate_score(text, category=category), url, text))
             if len(scored) >= _MAX_CANDIDATES_TO_SCORE:
                 break
         if scored:
