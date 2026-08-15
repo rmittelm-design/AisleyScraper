@@ -352,6 +352,19 @@ def _clean_text(html: str) -> str:
             best_text, best_score = text, score
 
     if best_text and best_score > 0:
+        # A tabbed/accordion "Shipping & Returns" page keeps each tab in its own
+        # container; picking only the densest one drops the other tab (Alexis'
+        # shipping-rates panel was lost, leaving returns text in the shipping
+        # slot). Concatenate every STRONG, distinct policy block so both survive;
+        # the returns/shipping split happens downstream at emit time.
+        strong = sorted({t for t in candidates if _candidate_score(t) >= _STRONG_CANDIDATE_SCORE},
+                        key=len, reverse=True)
+        kept: list[str] = []
+        for t in strong:
+            if not any(t in k for k in kept):  # drop blocks nested in a longer kept one
+                kept.append(t)
+        if len(kept) > 1:
+            return "\n\n".join(kept)[: _MAX_CANDIDATE_CHARS * 3]
         return best_text
     body = soup.body or soup
     return _normalize(body)
@@ -454,6 +467,73 @@ def _extract_returns_from_legal(text: str | None) -> str | None:
     return section
 
 
+# Classify a policy BLOCK as shipping- vs returns-dominant, to split a combined
+# page's concatenated blocks (from _clean_text) into the correct labelled section
+# (Alexis' shipping-rates tab vs its returns tab).
+_SHIP_CONTENT = re.compile(
+    r"free\s+shipping|flat[\s-]?rate|ships?\s+within|dispatch|calculated\s+at\s+checkout|"
+    r"\d+\s*[-–]?\s*\d*\s*business\s*days?|ground\s+shipping|express\s+shipping|"
+    r"standard\s+shipping|2nd\s*day|next\s*day|overnight|expedited|tracking\s+(?:number|info)|"
+    r"\bcarrier\b|customs|duties|delivery\s+(?:time|estimate|window|option)|p\.?\s?o\.?\s*box|"
+    r"shipping\s+(?:cost|rate|fee|method|option)|shipping\s+is\s+\$",
+    re.IGNORECASE,
+)
+_RET_CONTENT = re.compile(
+    r"\breturn|\brefund|\bexchange|store\s+credit|restocking|final\s+sale|\brma\b",
+    re.IGNORECASE,
+)
+
+
+_SHIP_RATE_ANCHOR = re.compile(
+    r"domestic\s+shipping|shipping\s+rates?|shipping\s+(?:&|and)\s+(?:delivery|handling)|"
+    r"shipping\s+(?:is|costs?)\s+\$|free\s+shipping|shipping\s+guidelines|"
+    r"delivery\s+(?:information|options|rates?|times?)|"
+    r"(?:ground|standard|express|expedited|overnight)\s+shipping\s+is\s+\$",
+    re.IGNORECASE,
+)
+
+
+def _full_visible_text(html: str) -> str:
+    h = re.sub(r"<(script|style|noscript|svg|template)[\s\S]*?</\1>", " ", html, flags=re.I)
+    txt = re.sub(r"<[^>]+>", " ", h)
+    txt = (txt.replace("&amp;", "&").replace("&#39;", "'").replace("&nbsp;", " ")
+              .replace("&ndash;", "-").replace("&rsquo;", "'").replace("&quot;", '"'))
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+def _shipping_from_full_page(html: str) -> str | None:
+    """Lift a shipping window from a page's FULL visible text, for when the real
+    shipping section sits outside any known policy container (Alexis' rates tab
+    is diluted by a long ship-to-countries list, so the density cleaner drops it)."""
+    txt = _full_visible_text(html)
+    m = _SHIP_RATE_ANCHOR.search(txt)
+    if not m:
+        return None
+    seg = txt[m.start(): m.start() + 3200].strip()
+    if len(_SHIP_CONTENT.findall(seg)) >= 3:
+        return seg[:_MAX_CHARS_PER_POLICY]
+    return None
+
+
+def _category_text(text: str, category: str) -> str:
+    """From a possibly-combined policy body (blocks joined by ``_clean_text``),
+    keep only the blocks relevant to ``category``. No-op for a single block, so a
+    normal single-policy page is unchanged."""
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    if len(blocks) <= 1:
+        return text
+    kept: list[str] = []
+    for b in blocks:
+        ship = len(_SHIP_CONTENT.findall(b))
+        ret = len(_RET_CONTENT.findall(b))
+        if category == "shipping":
+            if ship >= 2 and ship >= ret:
+                kept.append(b)
+        elif ret > ship:  # returns
+            kept.append(b)
+    return "\n\n".join(kept).strip() or text
+
+
 async def fetch_shipping_returns(
     base_url: str,
     fetcher: Fetcher,
@@ -476,19 +556,26 @@ async def fetch_shipping_returns(
     base = base_url.rstrip("/")
     homepage_links = _homepage_policy_links(homepage_html, base) if homepage_html else []
 
-    # Cache cleaned text per URL so a combined page (or a repeated candidate) is
-    # fetched at most once across both categories.
+    # Cache cleaned text (and raw html) per URL so a combined page (or a repeated
+    # candidate) is fetched at most once across both categories.
     page_cache: dict[str, str | None] = {}
+    raw_cache: dict[str, str | None] = {}
+
+    async def _raw(url: str) -> str | None:
+        if url in raw_cache:
+            return raw_cache[url]
+        try:
+            html = await fetcher.get_text(url)
+        except Exception:
+            html = None
+        raw_cache[url] = html
+        return html
 
     async def _page_text(url: str) -> str | None:
         if url in page_cache:
             return page_cache[url]
-        try:
-            html = await fetcher.get_text(url)
-        except Exception:
-            page_cache[url] = None
-            return None
-        text = _clean_text(html)
+        html = await _raw(url)
+        text = _clean_text(html) if html else None
         page_cache[url] = text
         return text
 
@@ -565,6 +652,18 @@ async def fetch_shipping_returns(
                 found["returns"] = (f"{base}{path}", section)
                 break
 
+    # The shipping slot's container text can be the wrong tab (Alexis' rates sit
+    # in a non-standard container the cleaner drops, leaving return text here).
+    # Lift a shipping window from the page's full visible text and use it when it
+    # is more shipping-rich than the container text (so a correct, rich shipping
+    # container is never replaced by a worse window).
+    if "shipping" in found:
+        surl, stext = found["shipping"]
+        html = await _raw(surl)
+        win = _shipping_from_full_page(html) if html else None
+        if win and len(_SHIP_CONTENT.findall(win)) > len(_SHIP_CONTENT.findall(stext)):
+            found["shipping"] = (surl, win)
+
     returns = found.get("returns")
     shipping = found.get("shipping")
     if not returns and not shipping:
@@ -578,9 +677,11 @@ async def fetch_shipping_returns(
     parts: list[str] = []
     urls: list[str] = []
     if returns:
-        parts.append(f"RETURNS:\n{returns[1][:_MAX_CHARS_PER_POLICY]}")
+        rtext = _category_text(returns[1], "returns")
+        parts.append(f"RETURNS:\n{rtext[:_MAX_CHARS_PER_POLICY]}")
         urls.append(returns[0])
     if shipping:
-        parts.append(f"SHIPPING:\n{shipping[1][:_MAX_CHARS_PER_POLICY]}")
+        stext = _category_text(shipping[1], "shipping")
+        parts.append(f"SHIPPING:\n{stext[:_MAX_CHARS_PER_POLICY]}")
         urls.append(shipping[0])
     return "\n\n".join(parts), " | ".join(urls)

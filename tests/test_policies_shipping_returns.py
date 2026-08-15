@@ -226,6 +226,56 @@ def test_shipping_slot_uses_dedicated_page_over_returns_page():
     assert "at checkout" in ship or "dispatched" in ship  # real shipping content
 
 
+# A tabbed "Shipping & Returns" page: shipping and returns live in SEPARATE
+# containers (Alexis). _clean_text must keep both, not drop a tab.
+_TABBED_COMBINED_HTML = (
+    "<html><body>"
+    "<div class='rte'>Return Policy. Items may be returned within 30 days of delivery "
+    "for a full refund to the original payment method. Exchanges and store credit are "
+    "available. All sale items are final sale.</div>"
+    "<div class='rte'>Domestic Shipping Rates. Ground shipping is $25, 2nd Day is $60, "
+    "Next Day is $80. Orders ship within 1 business day via UPS; delivery in 2-7 business "
+    "days. Free shipping over $150. Orders are not available for P.O. Box addresses.</div>"
+    "</body></html>"
+)
+
+
+def test_clean_text_keeps_both_tabs_of_a_combined_page():
+    t = policies._clean_text(_TABBED_COMBINED_HTML)
+    assert "return" in t.lower() and "refund" in t.lower()
+    assert "ground shipping" in t.lower() and "$25" in t  # the shipping tab is NOT dropped
+
+
+def test_category_text_splits_combined_blocks():
+    combined = policies._clean_text(_TABBED_COMBINED_HTML)
+    ship = policies._category_text(combined, "shipping")
+    ret = policies._category_text(combined, "returns")
+    assert "ground shipping" in ship.lower() and "$25" in ship
+    assert "refund" in ret.lower()
+    assert "$25" not in ret  # shipping rates don't leak into the returns section
+    assert "refund" not in ship.lower()  # return text doesn't leak into shipping
+
+
+def test_combined_shipping_page_yields_shipping_not_returns():
+    """A store whose shipping candidate is a combined tabbed page must land real
+    shipping content in the SHIPPING slot, not the returns tab (Alexis bug)."""
+    base = "https://shop.example.com"
+    refund = (
+        "<html><body><main>Return Policy. Items may be returned within 30 days for a full "
+        "refund to the original payment method. Exchanges and store credit are available. "
+        "Sale items are final sale.</main></body></html>"
+    )
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": refund,
+            f"{base}/pages/shipping-returns": _TABBED_COMBINED_HTML,  # a _COMBINED_PATHS slug
+        }
+    )
+    text, _ = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    # the shipping rates must survive to the output (previously dropped)
+    assert "ground shipping" in text.lower() and "$25" in text
+
+
 # Regression: a storefront mega-nav wraps the policy. Before the content-container
 # fix, _clean_text returned <body> text and the menu ate the whole char budget,
 # so shipping_returns was stored as pure navigation (observed on doors.nyc).
