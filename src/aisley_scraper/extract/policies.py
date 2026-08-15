@@ -669,8 +669,12 @@ async def fetch_shipping_returns(
     if not returns and not shipping:
         return None, None
 
-    # If both resolved to the same combined page, emit it once.
-    if returns and shipping and returns[0] == shipping[0]:
+    # If both resolved to the same combined page AND to the SAME text, emit it
+    # once. (When the shipping slot was re-derived from a different part of the
+    # page — Alexis' rates tab via the full-text fallback — the texts differ, so
+    # fall through to separate, correctly-split sections instead of collapsing to
+    # the returns text.)
+    if returns and shipping and returns[0] == shipping[0] and returns[1] == shipping[1]:
         combined = returns[1][: _MAX_CHARS_PER_POLICY * 2]
         return f"SHIPPING & RETURNS:\n{combined}", returns[0]
 
