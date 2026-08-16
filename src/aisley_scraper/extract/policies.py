@@ -233,12 +233,31 @@ _MAX_CANDIDATE_CHARS = 8000
 _STRONG_CANDIDATE_SCORE = 4.0
 
 
-def _candidate_score(text: str) -> float:
+# Shipping/delivery terms. Counting mentions separates a page that IS about
+# shipping (many) from a returns page that merely name-drops it once ("return
+# shipping is at your cost"). Used only to make the shipping slot shipping-aware.
+_SHIPPING_TERM = re.compile(
+    r"\bship\w*|deliver\w*|dispatch\w*|freight|postage|courier|carrier", re.IGNORECASE
+)
+
+
+def _shipping_richness(text: str) -> int:
+    return len(_SHIPPING_TERM.findall(text or ""))
+
+
+def _candidate_score(text: str, *, category: str | None = None) -> float:
     """Policy-signal DENSITY (distinct signals per 1000 chars), nav-penalised.
 
     Density — not a raw count — is what separates a policy from a menu: a
     sprawling nav blob accumulates a few incidental signals across thousands of
     characters, while a real policy is short and signal-dense.
+
+    For the ``shipping`` category the score is made shipping-AWARE: a dense
+    RETURNS page mentions "shipping" once and would otherwise out-score a store's
+    dedicated shipping/delivery page for the shipping slot (shopalexis' refund
+    page beating /pages/alexis-shipping-return-policy; boden's beating
+    /pages/orders-deliveries). Weighting by how shipping-rich the text is lets a
+    real shipping page win while a returns page (one mention) barely moves.
     """
     signals = _policy_signal_count(text)
     if signals < 2:
@@ -246,6 +265,8 @@ def _candidate_score(text: str) -> float:
     density = signals / max(1.0, len(text) / 1000.0)
     if _NAV_MARKERS.search(text[:400]):
         density *= 0.1
+    if category == "shipping":
+        density *= 1.0 + min(_shipping_richness(text), 12) / 2.0
     return density
 
 
@@ -331,6 +352,19 @@ def _clean_text(html: str) -> str:
             best_text, best_score = text, score
 
     if best_text and best_score > 0:
+        # A tabbed/accordion "Shipping & Returns" page keeps each tab in its own
+        # container; picking only the densest one drops the other tab (Alexis'
+        # shipping-rates panel was lost, leaving returns text in the shipping
+        # slot). Concatenate every STRONG, distinct policy block so both survive;
+        # the returns/shipping split happens downstream at emit time.
+        strong = sorted({t for t in candidates if _candidate_score(t) >= _STRONG_CANDIDATE_SCORE},
+                        key=len, reverse=True)
+        kept: list[str] = []
+        for t in strong:
+            if not any(t in k for k in kept):  # drop blocks nested in a longer kept one
+                kept.append(t)
+        if len(kept) > 1:
+            return "\n\n".join(kept)[: _MAX_CANDIDATE_CHARS * 3]
         return best_text
     body = soup.body or soup
     return _normalize(body)
@@ -376,6 +410,188 @@ def _homepage_policy_links(homepage_html: str, base_url: str) -> list[tuple[str,
     return links
 
 
+# Terms-of-service / T&C pages. Rejected as a whole (legal boilerplate), but a
+# store may leave its dedicated returns page empty and publish the real returns
+# policy inside T&C (dansonjewelers.com), so as a LAST resort we lift just the
+# returns section out of one of these.
+_TC_PATHS: tuple[str, ...] = (
+    "/policies/terms-of-service",
+    "/policies/terms-and-conditions",
+    "/pages/terms-of-service",
+    "/pages/terms-and-conditions",
+    "/pages/terms",
+)
+
+# Heading that begins the returns/refunds section within a T&C page.
+_RETURN_SECTION_START = re.compile(
+    r"returns?\s*(?:&|and)\s*exchanges?|exchanges?\s*(?:&|and)\s*returns?|"
+    r"returns?\s+(?:&|and)\s+refunds?|returns?\s+policy|refund\s+policy|"
+    r"return\s*(?:&|and)\s*exchange|exchange\s+and\s+return",
+    re.IGNORECASE,
+)
+
+# STRONG section boundaries that end the returns discussion. Only structural
+# legal-section wording that starts a NEW section — NOT bare warranty phrasing
+# ("without warranties of any kind", "we disclaim any warranty of our own"),
+# which lawyers routinely interleave BETWEEN a returns-eligibility statement and
+# the returns-remedy/refund-timeline paragraph. "as-is" needs the legal
+# continuation, so resale "sold/provided as-is, where-is" item notes never stop
+# the run.
+# RELIABLE boundaries — this wording never appears inside a genuine returns
+# policy, so it always ends the returns run (even mid-run, cutting a following
+# refund-mentioning liability clause).
+_STOP_RUN = re.compile(
+    r"as[\s-]is[\"']?\s+(?:and\s+)?(?:as[\s-]available|basis|without\s+warrant)|"
+    r"disclaimer\s+of\s+warrant|limitation\s+of\s+liabilit|in\s+no\s+event\s+shall|"
+    r"shall\s+not\s+be\s+liable|force\s+majeure|severabilit|entire\s+agreement|"
+    r"indemnif|arbitration|intellectual\s+propert|privacy\s+polic|"
+    r"acceptance\s+of\s+terms|prohibited\s+use|"
+    r"third[\s-]party\s+link|user\s+comments|errors,?\s+inaccuracies|optional\s+tools",
+    re.IGNORECASE,
+)
+# Trailing-buffer boundaries — the above PLUS ambiguous phrases ("governing law",
+# "dispute resolution") that may occur as sentence-initial returns prose ("governing
+# law does not limit your return rights"). They must not break the run mid-stream,
+# but they do bound the trailing buffer so a real "Governing Law" heading right
+# after the returns run (flattened, unpunctuated) is not appended.
+_STOP_BUF = re.compile(
+    _STOP_RUN.pattern + r"|governing\s+law|dispute\s+resolution",
+    re.IGNORECASE,
+)
+
+
+def _extract_returns_from_legal(text: str | None) -> str | None:
+    """Lift the returns/refunds section out of a T&C page body, or None.
+
+    The T&C page as a whole is legal boilerplate (rejected), but the returns
+    section inside it is a real policy. We keep the CONTIGUOUS run of returns
+    content from its heading — extending across a short gap (an interleaved
+    warranty note) but stopping at a strong section boundary — so the remedy/
+    refund-timeline tail is not lost, while trailing legal boilerplate (which
+    carries no return vocabulary) is excluded. Because the result LEADS with
+    returns wording it clears ``_is_legal_page_text``; we still require real
+    policy phrasing so a bare mention ("no refunds under these Terms") is not
+    mistaken for a policy.
+    """
+    if not text:
+        return None
+    start = _RETURN_SECTION_START.search(text)
+    if not start:
+        return None
+    section = text[start.start() :]
+    hits = list(_RET_CONTENT.finditer(section))
+    if not hits:
+        return None
+    # Extend through the contiguous returns discussion: keep advancing while the
+    # next return mention is close (<600 chars) AND no strong section boundary
+    # intervenes.
+    end = hits[0].end()
+    for m in hits[1:]:
+        gap = section[end : m.start()]
+        if len(gap) > 900 or _STOP_RUN.search(gap):
+            break
+        end = m.end()
+    # Trailing buffer to finish the last sentence — but never past the next strong
+    # boundary (e.g. a governing-law heading in flattened, unpunctuated text).
+    stop = _STOP_BUF.search(section, end)
+    buf_end = min(stop.start(), end + 120) if stop else end + 120
+    section = section[:buf_end][:_MAX_CHARS_PER_POLICY].strip()
+    if len(section) < _MIN_POLICY_CHARS:
+        return None
+    if not _looks_like_policy(section) or _is_legal_page_text(section):
+        return None
+    return section
+
+
+# Classify a policy BLOCK as shipping- vs returns-dominant, to split a combined
+# page's concatenated blocks (from _clean_text) into the correct labelled section
+# (Alexis' shipping-rates tab vs its returns tab).
+_SHIP_CONTENT = re.compile(
+    r"free\s+shipping|flat[\s-]?rate|ships?\s+within|dispatch|calculated\s+at\s+checkout|"
+    r"\d+\s*[-–]?\s*\d*\s*business\s*days?|ground\s+shipping|express\s+shipping|"
+    r"standard\s+shipping|2nd\s*day|next\s*day|overnight|expedited|tracking\s+(?:number|info)|"
+    r"\bcarrier\b|customs|duties|delivery\s+(?:time|estimate|window|option)|p\.?\s?o\.?\s*box|"
+    r"shipping\s+(?:cost|rate|fee|method|option)|shipping\s+is\s+\$",
+    re.IGNORECASE,
+)
+_RET_CONTENT = re.compile(
+    r"\breturn|\brefund|\bexchange|store\s+credit|restocking|final\s+sale|\brma\b",
+    re.IGNORECASE,
+)
+
+
+_SHIP_RATE_ANCHOR = re.compile(
+    r"domestic\s+shipping|shipping\s+rates?|shipping\s+(?:&|and)\s+(?:delivery|handling)|"
+    r"shipping\s+(?:is|costs?)\s+\$|free\s+shipping|shipping\s+guidelines|"
+    r"delivery\s+(?:information|options|rates?|times?)|"
+    r"(?:ground|standard|express|expedited|overnight)\s+shipping\s+is\s+\$",
+    re.IGNORECASE,
+)
+# Footer / social / account chrome that a shipping window should not be made of;
+# used to penalize a full-page window anchored on a footer benefits band or an
+# account UI rather than the real shipping section.
+_SHIP_WIN_CHROME = re.compile(
+    r"instagram|facebook|pinterest|tiktok|youtube|linkedin|\bcareers\b|"
+    r"©|\(c\)\s*\d|all\s+rights\s+reserved|newsletter|"
+    r"add\s+to\s+cart|shopping\s+cart|my\s+account|create\s+account|reset\s+your\s+password",
+    re.IGNORECASE,
+)
+
+
+def _full_visible_text(html: str) -> str:
+    h = re.sub(r"<(script|style|noscript|svg|template)[\s\S]*?</\1>", " ", html, flags=re.I)
+    txt = re.sub(r"<[^>]+>", " ", h)
+    txt = (txt.replace("&amp;", "&").replace("&#39;", "'").replace("&nbsp;", " ")
+              .replace("&ndash;", "-").replace("&rsquo;", "'").replace("&quot;", '"'))
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+def _shipping_from_full_page(html: str) -> str | None:
+    """Lift a shipping window from a page's FULL visible text, for when the real
+    shipping section sits outside any known policy container (Alexis' rates tab
+    is diluted by a long ship-to-countries list, so the density cleaner drops it)."""
+    txt = _full_visible_text(html)
+    # Take the EARLIEST shipping-rate anchor whose window reads as shipping. Trim
+    # the 3200-char forward window at the first footer/social/account chrome (so
+    # the result isn't padded with it) and require the trimmed window to be
+    # shipping-dominant (its shipping content >= its return vocabulary). This skips
+    # a top "free shipping" promo bar (on a combined page its window is
+    # returns/menu-heavy), trims away a footer benefits band, and still recovers a
+    # real rate block diluted by a long ship-to-countries list. When nothing
+    # qualifies it returns None rather than emit returns/chrome as the shipping
+    # policy. The clean-container clobber is prevented by the call-site gate.
+    for m in _SHIP_RATE_ANCHOR.finditer(txt):
+        seg = txt[m.start(): m.start() + 3200]
+        cm = _SHIP_WIN_CHROME.search(seg)
+        if cm:
+            seg = seg[: cm.start()]
+        seg = seg.strip()
+        sh = len(_SHIP_CONTENT.findall(seg))
+        rt = len(_RET_CONTENT.findall(seg))
+        if sh >= 3 and sh >= rt:
+            return seg[:_MAX_CHARS_PER_POLICY]
+    return None
+
+
+def _category_text(text: str, category: str) -> str:
+    """From a possibly-combined policy body (blocks joined by ``_clean_text``),
+    keep only the blocks relevant to ``category``. No-op for a single block, so a
+    normal single-policy page is unchanged."""
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    if len(blocks) <= 1:
+        return text
+    kept: list[str] = []
+    for b in blocks:
+        ship = len(_SHIP_CONTENT.findall(b))
+        ret = len(_RET_CONTENT.findall(b))
+        if category == "shipping":
+            if ship >= 2 and ship >= ret:
+                kept.append(b)
+        elif ret > ship:  # returns
+            kept.append(b)
+    return "\n\n".join(kept).strip() or text
+
+
 async def fetch_shipping_returns(
     base_url: str,
     fetcher: Fetcher,
@@ -398,19 +614,26 @@ async def fetch_shipping_returns(
     base = base_url.rstrip("/")
     homepage_links = _homepage_policy_links(homepage_html, base) if homepage_html else []
 
-    # Cache cleaned text per URL so a combined page (or a repeated candidate) is
-    # fetched at most once across both categories.
+    # Cache cleaned text (and raw html) per URL so a combined page (or a repeated
+    # candidate) is fetched at most once across both categories.
     page_cache: dict[str, str | None] = {}
+    raw_cache: dict[str, str | None] = {}
+
+    async def _raw(url: str) -> str | None:
+        if url in raw_cache:
+            return raw_cache[url]
+        try:
+            html = await fetcher.get_text(url)
+        except Exception:
+            html = None
+        raw_cache[url] = html
+        return html
 
     async def _page_text(url: str) -> str | None:
         if url in page_cache:
             return page_cache[url]
-        try:
-            html = await fetcher.get_text(url)
-        except Exception:
-            page_cache[url] = None
-            return None
-        text = _clean_text(html)
+        html = await _raw(url)
+        text = _clean_text(html) if html else None
         page_cache[url] = text
         return text
 
@@ -453,7 +676,7 @@ async def fetch_shipping_returns(
             # first: a store may expose the same policy on several pages of
             # differing quality (pookieandsebastian's /pages/return-policy is
             # tighter than its /policies/refund-policy).
-            scored.append((_candidate_score(text), url, text))
+            scored.append((_candidate_score(text, category=category), url, text))
             if len(scored) >= _MAX_CANDIDATES_TO_SCORE:
                 break
         if scored:
@@ -477,22 +700,56 @@ async def fetch_shipping_returns(
             ):
                 found[category] = (base, text)
 
+    # Last resort for returns: the store left its dedicated returns page empty
+    # but published the policy inside terms-of-service. Lift just the returns
+    # section (the T&C page as a whole is rejected above as legal boilerplate).
+    if "returns" not in found:
+        for path in _TC_PATHS:
+            section = _extract_returns_from_legal(await _page_text(f"{base}{path}"))
+            if section:
+                found["returns"] = (f"{base}{path}", section)
+                break
+
+    # The shipping slot's container text can be the wrong tab (Alexis' rates sit
+    # in a non-standard container the cleaner drops, leaving return text here).
+    # ONLY when that container is not already real shipping — it is
+    # returns-dominant or nearly shipping-empty — recover a shipping window from
+    # the page's full visible text. This keeps a clean, shipping-rich container
+    # from being clobbered by a chrome-polluted full-page window (the guard on
+    # match count alone is defeated by a "free shipping" banner + nav, which add
+    # their own shipping-word matches).
+    if "shipping" in found:
+        surl, stext = found["shipping"]
+        ship_hits = len(_SHIP_CONTENT.findall(stext))
+        ret_hits = len(_RET_CONTENT.findall(stext))
+        if ship_hits < 2 or ret_hits > ship_hits:
+            html = await _raw(surl)
+            win = _shipping_from_full_page(html) if html else None
+            if win and len(_SHIP_CONTENT.findall(win)) > ship_hits:
+                found["shipping"] = (surl, win)
+
     returns = found.get("returns")
     shipping = found.get("shipping")
     if not returns and not shipping:
         return None, None
 
-    # If both resolved to the same combined page, emit it once.
-    if returns and shipping and returns[0] == shipping[0]:
+    # If both resolved to the same combined page AND to the SAME text, emit it
+    # once. (When the shipping slot was re-derived from a different part of the
+    # page — Alexis' rates tab via the full-text fallback — the texts differ, so
+    # fall through to separate, correctly-split sections instead of collapsing to
+    # the returns text.)
+    if returns and shipping and returns[0] == shipping[0] and returns[1] == shipping[1]:
         combined = returns[1][: _MAX_CHARS_PER_POLICY * 2]
         return f"SHIPPING & RETURNS:\n{combined}", returns[0]
 
     parts: list[str] = []
     urls: list[str] = []
     if returns:
-        parts.append(f"RETURNS:\n{returns[1][:_MAX_CHARS_PER_POLICY]}")
+        rtext = _category_text(returns[1], "returns")
+        parts.append(f"RETURNS:\n{rtext[:_MAX_CHARS_PER_POLICY]}")
         urls.append(returns[0])
     if shipping:
-        parts.append(f"SHIPPING:\n{shipping[1][:_MAX_CHARS_PER_POLICY]}")
+        stext = _category_text(shipping[1], "shipping")
+        parts.append(f"SHIPPING:\n{stext[:_MAX_CHARS_PER_POLICY]}")
         urls.append(shipping[0])
     return "\n\n".join(parts), " | ".join(urls)
