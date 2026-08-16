@@ -34,7 +34,7 @@ cd /Users/ronimittelman/Desktop/Projects/Projects/AisleyScraper
    `url <tab> store_name <tab> addr1 <tab> addr2 …` (a bare-url row with no name/address is fine — the name is taken from the scraped homepage). The crawl reads **all** `*.tsv` in that folder and merges them by url.
 
 	The standalone `ingest-stores --csv <path>` command still loads a single TSV file (the `--csv` flag name is kept for backward compatibility).
-4. Run `aisley-scraper crawl-stores`.
+4. Run the full scrape/update: **`aisley-scraper crawl-stores --mark-removed`** — this is the one command to scrape and update everything (see [Running a full scrape / update](#running-a-full-scrape--update-the-command-to-run) just below for exactly what it does).
 
 If you are upgrading an existing deployment, apply migrations in order before crawling:
 
@@ -56,6 +56,28 @@ Restart behavior for `crawl-stores`:
 - For two-phase resume, `--phase 2` now requires an existing staged run id and will not create a new run implicitly.
 
 Orphaned-storage preflight runs only for `--phase both`.
+
+## Running a full scrape / update — the command to run
+
+To scrape and update **everything** in one pass, run:
+
+```bash
+aisley-scraper crawl-stores --mark-removed
+```
+
+This is the canonical command for a full catalog scrape + update. In a single default `--phase both` pass it:
+
+- **scrapes new stores** — any store in `shopify_stores` or in the `./data/stores/*.tsv` seeds that isn't fully scraped yet is fetched and inserted (DB-first, then unseen TSV stores are appended);
+- **scrapes new items for existing stores** — every product in each store's `products.json` is upserted (new products inserted, existing ones updated);
+- **validates + stores product images** — `--phase both` runs the fashion/CLIP image validation and persists images (this is the default; it is *not* image-free);
+- **marks removed items unavailable** — `--mark-removed` flags products that have disappeared from a store's catalog as `unavailable=true`, guarded by `--min-coverage` (default `0.5`) so a partial/bot-blocked scrape can't wrongly flag a whole catalog;
+- runs **two-lane concurrency** — small stores concurrently first (data usable sooner), then the largest store(s) last at lower concurrency (gentler on Shopify's CDN). See `_split_lanes` / `run_crawl` in `src/aisley_scraper/cli.py`.
+
+Notes:
+
+- Add `--fresh` **only** to start a brand-new run id — it purges the previous run's tracking (products are safe; run bookkeeping is not). **Never `--fresh` while another crawl is live.** Without `--fresh`, a run resumes from pending/failed stores.
+- Canary first if you like: `aisley-scraper crawl-stores --mark-removed --limit 20`.
+- **Do not** use `refresh-products` for a full update — it is an *update-only* path: it refreshes metadata on existing products and marks removed ones unavailable, but it **skips new products and never scrapes new/empty stores** (and it runs sequentially, not two-lane). Use it only for a fast price/availability sweep of the existing catalog. See [Refresh metadata only (`refresh-products`)](#refresh-metadata-only-refresh-products) below.
 
 ## Crawl Run Modes
 
