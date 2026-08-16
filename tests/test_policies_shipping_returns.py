@@ -556,3 +556,337 @@ def test_best_scoring_policy_page_wins_over_first_match():
     text, url = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
     assert text is not None
     assert "/pages/return-policy" in url, f"picked the noisier page: {url}"
+
+
+# --- Regression tests for the full-page shipping fallback + T&C returns bound ---
+# (pre-merge review of fix/policy-terms-fallback surfaced these paths as unpinned)
+
+_DILUTED_SHIP_TAB = (
+    "<html><body>"
+    "<div class='rte'>Return Policy. Items may be returned within 30 days of delivery "
+    "for a full refund or exchange to the original payment method. Store credit is "
+    "available. All sale items are final sale and cannot be returned.</div>"
+    "<div class='rte'>Domestic Shipping Rates. Ground shipping is $25, 2nd Day is $60, "
+    "Next Day is $80. Orders ship within 1 business day; delivery in 2-7 business days. "
+    "Free shipping over $150. No P.O. Box addresses. We ship to: "
+    + ", ".join(f"Country{i}" for i in range(400)) + ".</div>"
+    "</body></html>"
+)
+
+
+def test_full_page_shipping_fallback_recovers_diluted_shipping_tab():
+    """When the real shipping section is so diluted (huge ship-to list) that the
+    density cleaner drops it and the shipping slot resolves to returns text, the
+    full-page fallback recovers the rate window (exercises the swap at the emit
+    step)."""
+    # precondition: the cleaner drops the diluted shipping tab, so without the
+    # fallback the shipping slot would hold only returns text (no rate figures).
+    assert "$25" not in policies._clean_text(_DILUTED_SHIP_TAB)
+    base = "https://shop.example.com"
+    refund = (
+        "<html><body><main>Return Policy. Items may be returned within 30 days for a full "
+        "refund to the original payment method. Exchanges and store credit are available. "
+        "Sale items are final sale.</main></body></html>"
+    )
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": refund,
+            f"{base}/policies/shipping-policy": _DILUTED_SHIP_TAB,
+        }
+    )
+    text, _ = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is not None and "SHIPPING:" in text
+    ship = text.split("SHIPPING:")[-1]
+    assert "ground shipping is $25" in ship.lower()  # recovered only via the fallback
+
+
+def test_shipping_from_full_page_picks_densest_window_over_footer_link():
+    """A stray 'Shipping Rates' footer/nav link must not strand the window in the
+    footer: the densest window (the real delivery lead) wins."""
+    html = (
+        "<html><body>"
+        "<main><h1>Delivery Information</h1><p>Standard delivery time is 3-5 business "
+        "days. Orders are dispatched within 24 hours Monday to Friday. A tracking "
+        "number is provided once your parcel ships. We ship to P.O. boxes and offer "
+        "express shipping for an additional fee. International customers may owe "
+        "customs and duties.</p></main>"
+        "<footer><ul><li><a href='/pages/shipping-rates'>Shipping Rates</a></li>"
+        "<li>Returns</li><li>Contact</li></ul>(c) 2026 Store</footer>"
+        "</body></html>"
+    )
+    win = policies._shipping_from_full_page(html)
+    assert win is not None
+    assert "business days" in win.lower() and "tracking number" in win.lower()
+
+
+def test_clean_shipping_container_not_clobbered_by_announcement_bar():
+    """A clean dedicated shipping page carrying a 'free shipping' announcement bar
+    and nav must keep its clean container; the full-page fallback must not replace
+    a real shipping container with banner + menu chrome."""
+    base = "https://shop.example.com"
+    shipping = (
+        "<html><body>"
+        "<div class='announcement-bar'>Free shipping on all US orders over $50!</div>"
+        + _NAV +
+        "<main><div class='shopify-policy__body'>Ground shipping is a $5 flat rate. "
+        "Orders ship within 2 business days via standard shipping. Expedited shipping "
+        "is available at checkout. A tracking number is emailed once your order ships."
+        "</div></main></body></html>"
+    )
+    refund = (
+        "<html><body><main>Items may be returned within 30 days for a full refund. "
+        "Items must be unworn and in original packaging. Final sale items are "
+        "non-returnable.</main></body></html>"
+    )
+    fetcher = _FakeFetcher(
+        {
+            f"{base}/policies/refund-policy": refund,
+            f"{base}/policies/shipping-policy": shipping,
+        }
+    )
+    text, _ = asyncio.run(policies.fetch_shipping_returns(base, fetcher, _settings()))
+    assert text is not None and "SHIPPING:" in text
+    ship = text.split("SHIPPING:")[-1]
+    assert "flat rate" in ship.lower() and "business days" in ship.lower()
+    for junk in ("All Clothing", "Shopping Cart", "My Account", "Best Sellers"):
+        assert junk not in ship, f"nav leaked into shipping via full-page fallback: {junk!r}"
+
+
+def test_extract_returns_from_legal_bounds_terse_section():
+    """A terse returns section is bounded at the next legal heading, not run on
+    into governing-law / jurisdiction boilerplate (the fixed-200-char skip bug)."""
+    body = (
+        "Return Policy. All sales are final and no refunds are issued; however "
+        "defective items may be exchanged within 14 days of delivery for store credit. "
+        "Governing Law. These terms are governed by the laws of the state and any "
+        "dispute is subject to the exclusive jurisdiction of its courts. "
+        "Limitation of Liability. In no event shall we be liable for damages."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "store credit" in section.lower()
+    assert "jurisdiction" not in section.lower()
+    assert "limitation of liability" not in section.lower()
+
+
+def test_extract_returns_from_legal_keeps_body_mentioning_legal_terms():
+    """A legit returns body that MENTIONS 'Terms of Use' / 'governing law'
+    mid-sentence must not be truncated at the mention; only a real following
+    section heading ends it."""
+    body = (
+        "Returns and Refunds. All returns are subject to these Terms of Use. You may "
+        "return unworn merchandise within 30 days of delivery for a full refund to the "
+        "original payment method; exchanges and store credit are also available. "
+        "Governing Law. These terms are governed by the laws of the state."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "30 days" in section and "store credit" in section.lower()
+    assert "governed by the laws" not in section.lower()  # stops at the real heading
+
+
+def test_extract_returns_from_legal_keeps_inline_disclaimer_label():
+    """An inline 'Disclaimer:' label introducing return terms is not a section
+    heading and must not truncate the returns body."""
+    body = (
+        "Return Policy. Disclaimer: all sale items are final and cannot be returned. "
+        "Full-price items may be returned within 30 days for a refund if unworn with "
+        "original tags attached."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "final" in section.lower() and "30 days" in section
+
+
+def test_shipping_from_full_page_does_not_jump_past_lead_into_footer():
+    """A trailing 'delivery time' phrase must not anchor the window past the real
+    shipping lead into footer chrome; the lead (methods, tracking) is preserved."""
+    html = (
+        "<html><body>"
+        "<div class='announcement-bar'>FREE SHIPPING ON ORDERS OVER $75</div>"
+        "<nav>Home Shop Collections About Contact Account Cart</nav>"
+        "<main><p>Free Shipping. We offer free shipping on all U.S. orders over $75. "
+        "Orders ship within 1-2 business days via ground shipping. Standard and express "
+        "shipping options are available at checkout, and a tracking number is emailed "
+        "once your order ships. Please allow additional delivery time during holidays.</p>"
+        "</main><footer>Newsletter Sign up Instagram Facebook Pinterest</footer>"
+        "</body></html>"
+    )
+    win = policies._shipping_from_full_page(html)
+    assert win is not None
+    # the real shipping lead survives (the bug anchored at 'delivery time', losing it)
+    assert "business days" in win.lower()
+    assert "tracking number" in win.lower()
+    assert "ground shipping" in win.lower()
+
+
+def test_extract_returns_from_legal_drops_boilerplate_heading_without_punctuation():
+    """A real trailing legal section with NO preceding period (flattened text /
+    bulleted returns list) must still be dropped — it carries no return vocab."""
+    body = (
+        "Returns and Exchanges Items may be returned within 30 days Items must be "
+        "unworn with original tags Refunds are issued to the original payment method "
+        "Governing Law These Terms shall be governed by the laws of the State of "
+        "California and any dispute shall be resolved in the courts located in Los "
+        "Angeles County. You hereby consent to personal jurisdiction and waive any "
+        "objection to venue."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "30 days" in section and "original tags" in section
+    assert "governed by the laws" not in section.lower()
+    assert "jurisdiction" not in section.lower()
+
+
+def test_extract_returns_from_legal_keeps_returns_after_sentence_initial_mention():
+    """A returns body whose later sentence merely BEGINS with 'Governing law ...'
+    as prose (still discussing return rights) must not be truncated."""
+    body = (
+        "Return Policy. We accept returns within 30 days of delivery for a full "
+        "refund. Governing law of your purchase does not limit any statutory consumer "
+        "rights you may have, and we will honor all mandatory return rights in your "
+        "jurisdiction. Please retain your receipt and contact us to arrange your "
+        "return shipment."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "30 days" in section
+    assert "return shipment" in section.lower()  # the tail was not dropped
+
+
+def test_extract_returns_from_legal_drops_liability_boilerplate_with_refund_word():
+    """Legal boilerplate that itself contains 'refund' (as-is / liability clauses)
+    must still be cut — the semantic lookahead alone was fooled by it."""
+    body = (
+        "Returns & Refunds. We gladly accept returns within 30 days of delivery for a "
+        "full refund to your original payment method. Items must be unworn with tags. "
+        "Disclaimer of Warranties. THE PRODUCTS ARE PROVIDED ON AN AS IS AND AS "
+        "AVAILABLE BASIS. We make no warranties, express or implied. In no event shall "
+        "our liability exceed the amount you paid, and your sole remedy is to return "
+        "the product for a refund of the purchase price actually paid by you. Governing "
+        "Law. These Terms shall be governed by the laws of the State of California."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "30 days" in section and "unworn" in section.lower()
+    for junk in ("as is", "warranties", "in no event", "liability", "governed by the laws"):
+        assert junk not in section.lower(), f"legal boilerplate leaked: {junk!r}"
+
+
+def test_extract_returns_from_legal_keeps_returns_tail_after_inline_disclaimer():
+    """An inline 'Disclaimer:' inside a genuine returns policy followed by return-free
+    logistics prose must not truncate the refund-timeframe tail."""
+    body = (
+        "Returns Policy. We happily accept returns within 30 days of delivery. To be "
+        "eligible your item must be unused and in the same condition that you received "
+        "it, in its original packaging with all tags attached. Disclaimer: we cannot be "
+        "held responsible for items lost or damaged in transit on their way back to our "
+        "warehouse, so we strongly recommend that you use a trackable shipping method "
+        "and consider purchasing insurance for any higher-value merchandise, because we "
+        "are simply unable to guarantee that we will receive the package that you have "
+        "sent to us for processing at our facility. Once your package arrives and has "
+        "passed our inspection, please allow five to ten business days for your refund "
+        "to be issued back to the original method of payment used at purchase."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "five to ten business days" in section.lower()  # tail retained
+
+
+def test_shipping_from_full_page_prefers_body_rates_over_footer_usp_band():
+    """A late footer benefits/USP band that is shipping-dense must not out-select the
+    real (earlier) shipping section in the page body."""
+    countries = ", ".join(f"Country{i}" for i in range(400))
+    html = (
+        "<html><body>"
+        "<nav>Home Shop New In Sale Account Cart</nav>"
+        "<div class='rte'>Return Policy. Items may be returned within 30 days, final "
+        "sale excluded, unworn with original tags.</div>"
+        "<div class='rte'>Domestic Shipping Rates. Ground shipping is a flat rate. "
+        "Orders ship within 1 business day. We ship to: " + countries + ".</div>"
+        "<div class='usp'>Free Shipping over $150. Express shipping and overnight "
+        "shipping available at checkout. We ship worldwide; customer pays customs and "
+        "duties. Ground shipping on all domestic orders.</div>"
+        "<footer>About Careers Instagram Facebook Pinterest (c) 2026</footer>"
+        "</body></html>"
+    )
+    win = policies._shipping_from_full_page(html)
+    assert win is not None
+    assert win.lower().startswith("domestic shipping rates")
+    assert "flat rate" in win.lower() and "business day" in win.lower()
+    assert "Instagram" not in win and "Careers" not in win
+
+
+def test_extract_returns_from_legal_keeps_resale_sold_as_is_condition():
+    """A resale/vintage store's 'sold as-is' item-condition note (returns-relevant)
+    must not be treated as a legal 'as is' warranty disclaimer and drop the policy."""
+    body = (
+        "Terms & Conditions. Return Policy. All pre-owned items are sold as-is; because our "
+        "pieces are secondhand we note any flaws in the listing. Full-price items purchased "
+        "online may be returned within 10 days of delivery for store credit only, provided the "
+        "garment is unworn with tags. Sale and vintage items are final sale. Email us with your "
+        "order number to begin a return. Governing Law. These Terms are governed by the laws of "
+        "the State of California."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "10 days" in section and "store credit" in section.lower()
+    assert "governed by the laws" not in section.lower()
+
+
+def test_extract_returns_from_legal_still_cuts_legal_as_is_available_boilerplate():
+    """The legal 'provided on an as is and as available basis' disclaimer must still
+    be cut even though 'as is' is now context-sensitive."""
+    body = (
+        "Return Policy. Items may be returned within 30 days for a refund. The site and all "
+        "products are provided on an as is and as available basis, and we make no warranties of "
+        "any kind, express or implied."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "30 days" in section
+    assert "as available" not in section.lower()
+    assert "no warranties" not in section.lower()
+
+
+def test_extract_returns_from_legal_keeps_resale_provided_as_is_condition():
+    """'items are provided as-is' (resale item-condition) must survive just like
+    'sold as-is' — only the legal 'as-is and as available/basis/without warranty'
+    forms cut."""
+    body = (
+        "Return Policy. All secondhand items are provided as is due to their pre-loved "
+        "nature, but if your order arrives damaged we accept returns within 5 days for a "
+        "full refund; new items may be returned within 30 days with tags. Governing Law. "
+        "These Terms are governed by the laws of the State of New York."
+    )
+    section = policies._extract_returns_from_legal(body)
+    assert section is not None
+    assert "5 days" in section and "30 days" in section
+    assert "governed by the laws" not in section.lower()
+
+
+def test_shipping_from_full_page_recovers_rates_past_promo_bar():
+    """A top 'free shipping' promo bar must not strand the window before the real
+    rate section further down the page."""
+    countries = ", ".join(f"Country{i}" for i in range(240))
+    menu = "Shop New In Dresses Tops Bottoms Shoes Accessories Sale About Contact " * 20
+    returns = (
+        "Returns. We accept returns within 30 days of delivery. Items must be unworn with "
+        "tags. Return shipping is the customer's responsibility. Refunds are issued to the "
+        "original payment method once received. " * 6
+    )
+    html = (
+        "<html><body>"
+        "<div class='announce'>Free shipping on U.S. orders over $150</div>"
+        "<nav>" + menu + "</nav>"
+        "<div class='rte'>" + returns + "</div>"
+        "<div class='rte'>Shipping Rates. Domestic shipping is a $8.95 flat rate, free over "
+        "$150. Express shipping is $24.95. Orders ship within 1-2 business days via USPS and "
+        "UPS with tracking. International shipping is calculated at checkout. We ship to: "
+        + countries + ".</div>"
+        "</body></html>"
+    )
+    win = policies._shipping_from_full_page(html)
+    assert win is not None
+    assert "8.95" in win and "flat rate" in win.lower()
+    assert "business days" in win.lower()

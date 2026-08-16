@@ -430,12 +430,32 @@ _RETURN_SECTION_START = re.compile(
     re.IGNORECASE,
 )
 
-# Unrelated legal sections that mark the END of the returns section in a T&C page.
-_TC_SECTION_END = re.compile(
-    r"privacy\s+polic|governing\s+law|intellectual\s+propert|"
-    r"limitation\s+of\s+liabilit|disclaimer|indemnif|dispute\s+resolution|"
-    r"terms\s+of\s+use|acceptance\s+of\s+terms|prohibited\s+use|"
-    r"changes\s+to\s+(?:these\s+)?terms",
+# STRONG section boundaries that end the returns discussion. Only structural
+# legal-section wording that starts a NEW section — NOT bare warranty phrasing
+# ("without warranties of any kind", "we disclaim any warranty of our own"),
+# which lawyers routinely interleave BETWEEN a returns-eligibility statement and
+# the returns-remedy/refund-timeline paragraph. "as-is" needs the legal
+# continuation, so resale "sold/provided as-is, where-is" item notes never stop
+# the run.
+# RELIABLE boundaries — this wording never appears inside a genuine returns
+# policy, so it always ends the returns run (even mid-run, cutting a following
+# refund-mentioning liability clause).
+_STOP_RUN = re.compile(
+    r"as[\s-]is[\"']?\s+(?:and\s+)?(?:as[\s-]available|basis|without\s+warrant)|"
+    r"disclaimer\s+of\s+warrant|limitation\s+of\s+liabilit|in\s+no\s+event\s+shall|"
+    r"shall\s+not\s+be\s+liable|force\s+majeure|severabilit|entire\s+agreement|"
+    r"indemnif|arbitration|intellectual\s+propert|privacy\s+polic|"
+    r"acceptance\s+of\s+terms|prohibited\s+use|"
+    r"third[\s-]party\s+link|user\s+comments|errors,?\s+inaccuracies|optional\s+tools",
+    re.IGNORECASE,
+)
+# Trailing-buffer boundaries — the above PLUS ambiguous phrases ("governing law",
+# "dispute resolution") that may occur as sentence-initial returns prose ("governing
+# law does not limit your return rights"). They must not break the run mid-stream,
+# but they do bound the trailing buffer so a real "Governing Law" heading right
+# after the returns run (flattened, unpunctuated) is not appended.
+_STOP_BUF = re.compile(
+    _STOP_RUN.pattern + r"|governing\s+law|dispute\s+resolution",
     re.IGNORECASE,
 )
 
@@ -444,8 +464,11 @@ def _extract_returns_from_legal(text: str | None) -> str | None:
     """Lift the returns/refunds section out of a T&C page body, or None.
 
     The T&C page as a whole is legal boilerplate (rejected), but the returns
-    section inside it is a real policy. Extract from its heading up to the next
-    unrelated legal section (or the char cap). Because the result now LEADS with
+    section inside it is a real policy. We keep the CONTIGUOUS run of returns
+    content from its heading — extending across a short gap (an interleaved
+    warranty note) but stopping at a strong section boundary — so the remedy/
+    refund-timeline tail is not lost, while trailing legal boilerplate (which
+    carries no return vocabulary) is excluded. Because the result LEADS with
     returns wording it clears ``_is_legal_page_text``; we still require real
     policy phrasing so a bare mention ("no refunds under these Terms") is not
     mistaken for a policy.
@@ -456,10 +479,23 @@ def _extract_returns_from_legal(text: str | None) -> str | None:
     if not start:
         return None
     section = text[start.start() :]
-    end = _TC_SECTION_END.search(section, 200)
-    if end:
-        section = section[: end.start()]
-    section = section[:_MAX_CHARS_PER_POLICY].strip()
+    hits = list(_RET_CONTENT.finditer(section))
+    if not hits:
+        return None
+    # Extend through the contiguous returns discussion: keep advancing while the
+    # next return mention is close (<600 chars) AND no strong section boundary
+    # intervenes.
+    end = hits[0].end()
+    for m in hits[1:]:
+        gap = section[end : m.start()]
+        if len(gap) > 900 or _STOP_RUN.search(gap):
+            break
+        end = m.end()
+    # Trailing buffer to finish the last sentence — but never past the next strong
+    # boundary (e.g. a governing-law heading in flattened, unpunctuated text).
+    stop = _STOP_BUF.search(section, end)
+    buf_end = min(stop.start(), end + 120) if stop else end + 120
+    section = section[:buf_end][:_MAX_CHARS_PER_POLICY].strip()
     if len(section) < _MIN_POLICY_CHARS:
         return None
     if not _looks_like_policy(section) or _is_legal_page_text(section):
@@ -491,6 +527,15 @@ _SHIP_RATE_ANCHOR = re.compile(
     r"(?:ground|standard|express|expedited|overnight)\s+shipping\s+is\s+\$",
     re.IGNORECASE,
 )
+# Footer / social / account chrome that a shipping window should not be made of;
+# used to penalize a full-page window anchored on a footer benefits band or an
+# account UI rather than the real shipping section.
+_SHIP_WIN_CHROME = re.compile(
+    r"instagram|facebook|pinterest|tiktok|youtube|linkedin|\bcareers\b|"
+    r"©|\(c\)\s*\d|all\s+rights\s+reserved|newsletter|"
+    r"add\s+to\s+cart|shopping\s+cart|my\s+account|create\s+account|reset\s+your\s+password",
+    re.IGNORECASE,
+)
 
 
 def _full_visible_text(html: str) -> str:
@@ -506,12 +551,25 @@ def _shipping_from_full_page(html: str) -> str | None:
     shipping section sits outside any known policy container (Alexis' rates tab
     is diluted by a long ship-to-countries list, so the density cleaner drops it)."""
     txt = _full_visible_text(html)
-    m = _SHIP_RATE_ANCHOR.search(txt)
-    if not m:
-        return None
-    seg = txt[m.start(): m.start() + 3200].strip()
-    if len(_SHIP_CONTENT.findall(seg)) >= 3:
-        return seg[:_MAX_CHARS_PER_POLICY]
+    # Take the EARLIEST shipping-rate anchor whose window reads as shipping. Trim
+    # the 3200-char forward window at the first footer/social/account chrome (so
+    # the result isn't padded with it) and require the trimmed window to be
+    # shipping-dominant (its shipping content >= its return vocabulary). This skips
+    # a top "free shipping" promo bar (on a combined page its window is
+    # returns/menu-heavy), trims away a footer benefits band, and still recovers a
+    # real rate block diluted by a long ship-to-countries list. When nothing
+    # qualifies it returns None rather than emit returns/chrome as the shipping
+    # policy. The clean-container clobber is prevented by the call-site gate.
+    for m in _SHIP_RATE_ANCHOR.finditer(txt):
+        seg = txt[m.start(): m.start() + 3200]
+        cm = _SHIP_WIN_CHROME.search(seg)
+        if cm:
+            seg = seg[: cm.start()]
+        seg = seg.strip()
+        sh = len(_SHIP_CONTENT.findall(seg))
+        rt = len(_RET_CONTENT.findall(seg))
+        if sh >= 3 and sh >= rt:
+            return seg[:_MAX_CHARS_PER_POLICY]
     return None
 
 
@@ -654,15 +712,21 @@ async def fetch_shipping_returns(
 
     # The shipping slot's container text can be the wrong tab (Alexis' rates sit
     # in a non-standard container the cleaner drops, leaving return text here).
-    # Lift a shipping window from the page's full visible text and use it when it
-    # is more shipping-rich than the container text (so a correct, rich shipping
-    # container is never replaced by a worse window).
+    # ONLY when that container is not already real shipping — it is
+    # returns-dominant or nearly shipping-empty — recover a shipping window from
+    # the page's full visible text. This keeps a clean, shipping-rich container
+    # from being clobbered by a chrome-polluted full-page window (the guard on
+    # match count alone is defeated by a "free shipping" banner + nav, which add
+    # their own shipping-word matches).
     if "shipping" in found:
         surl, stext = found["shipping"]
-        html = await _raw(surl)
-        win = _shipping_from_full_page(html) if html else None
-        if win and len(_SHIP_CONTENT.findall(win)) > len(_SHIP_CONTENT.findall(stext)):
-            found["shipping"] = (surl, win)
+        ship_hits = len(_SHIP_CONTENT.findall(stext))
+        ret_hits = len(_RET_CONTENT.findall(stext))
+        if ship_hits < 2 or ret_hits > ship_hits:
+            html = await _raw(surl)
+            win = _shipping_from_full_page(html) if html else None
+            if win and len(_SHIP_CONTENT.findall(win)) > ship_hits:
+                found["shipping"] = (surl, win)
 
     returns = found.get("returns")
     shipping = found.get("shipping")
