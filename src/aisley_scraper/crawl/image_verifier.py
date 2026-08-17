@@ -497,7 +497,37 @@ async def verify_first_image_product_validation(
         )
         return product, keep, reason, product_prob
 
-    results = await asyncio.gather(*(_validate_product(product) for product in products))
+    # Cap the whole chunk at a wall-clock budget. Each image only hits its per-image
+    # attempt timeout, so a CDN that opens the socket but never sends bytes leaves
+    # the aggregate otherwise unbounded (a big chunk then grinds for tens of minutes
+    # at ~0% CPU, blocking all downstream DB writes). On timeout, PRESERVE every
+    # not-yet-decided product (network/transient semantics) rather than dropping it
+    # because the CDN stalled.
+    tasks = [asyncio.create_task(_validate_product(product)) for product in products]
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks),
+            timeout=float(settings.image_validation_chunk_timeout_sec),
+        )
+    except asyncio.TimeoutError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        preserved = 0
+        results = []
+        for product, t in zip(products, tasks):
+            if t.cancelled() or t.exception() is not None:
+                results.append((product, True, "network_timeout", None))
+                preserved += 1
+            else:
+                results.append(t.result())
+        logger.warning(
+            "First-image validation chunk exceeded %.0fs budget; preserved %s "
+            "undecided product(s) (CDN stall)",
+            float(settings.image_validation_chunk_timeout_sec),
+            preserved,
+        )
 
     kept_products: list[ProductRecord] = []
     for product, keep, reason, product_prob in results:

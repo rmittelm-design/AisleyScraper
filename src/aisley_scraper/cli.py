@@ -2845,13 +2845,47 @@ def run_crawl(
                     )
                     return persisted_ok
 
+                # Per-store wall-clock ceiling: bound each store so one that wedges
+                # (an uncapped image chunk, a frozen pooler write) is abandoned and
+                # marked failed for retry instead of stalling the whole lane. This is
+                # the catch-all for hangs that the per-request timeouts don't cover.
+                store_deadline = float(
+                    getattr(settings, "crawl_store_total_timeout_sec", 1200) or 1200
+                )
+
+                async def _bounded_store(seed: StoreSeed) -> bool:
+                    try:
+                        return await asyncio.wait_for(
+                            _process_one_store(seed), timeout=store_deadline
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Store exceeded %.0fs wall-clock; abandoning and marking "
+                            "failed (retried next run): %s",
+                            store_deadline,
+                            seed.store_url,
+                        )
+                        ms = getattr(repo, "mark_run_store_status", None)
+                        if callable(ms):
+                            try:
+                                ms(
+                                    run_id=resolved_run_id,
+                                    website=seed.store_url,
+                                    status="failed",
+                                    error_message=f"store timeout >{int(store_deadline)}s",
+                                )
+                            except Exception:  # noqa: BLE001 - best-effort status write
+                                pass
+                        done_counter[0] += 1
+                        return False
+
                 try:
                     # The batch IS the concurrency unit: run_crawl sizes each batch to
                     # the desired per-lane concurrency (small vs large stores), so
                     # processing the whole batch at once = that many stores in parallel.
                     # Safe because every Repository call opens its own connection.
                     results = await asyncio.gather(
-                        *(_process_one_store(seed) for seed in batch),
+                        *(_bounded_store(seed) for seed in batch),
                         return_exceptions=True,
                     )
                     for seed, r in zip(batch, results):

@@ -50,6 +50,16 @@ class Settings(BaseSettings):
     crawl_request_total_timeout_sec: int = Field(
         default=60, alias="CRAWL_REQUEST_TOTAL_TIMEOUT_SEC"
     )
+    # Per-store wall-clock ceiling in --phase both. A single request is bounded by
+    # crawl_request_total_timeout_sec, but a store can still wedge indefinitely in a
+    # place those bounds don't cover — an uncapped image-validation chunk, or a
+    # frozen Supabase pooler write (invisible to statement_timeout / TCP). This is
+    # the catch-all: any store exceeding it is abandoned and marked failed (retried
+    # on the next run) so one bad store can't stall the whole lane. Generous so a
+    # legitimately huge catalog is never falsely timed out.
+    crawl_store_total_timeout_sec: int = Field(
+        default=1200, alias="CRAWL_STORE_TOTAL_TIMEOUT_SEC"
+    )
     # The pre-crawl orphan-storage audit (see _run_orphan_preflight) walks the
     # ENTIRE storage bucket via the Supabase Storage API before scraping starts,
     # and then auto-deletes orphaned objects. On a large bucket this can take a

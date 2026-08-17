@@ -231,3 +231,45 @@ def test_verify_first_image_product_validation_preserves_on_timeout(monkeypatch)
 
     assert len(products) == 1
     assert products[0].images == ["https://cdn.example.com/first.jpg"]
+
+
+def test_verify_first_image_product_validation_chunk_ceiling_caps_cdn_hang(monkeypatch) -> None:
+    """A CDN that accepts the socket but never responds makes per-product validation
+    hang forever. The chunk wall-clock ceiling must cap the whole chunk and PRESERVE
+    every undecided product instead of hanging or dropping them."""
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(3600)  # never returns — simulates a stalled CDN
+
+    monkeypatch.setattr(image_verifier, "evaluate_first_image_product_validation", _hang)
+
+    settings = Settings(
+        SUPABASE_URL="https://x.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY="key",
+        SUPABASE_STORAGE_BUCKET="product-images",
+        SUPABASE_STORAGE_PATH="aisley",
+        INPUT_CSV_PATH="./data/stores.csv",
+        IMAGE_VALIDATION_ENABLED=True,
+        IMAGE_VALIDATION_CONCURRENCY=2,
+        IMAGE_VALIDATION_CHUNK_TIMEOUT_SEC=0.3,
+    )
+    products = [
+        ProductRecord(
+            product_id=str(i), product_handle=None, item_name="X",
+            description=None, images=[f"https://cdn.example.com/x{i}.jpg"],
+        )
+        for i in range(5)
+    ]
+
+    async def _run() -> None:
+        # Outer guard: if the chunk ceiling were broken this hangs and the test fails
+        # loudly instead of stalling forever.
+        await asyncio.wait_for(
+            image_verifier.verify_first_image_product_validation(
+                products=products, fetcher=object(), settings=settings
+            ),
+            timeout=5.0,
+        )
+
+    asyncio.run(_run())
+    # Capped fast, and all 5 preserved (network/transient) — none dropped by the stall.
+    assert len(products) == 5
