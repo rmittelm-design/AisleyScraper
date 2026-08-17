@@ -17,6 +17,8 @@ import threading
 import time
 from uuid import uuid4
 
+import psycopg
+
 from aisley_scraper.config import get_settings
 from aisley_scraper.crawl.fetcher import Fetcher
 from aisley_scraper.crawl.orchestrator import (
@@ -572,6 +574,44 @@ async def _await_task_with_idle_watchdog(
                 if idle_hit
                 else f"store timeout >{int(hard)}s"
             )
+
+
+def _batched_upsert_with_retry(
+    repo, store_id, products, *, logger, attempts: int = 5, sleep=time.sleep
+) -> tuple[str, "Exception | None"]:
+    """Upsert a whole page's products in one batch, tolerating a transient DB blip.
+
+    Returns one of:
+      ("ok", None)         — the batch committed.
+      ("data_error", exc)  — a NON-connection error (e.g. a poison row); the caller
+                             should retry the page per-product to isolate the row.
+      ("conn_outage", exc) — connection retries were exhausted (a sustained pooler /
+                             network outage); the caller should fail the page (the
+                             store retries next run) rather than hammer per-product
+                             against a dead connection.
+
+    A connection error (``psycopg.OperationalError`` — pooler saturation, connect
+    timeout, dropped socket) is retried up to ``attempts`` times with exponential
+    backoff so a momentary blip doesn't fail an otherwise-good store; a data error
+    returns immediately because retrying cannot fix it. Runs inside the persist
+    worker thread, so the backoff ``sleep`` blocks only that thread.
+    """
+    last_conn_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            repo.upsert_products_batch(store_id, products)
+            return ("ok", None)
+        except psycopg.OperationalError as exc:
+            last_conn_exc = exc
+            logger.warning(
+                "Batched upsert connection error store=%s attempt=%s/%s size=%s: %s",
+                store_id, attempt, attempts, len(products), exc,
+            )
+            if attempt < attempts:
+                sleep(min(15.0, float(2 ** (attempt - 1))))  # 1, 2, 4, 8, 15
+        except Exception as exc:  # noqa: BLE001 - data error: don't retry, isolate per-product
+            return ("data_error", exc)
+    return ("conn_outage", last_conn_exc)
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -2016,29 +2056,24 @@ def run_crawl(
 
             # Batched final upsert for the whole page (unchanged + image-changed
             # products) collapses up to ~250 per-product DB round-trips into one.
-            # On a batch executemany error (all-or-nothing txn) fall back to
-            # per-product so a single poison row can't fail the whole page and the
-            # per-product failure accounting (final_upsert_failures) is preserved.
+            # A transient connection blip (pooler saturation / connect timeout) is
+            # retried with backoff so it no longer fails an otherwise-good store; a
+            # data error (poison row) falls back to per-product so one bad row can't
+            # fail the page; a sustained outage fails the page for retry next run
+            # (never hammering per-product against a dead connection).
             if pending_upserts:
                 batch_products = [p for (p, _s) in pending_upserts]
-                batch_ok = False
-                for attempt in range(1, 4):
-                    try:
-                        repo.upsert_products_batch(store_id, batch_products)
-                        batch_ok = True
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Batched final upsert failed store=%s attempt=%s/3 size=%s: %s",
-                            store_id,
-                            attempt,
-                            len(batch_products),
-                            exc,
-                        )
-                if batch_ok:
+                outcome, exc = _batched_upsert_with_retry(
+                    repo, store_id, batch_products, logger=logger
+                )
+                if outcome == "ok":
                     for product, existing_image_state in pending_upserts:
                         _delete_stale_after_success(product, existing_image_state)
-                else:
+                elif outcome == "data_error":
+                    logger.warning(
+                        "Batched upsert data error store=%s size=%s; retrying per-product: %s",
+                        store_id, len(batch_products), exc,
+                    )
                     for product, existing_image_state in pending_upserts:
                         if not _safe_upsert_product(product):
                             _cleanup_new_uploads_after_upsert_failure(
@@ -2047,6 +2082,14 @@ def run_crawl(
                             final_upsert_failures.append(product.product_id)
                         else:
                             _delete_stale_after_success(product, existing_image_state)
+                else:  # conn_outage — sustained DB outage; fail the page, retry next run
+                    logger.warning(
+                        "Batched upsert connection outage store=%s size=%s; failing "
+                        "page for retry next run: %s",
+                        store_id, len(batch_products), exc,
+                    )
+                    for product, _s in pending_upserts:
+                        final_upsert_failures.append(product.product_id)
 
             # One more repair pass for products that still have source images but are missing
             # uploaded image URLs and/or gender probabilities.
