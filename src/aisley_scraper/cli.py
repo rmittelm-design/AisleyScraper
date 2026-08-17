@@ -2753,7 +2753,7 @@ def run_crawl(
             )
             return p2_success
 
-        async def _persist_batch_stream(batch: list[StoreSeed]) -> tuple[int, int]:
+        async def _persist_batch_stream(batch: list[StoreSeed], conc: int) -> tuple[int, int]:
             processed_in_batch = 0
             success_in_batch = 0
             stall_interval = int(getattr(settings, "crawl_stall_log_interval_sec", 60) or 0)
@@ -3008,12 +3008,20 @@ def run_crawl(
                         return False
 
                 try:
-                    # The batch IS the concurrency unit: run_crawl sizes each batch to
-                    # the desired per-lane concurrency (small vs large stores), so
-                    # processing the whole batch at once = that many stores in parallel.
-                    # Safe because every Repository call opens its own connection.
+                    # Streaming concurrency: run at most `conc` stores at once over
+                    # the WHOLE lane, starting the next store the moment a slot frees.
+                    # A slow giant no longer idles the other slots the way the old
+                    # fixed-batch gather did (it waited for the slowest store in each
+                    # group of `conc` before starting the next group). Safe because
+                    # every Repository write uses its own per-thread connection.
+                    sem = asyncio.Semaphore(max(1, conc))
+
+                    async def _gated_store(seed: StoreSeed) -> bool:
+                        async with sem:
+                            return await _bounded_store(seed)
+
                     results = await asyncio.gather(
-                        *(_bounded_store(seed) for seed in batch),
+                        *(_gated_store(seed) for seed in batch),
                         return_exceptions=True,
                     )
                     for seed, r in zip(batch, results):
@@ -3109,9 +3117,10 @@ def run_crawl(
         else:
             # --phase both: two concurrent lanes so one giant store can't block the
             # rest — small stores first (higher concurrency; they finish fast), then
-            # large stores (lower concurrency, gentler on the CDN). Each batch is
-            # processed concurrently by _persist_batch_stream, so batch size == that
-            # lane's concurrency.
+            # large stores (lower concurrency, gentler on the CDN). Each lane is
+            # streamed at its concurrency by _persist_batch_stream: at most `conc`
+            # stores run at once and a freed slot immediately starts the next store,
+            # so a slow giant never idles the other slots.
             small_conc = max(1, int(settings.crawl_small_store_concurrency))
             large_conc = max(1, int(settings.crawl_large_store_concurrency))
             small_seeds, large_seeds = _partition_seeds_by_size(
@@ -3134,14 +3143,15 @@ def run_crawl(
                     f"--- lane={lane_name}: {len(lane_seeds)} store(s) at concurrency {conc} ---",
                     flush=True,
                 )
-                for start in range(0, len(lane_seeds), conc):
-                    batch = lane_seeds[start : start + conc]
-                    processed_in_batch, success_in_batch = asyncio.run(
-                        _persist_batch_stream(batch)
-                    )
-                    processed_count += processed_in_batch
-                    success_count += success_in_batch
-                    print(f"Progress: persisted {processed_count}/{len(seeds)} stores", flush=True)
+                # Stream the whole lane at `conc` concurrency (a freed slot starts
+                # the next store immediately) instead of running fixed batches of
+                # `conc` to completion — so one slow giant can't idle the lane.
+                processed_in_lane, success_in_lane = asyncio.run(
+                    _persist_batch_stream(lane_seeds, conc)
+                )
+                processed_count += processed_in_lane
+                success_count += success_in_lane
+                print(f"Progress: persisted {processed_count}/{len(seeds)} stores", flush=True)
 
             print(f"Crawled {success_count}/{len(seeds)} stores successfully", flush=True)
 
