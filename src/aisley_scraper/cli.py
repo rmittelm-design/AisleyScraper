@@ -484,8 +484,17 @@ def _get_store_urls_from_repo(repo: Repository) -> list[str]:
     return []
 
 
-def _resolve_run_id(state_path: str, run_id: str | None, fresh: bool) -> tuple[str, str | None]:
-    """Return (new_run_id, old_run_id_to_purge). old_run_id_to_purge is set only on --fresh."""
+def _resolve_run_id(
+    state_path: str, run_id: str | None, fresh: bool
+) -> tuple[str, str | None, str]:
+    """Return (new_run_id, old_run_id_to_purge, origin).
+
+    old_run_id_to_purge is set only on --fresh. ``origin`` is one of:
+    "fresh" (--fresh passed), "adopted" (explicit --run-id), "resume"
+    (existing non-empty state file), or "new" (no/empty state file → a
+    brand-new run staging every store). The origin drives the RESUMING-vs-
+    STARTING-NEW startup log so a from-scratch launch can never be silent.
+    """
     state_file = Path(state_path)
 
     if fresh:
@@ -496,20 +505,20 @@ def _resolve_run_id(state_path: str, run_id: str | None, fresh: bool) -> tuple[s
                 old_run_id = persisted
         resolved = run_id or str(uuid4())
         state_file.write_text(resolved, encoding="utf-8")
-        return resolved, old_run_id
+        return resolved, old_run_id, "fresh"
 
     if run_id:
         state_file.write_text(run_id, encoding="utf-8")
-        return run_id, None
+        return run_id, None, "adopted"
 
     if state_file.exists():
         persisted = state_file.read_text(encoding="utf-8").strip()
         if persisted:
-            return persisted, None
+            return persisted, None, "resume"
 
     resolved = str(uuid4())
     state_file.write_text(resolved, encoding="utf-8")
-    return resolved, None
+    return resolved, None, "new"
 
 
 def _resolve_existing_run_id(state_path: str, run_id: str | None) -> str:
@@ -1425,7 +1434,9 @@ def run_crawl(
             else:
                 all_seeds = all_seeds[: settings.crawl_max_stores_per_run]
 
-            resolved_run_id, old_run_id = _resolve_run_id(settings.crawl_run_state_path, run_id, fresh)
+            resolved_run_id, old_run_id, run_origin = _resolve_run_id(
+                settings.crawl_run_state_path, run_id, fresh
+            )
             if old_run_id and old_run_id != resolved_run_id:
                 purge_run = getattr(repo, "purge_run", None)
                 if callable(purge_run):
@@ -1460,6 +1471,37 @@ def run_crawl(
                 seeds = [seed for seed in all_seeds if seed.store_url in eligible_urls]
             else:
                 seeds = all_seeds
+
+            # Make RESUME-vs-from-scratch visible at startup so a brand-new run
+            # (all stores re-staged as pending) can never happen silently again.
+            count_startup = getattr(repo, "count_run_store_status", None)
+            if callable(count_startup):
+                done = count_startup(
+                    run_id=resolved_run_id, status="scraped"
+                ) + count_startup(run_id=resolved_run_id, status="completed")
+                pend = count_startup(run_id=resolved_run_id, status="pending")
+                fail = count_startup(run_id=resolved_run_id, status="failed")
+                if run_origin in ("resume", "adopted"):
+                    logger.info(
+                        "RESUMING run_id=%s (%s): %s done, %s pending, %s failed of %s "
+                        "stores; %s to process this launch.",
+                        resolved_run_id,
+                        run_origin,
+                        done,
+                        pend,
+                        fail,
+                        len(all_seeds),
+                        len(seeds),
+                    )
+                else:
+                    logger.info(
+                        "STARTING NEW run_id=%s (%s): all %s stores pending, %s to "
+                        "process this launch.",
+                        resolved_run_id,
+                        run_origin,
+                        len(all_seeds),
+                        len(seeds),
+                    )
 
         uploader = StorageUploader(settings)
         geocode_cache: dict[str, tuple[float, float] | None] = {}
@@ -3034,10 +3076,31 @@ def run_crawl(
                 pending = count_status(run_id=resolved_run_id, status="pending")
                 scraped = count_status(run_id=resolved_run_id, status="scraped")
                 failed = count_status(run_id=resolved_run_id, status="failed")
+                # Retain the run-state pointer on completion. Previously it was
+                # unlinked here when pending/scraped/failed were all 0 — but a
+                # cleanly finished run leaves every store in status "completed"
+                # (not counted here), so that condition always tripped and the
+                # NEXT launch, finding no pointer, minted a brand-new run_id and
+                # re-scraped all stores from scratch. Keeping the pointer makes a
+                # no-fresh relaunch RESUME (a no-op when fully done); a new full
+                # cycle is now started explicitly with --fresh.
                 if pending == 0 and scraped == 0 and failed == 0:
-                    state_file = Path(settings.crawl_run_state_path)
-                    if state_file.exists():
-                        state_file.unlink()
+                    logger.info(
+                        "Run complete (run_id=%s): 0 pending, 0 failed. State file "
+                        "retained at %s; re-launch without --fresh resumes this run "
+                        "(a no-op when fully done). Pass --fresh to begin a new full cycle.",
+                        resolved_run_id,
+                        settings.crawl_run_state_path,
+                    )
+                else:
+                    logger.info(
+                        "Run stopped (run_id=%s): pending=%s scraped=%s failed=%s remain. "
+                        "Re-launch without --fresh to resume.",
+                        resolved_run_id,
+                        pending,
+                        scraped,
+                        failed,
+                    )
 
         return 0
     finally:

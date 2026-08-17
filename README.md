@@ -75,7 +75,7 @@ This is the canonical command for a full catalog scrape + update. In a single de
 
 Notes:
 
-- Add `--fresh` **only** to start a brand-new run id — it purges the previous run's tracking (products are safe; run bookkeeping is not). **Never `--fresh` while another crawl is live.** Without `--fresh`, a run resumes from pending/failed stores.
+- **Resume vs. new cycle (important):** without `--fresh`, the command **resumes** the active run — it processes only `pending`/`failed` stores and **never silently restarts from scratch**. The startup log always tells you which it is: `RESUMING run_id=… : N done, M pending …` or `STARTING NEW run_id=… : all N pending …`. When a run finishes, its run-id pointer (`.aisley_active_run_id`) is **retained**, so re-running without `--fresh` on a completed run is a safe no-op ("0 to process"). To begin a **brand-new full cycle**, add `--fresh` — it mints a new run id and purges the previous run's tracking (products are safe; run bookkeeping is not). **Never `--fresh` while a crawl is live**; a *completed* run is not live, so `--fresh` is safe once it has finished.
 - Canary first if you like: `aisley-scraper crawl-stores --mark-removed --limit 20`.
 - **Do not** use `refresh-products` for a full update — it is an *update-only* path: it refreshes metadata on existing products and marks removed ones unavailable, but it **skips new products and never scrapes new/empty stores** (and it runs sequentially, not two-lane). Use it only for a fast price/availability sweep of the existing catalog. See [Refresh metadata only (`refresh-products`)](#refresh-metadata-only-refresh-products) below.
 

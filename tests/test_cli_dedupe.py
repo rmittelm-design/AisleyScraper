@@ -973,7 +973,9 @@ def test_run_crawl_db_first_resume_processes_pending_only(monkeypatch) -> None:
     monkeypatch.setattr(cli, "Repository", _FakeRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
     monkeypatch.setattr(cli, "scrape_many_stream", _fake_scrape_many_stream)
-    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: ("run-1", None))
+    monkeypatch.setattr(
+        cli, "_resolve_run_id", lambda state_path, run_id, fresh: ("run-1", None, "resume")
+    )
 
     exit_code = cli.run_crawl(limit=None)
 
@@ -1036,7 +1038,9 @@ def test_run_crawl_enforce_preflight_executes_orphan_gate(monkeypatch) -> None:
     monkeypatch.setattr(cli, "load_store_seeds_from_dir", lambda path, _settings: [])
     monkeypatch.setattr(cli, "Repository", _FakeRepo)
     monkeypatch.setattr(cli, "StorageUploader", _FakeUploader)
-    monkeypatch.setattr(cli, "_resolve_run_id", lambda state_path, run_id, fresh: ("run-2", None))
+    monkeypatch.setattr(
+        cli, "_resolve_run_id", lambda state_path, run_id, fresh: ("run-2", None, "resume")
+    )
     monkeypatch.setattr(cli, "_run_orphan_preflight", _fake_preflight)
 
     exit_code = cli.run_crawl(limit=None)
