@@ -58,6 +58,18 @@ from aisley_scraper.storage_integrity import (
 )
 
 
+def _image_key(url: str) -> str:
+    """Base image identity for comparing scraped vs stored product images across
+    re-crawls. Strips whitespace and the query string — notably Shopify's
+    ``?v=<version>`` cache-buster, which Shopify rewrites on *any* product edit
+    (price, inventory, restock) even when the image bytes are unchanged. Comparing
+    by base path (same path == same image) lets the skip-revalidation optimisation
+    actually fire, so an already-validated product is not needlessly re-downloaded
+    and re-run through CLIP just because its ``?v=`` timestamp moved.
+    """
+    return url.strip().split("?", 1)[0]
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1781,7 +1793,9 @@ def run_crawl(
                     )
 
             def _normalize_source_urls(urls: list[str]) -> list[str]:
-                return [url.strip() for url in urls if url and url.strip()]
+                # Compare by base image path (ignore the volatile Shopify ?v= param)
+                # so unchanged products actually skip re-download + re-validation.
+                return [_image_key(url) for url in urls if url and url.strip()]
 
             def _needs_postprocess(product) -> bool:
                 existing_image_state = existing_state_by_product_id.get(product.product_id)
@@ -2152,7 +2166,9 @@ def run_crawl(
                     )
 
                     def _norm(urls: list[str]) -> list[str]:
-                        return [u.strip() for u in (urls or []) if u.strip()]
+                        # Compare by base image path (ignore the volatile Shopify ?v=
+                        # param) so unchanged products skip re-download + re-validation.
+                        return [_image_key(u) for u in (urls or []) if u.strip()]
 
                     # ── Stage 1: load staged data + upsert stores in parallel ─────
                     # The cross-region Supabase pooler intermittently FREEZES a read
