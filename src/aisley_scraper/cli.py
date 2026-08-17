@@ -538,6 +538,42 @@ def _resolve_existing_run_id(state_path: str, run_id: str | None) -> str:
     )
 
 
+class _StoreWatchdogTimeout(Exception):
+    """Raised by the per-store idle watchdog when a store stops making progress."""
+
+
+async def _await_task_with_idle_watchdog(
+    task: "asyncio.Task", progress: dict, *, idle: float, hard: float, poll: float
+):
+    """Await ``task`` and return its result.
+
+    Cancel it and raise :class:`_StoreWatchdogTimeout` if it makes NO forward
+    progress for ``idle`` seconds (``progress['ts']`` unchanged) — the signature
+    of a real wedge — or, when ``hard`` > 0, if it exceeds ``hard`` seconds total.
+    A big-but-progressing store keeps bumping ``progress['ts']`` (via the task) and
+    so runs to natural completion however long that takes. ``progress['ts']`` must
+    be updated to ``loop.time()`` by the task at each milestone (page fetched or
+    persist completed).
+    """
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=poll)
+        if task in done:
+            return task.result()
+        now = loop.time()
+        idle_hit = (now - progress["ts"]) >= idle
+        hard_hit = hard > 0 and (now - start) >= hard
+        if idle_hit or hard_hit:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise _StoreWatchdogTimeout(
+                f"store idle >{int(idle)}s (no progress)"
+                if idle_hit
+                else f"store timeout >{int(hard)}s"
+            )
+
+
 def _fmt_duration(seconds: float) -> str:
     s = int(max(0, seconds))
     h, rem = divmod(s, 3600)
@@ -1893,6 +1929,7 @@ def run_crawl(
 
             finalized_ids = {p.product_id for p in processing_products}
             final_upsert_failures: list[str] = []
+            pending_upserts: list = []
 
             fallback_products = []
             if postprocess_failed:
@@ -1955,11 +1992,7 @@ def run_crawl(
                     )
 
                 _try_enrich_from_supabase_images(product)
-                if not _safe_upsert_product(product):
-                    _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
-                    final_upsert_failures.append(product.product_id)
-                else:
-                    _delete_stale_after_success(product, existing_image_state)
+                pending_upserts.append((product, existing_image_state))
 
             for product in processing_products:
                 if _skip_no_image_product(product):
@@ -1979,12 +2012,41 @@ def run_crawl(
                     )
 
                 _try_enrich_from_supabase_images(product)
+                pending_upserts.append((product, existing_image_state))
 
-                if not _safe_upsert_product(product):
-                    _cleanup_new_uploads_after_upsert_failure(product, existing_image_state)
-                    final_upsert_failures.append(product.product_id)
+            # Batched final upsert for the whole page (unchanged + image-changed
+            # products) collapses up to ~250 per-product DB round-trips into one.
+            # On a batch executemany error (all-or-nothing txn) fall back to
+            # per-product so a single poison row can't fail the whole page and the
+            # per-product failure accounting (final_upsert_failures) is preserved.
+            if pending_upserts:
+                batch_products = [p for (p, _s) in pending_upserts]
+                batch_ok = False
+                for attempt in range(1, 4):
+                    try:
+                        repo.upsert_products_batch(store_id, batch_products)
+                        batch_ok = True
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Batched final upsert failed store=%s attempt=%s/3 size=%s: %s",
+                            store_id,
+                            attempt,
+                            len(batch_products),
+                            exc,
+                        )
+                if batch_ok:
+                    for product, existing_image_state in pending_upserts:
+                        _delete_stale_after_success(product, existing_image_state)
                 else:
-                    _delete_stale_after_success(product, existing_image_state)
+                    for product, existing_image_state in pending_upserts:
+                        if not _safe_upsert_product(product):
+                            _cleanup_new_uploads_after_upsert_failure(
+                                product, existing_image_state
+                            )
+                            final_upsert_failures.append(product.product_id)
+                        else:
+                            _delete_stale_after_success(product, existing_image_state)
 
             # One more repair pass for products that still have source images but are missing
             # uploaded image URLs and/or gender probabilities.
@@ -2813,13 +2875,18 @@ def run_crawl(
                 fetcher = Fetcher(settings)
                 done_counter = [0]  # progress index shared across the concurrent stores
 
-                async def _process_one_store(seed: StoreSeed) -> bool:
+                async def _process_one_store(
+                    seed: StoreSeed, progress: dict | None = None
+                ) -> bool:
                     persisted_ok = True
                     error_message = "store_persist_failed"
                     seen_ids: set[str] = set()
                     page_state: dict = {"complete": False}
                     try:
                         async for outcome in _iter_page_outcomes(seed, fetcher, page_state):
+                            if progress is not None:  # heartbeat: a page was fetched
+                                progress["ts"] = asyncio.get_running_loop().time()
+                                progress["ticks"] += 1
                             if isinstance(outcome, ScrapeResult):
                                 seen_ids.update(
                                     p.product_id for p in outcome.products if p.product_id
@@ -2844,6 +2911,9 @@ def run_crawl(
                             if not persisted_ok:
                                 error_message = "store_persist_failed"
                                 break
+                            if progress is not None:  # heartbeat: a page persisted
+                                progress["ts"] = asyncio.get_running_loop().time()
+                                progress["ticks"] += 1
                             gc.collect()
                     except Exception as exc:  # noqa: BLE001
                         persisted_ok = False
@@ -2887,24 +2957,40 @@ def run_crawl(
                     )
                     return persisted_ok
 
-                # Per-store wall-clock ceiling: bound each store so one that wedges
-                # (an uncapped image chunk, a frozen pooler write) is abandoned and
-                # marked failed for retry instead of stalling the whole lane. This is
-                # the catch-all for hangs that the per-request timeouts don't cover.
-                store_deadline = float(
-                    getattr(settings, "crawl_store_total_timeout_sec", 1200) or 1200
+                # Per-store NO-PROGRESS (idle) watchdog: abort a store only when it
+                # makes zero forward progress (no page fetched and no persist
+                # completed) for crawl_store_idle_timeout_sec — the signature of a
+                # real wedge (frozen pooler write, uncapped image chunk, slow-stream
+                # request). A big-but-progressing store keeps resetting the idle clock
+                # and runs to natural completion, so it is never falsely killed
+                # mid-scrape. crawl_store_total_timeout_sec (default 0 = off) is an
+                # optional absolute ceiling for defense-in-depth.
+                idle_deadline = float(
+                    getattr(settings, "crawl_store_idle_timeout_sec", 600) or 600
+                )
+                hard_deadline = float(
+                    getattr(settings, "crawl_store_total_timeout_sec", 0) or 0
+                )
+                watchdog_poll = max(
+                    1.0, min(idle_deadline, float(stall_interval or idle_deadline))
                 )
 
                 async def _bounded_store(seed: StoreSeed) -> bool:
+                    loop = asyncio.get_running_loop()
+                    progress = {"ts": loop.time(), "ticks": 0}
+                    task = asyncio.create_task(_process_one_store(seed, progress))
                     try:
-                        return await asyncio.wait_for(
-                            _process_one_store(seed), timeout=store_deadline
+                        return await _await_task_with_idle_watchdog(
+                            task,
+                            progress,
+                            idle=idle_deadline,
+                            hard=hard_deadline,
+                            poll=watchdog_poll,
                         )
-                    except asyncio.TimeoutError:
+                    except _StoreWatchdogTimeout as exc:
                         logger.warning(
-                            "Store exceeded %.0fs wall-clock; abandoning and marking "
-                            "failed (retried next run): %s",
-                            store_deadline,
+                            "Abandoning store (%s), marking failed for retry: %s",
+                            exc,
                             seed.store_url,
                         )
                         ms = getattr(repo, "mark_run_store_status", None)
@@ -2914,7 +3000,7 @@ def run_crawl(
                                     run_id=resolved_run_id,
                                     website=seed.store_url,
                                     status="failed",
-                                    error_message=f"store timeout >{int(store_deadline)}s",
+                                    error_message=str(exc),
                                 )
                             except Exception:  # noqa: BLE001 - best-effort status write
                                 pass

@@ -50,15 +50,25 @@ class Settings(BaseSettings):
     crawl_request_total_timeout_sec: int = Field(
         default=60, alias="CRAWL_REQUEST_TOTAL_TIMEOUT_SEC"
     )
-    # Per-store wall-clock ceiling in --phase both. A single request is bounded by
-    # crawl_request_total_timeout_sec, but a store can still wedge indefinitely in a
-    # place those bounds don't cover — an uncapped image-validation chunk, or a
-    # frozen Supabase pooler write (invisible to statement_timeout / TCP). This is
-    # the catch-all: any store exceeding it is abandoned and marked failed (retried
-    # on the next run) so one bad store can't stall the whole lane. Generous so a
-    # legitimately huge catalog is never falsely timed out.
+    # Per-store NO-PROGRESS (idle) ceiling in --phase both. The idle clock advances
+    # only when the store makes real forward progress (a products.json page fetched
+    # or a persist completed), so a legitimately huge catalog that keeps paginating
+    # resets it and runs to natural completion, however long that takes — it is never
+    # falsely killed mid-scrape the way a fixed wall-clock cap would. A store making
+    # ZERO forward progress for this long — a frozen Supabase pooler write, an
+    # uncapped image-validation chunk, a slow-stream request past its bound — is
+    # abandoned and marked failed (retried on the next run) so one bad store can't
+    # stall the whole lane. 600s is generous margin over the slowest legitimate
+    # single page (many new products validated/upserted at once) while still killing
+    # a true wedge in ~10 min instead of 20.
+    crawl_store_idle_timeout_sec: int = Field(
+        default=600, alias="CRAWL_STORE_IDLE_TIMEOUT_SEC"
+    )
+    # Optional ABSOLUTE per-store wall-clock ceiling for defense-in-depth. Default 0
+    # = disabled, letting the idle watchdog above be authoritative so a big-but-
+    # progressing store is never falsely timed out. Set > 0 for a hard cap.
     crawl_store_total_timeout_sec: int = Field(
-        default=1200, alias="CRAWL_STORE_TOTAL_TIMEOUT_SEC"
+        default=0, alias="CRAWL_STORE_TOTAL_TIMEOUT_SEC"
     )
     # The pre-crawl orphan-storage audit (see _run_orphan_preflight) walks the
     # ENTIRE storage bucket via the Supabase Storage API before scraping starts,

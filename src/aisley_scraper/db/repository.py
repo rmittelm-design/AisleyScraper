@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from urllib.parse import urlparse
 
 import psycopg
@@ -98,6 +99,8 @@ class Repository:
         else:
             self._dsn = dsn
             self._connect_timeout = max(1, int(connect_timeout))
+        # Per-thread reused connection for the hot write path (see _hot_conn).
+        self._local = threading.local()
 
     def _connect(self) -> psycopg.Connection:
         if not self._dsn:
@@ -118,6 +121,24 @@ class Repository:
             keepalives_count=3,
             tcp_user_timeout=30000,
         )
+
+    def _hot_conn(self) -> psycopg.Connection:
+        """A per-thread, REUSED connection for the hot write path.
+
+        Opening a fresh connection per product upsert costs a full TCP+TLS
+        handshake to the pooler (~0.1-0.2s each) — the dominant cost when a large
+        store persists tens of thousands of products. Reusing one connection per
+        worker thread eliminates that handshake. On error the connection is dropped
+        (see upsert_products_batch) so the next call reconnects; callers already
+        retry, so a stale pooled connection recovers transparently. Each
+        asyncio.to_thread worker gets its own connection, so this stays thread-safe.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is not None and not conn.closed:
+            return conn
+        conn = self._connect()
+        self._local.conn = conn
+        return conn
 
     # ── Schema ────────────────────────────────────────────────────────────────
     def ensure_schema(self) -> None:
@@ -783,10 +804,27 @@ class Repository:
             )
             for product in products
         ]
-        with self._connect() as conn:
+        # Reuse a per-thread connection instead of opening one per call: a large
+        # store persists tens of thousands of products, and a fresh TCP+TLS
+        # handshake to the pooler per product was the dominant crawl cost. On any
+        # error, drop the (possibly stale) pooled connection so the next call
+        # reconnects — callers retry (_safe_upsert_product), so this is transparent.
+        conn = self._hot_conn()
+        try:
             with conn.cursor() as cur:
                 cur.executemany(sql, params)
             conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._local.conn = None
+            raise
 
     def update_products_metadata(
         self,
