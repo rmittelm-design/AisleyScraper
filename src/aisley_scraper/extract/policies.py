@@ -270,6 +270,57 @@ def _candidate_score(text: str, *, category: str | None = None) -> float:
     return density
 
 
+_RATE_TIER = (
+    r"(?:standard|expedited|express|ground|economy|priority|overnight|"
+    r"next[\s-]?day|two[\s-]?day|2[\s-]?day|first[\s-]?class|flat[\s-]?rate|"
+    r"usps|ups|fedex|dhl)"
+)
+_RATE_ROW_RE = re.compile(r"(?i)(" + _RATE_TIER + r"[^$]{0,90}?)\$\s?(\d+(?:\.\d{2})?)\b")
+
+
+def _merge_missing_rate_lines(best_txt: str, all_texts: list[str | None]) -> str:
+    """Append shipping rate-table rows (method + $ cost) present on ANY candidate
+    page but absent from the chosen text.
+
+    The extractor keeps only the single best-scoring shipping page, so a concrete
+    rate table on a lower-scoring candidate — e.g. a nav-heavy /pages/shipping-info
+    whose density lost to a clean /policies/shipping-policy that has no rates —
+    is otherwise dropped, and the stored policy loses real shipping prices
+    (marinelayer's Standard $5 / Expedited $20, lemsshoes' $5.95). This grafts
+    those cost rows back on. Guards against free-shipping *thresholds* ("free over
+    $X", "$X+ orders"), which are not shipping costs; skips $0 rows and any amount
+    already represented in the chosen text.
+    """
+    have = {a.replace(" ", "") for a in re.findall(r"\$\s?\d+(?:\.\d{2})?", best_txt)}
+    rows: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for text in all_texts:
+        if not text:
+            continue
+        for m in _RATE_ROW_RE.finditer(text):
+            if float(m.group(2)) <= 0:  # $0 = free, not a cost
+                continue
+            before = text[max(0, m.start() - 24) : m.start()].lower()
+            if "free" in before or "complimentary" in before or "over" in before:
+                continue  # a free-shipping threshold, not a rate
+            if text[m.end() : m.end() + 4].lstrip().startswith("+"):
+                continue  # "$X+ orders" threshold
+            label = re.sub(r"\s+", " ", m.group(1)).strip(" *–-,:")
+            if "free" in label.lower() or "over" in label.lower():
+                continue
+            amt = f"${m.group(2)}"
+            if amt.replace(" ", "") in have:
+                continue  # cost already in the chosen text
+            key = (label.lower(), amt)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(f"{label} {amt}")
+    if not rows:
+        return best_txt
+    return best_txt.rstrip() + "\nShipping rates: " + "; ".join(rows) + "."
+
+
 def stored_policy_is_weak(text: str | None, *, min_score: float = 2.0) -> bool:
     """True when an ALREADY-STORED shipping_returns value looks like boilerplate.
 
@@ -682,6 +733,14 @@ async def fetch_shipping_returns(
         if scored:
             scored.sort(key=lambda item: -item[0])
             best_score_, best_url, best_txt = scored[0]
+            if category == "shipping":
+                # A concrete rate table (Standard $5 / Expedited $20 / …) often
+                # lives on a candidate that lost the density scoring (a nav-heavy
+                # /pages/shipping-info). Harvest its cost rows so they aren't
+                # dropped just because a cleaner, rate-free page outscored it.
+                best_txt = _merge_missing_rate_lines(
+                    best_txt, [t for _sc, _u, t in scored]
+                )
             # Stored uncapped; the cap is applied at emit time so a combined
             # page (which stands in for BOTH categories) gets both budgets.
             found[category] = (best_url, best_txt)
