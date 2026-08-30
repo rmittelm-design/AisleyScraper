@@ -8,7 +8,7 @@ Key behaviors:
 - **One folder of TSV seeds**: every `*.tsv` in `INPUT_TSV_DIR` (default `./data/stores`) is parsed and merged by url.
 - **Store branches**: each TSV row is `url <tab> store_name <tab> addr1 <tab> addr2 …`. Products are scraped once; one `shopify_stores` row is written per branch address (same url + name, each branch's own address + geocoded lat/long), and scraped products link to the **first** branch (third column). Online/address-less stores collapse to a single row.
 - **Non-apparel filtering**: scraped items are dropped when they match (a) kids/children terms — kid/child/boy/girl/toddler/baby/infant/newborn (aggressive substring on name/url/handle), or (b) non-apparel categories — furniture, boxes, pet/petwear, gift cards/cards, puzzles, sundries, bar goodies, candles, lighters, catchalls, books/coffee-table books, home décor, picture frames, serveware, soaps, diffusers, towels/tea towels, drinkware, beauty (perfume/serum/balm/etc.) (whole-word/phrase match on name/url/handle/product_type, so apparel like "spring", "cardigan", "petite" is preserved). **Jewelry and watches are intentionally kept.**
-- **Shipping/returns**: both a **return/refund policy** and a **shipping/delivery policy** are sought independently for each store (canonical Shopify `/policies/*`, common `/pages/*`, combined shipping+returns pages, then matching homepage links). Each is captured with its own length budget so one can't crowd out the other, and stored in `shopify_stores.shipping_returns` (labelled `RETURNS:` / `SHIPPING:` sections) and `shopify_stores.shipping_returns_url` (the page URL(s), `|`-joined).
+- **Shipping/returns**: both a **return/refund policy** and a **shipping/delivery policy** are sought independently for each store (canonical Shopify `/policies/*`, common `/pages/*`, combined shipping+returns pages, then matching homepage links). Each is captured with its own length budget so one can't crowd out the other, and stored in `shopify_stores.shipping_returns` (labelled `RETURNS:` / `SHIPPING:` sections) and `shopify_stores.shipping_returns_url` (the page URL(s), `|`-joined). Keeping these complete and accurate is a defined standard with a repeatable maintenance loop — see [Keeping shipping/returns policies at standard](docs/shipping-returns-policy-standard.md).
 
 ## Quick start
 
@@ -349,6 +349,20 @@ Local mode notes:
 - Set `PERSISTENCE_TARGET=local` to skip Supabase writes and save results to `LOCAL_OUTPUT_PATH`.
 - In local mode, scraped image URLs are preserved; Supabase image upload is not performed.
 
+## Keeping shipping/returns policies at standard
+
+A store's `shipping_returns` is "at standard" when it covers both returns and shipping (a `RETURNS:` and a `SHIPPING:` section, or a single `SHIPPING & RETURNS:` section from a combined page), is a real policy (not navigation/legal boilerplate — see `stored_policy_is_weak()` in `src/aisley_scraper/extract/policies.py`), and states the concrete facets the store publishes (rate table, free-shipping threshold, return window, restocking fee, final-sale exclusions, international/customs terms, carriers, contact). Established stores average ~2,400 characters; a policy far below ~1,200 is almost always missing facets and should be re-audited.
+
+Maintain it with a three-tier loop, cheapest first:
+
+1. **Automated recapture** — `aisley-scraper recapture-policies --only-broken` re-fetches and rewrites NULL/boilerplate rows (`--dry-run`, `--domain <d>`, `--limit N`, `--clear-unfixable`). The extractor merges rate tables across candidate pages so costs aren't dropped.
+2. **LLM audit + verify sweep** — a two-stage `pipeline(stores, audit, verify)` workflow that compares each stored policy against the store's **live** pages and adds only facets an independent verifier can re-confirm (the verify stage is mandatory — it strips hallucinated facts).
+3. **Manual capture** — for bot-blocked (HTTP 429) or JS-rendered help centers, transcribe from the live URLs/screenshots into the same format.
+
+**Never overwrite a good DB value with a rate-limited (thin) re-fetch** — a re-verify "FAIL" means "couldn't re-fetch," not "the stored value is wrong": check the current DB value first, dry-run, and only write when the new text is richer.
+
+Full runbook, facet checklist, and acceptance checks: [docs/shipping-returns-policy-standard.md](docs/shipping-returns-policy-standard.md).
+
 ## Troubleshooting
 
 ## GCP Redis Pause/Resume Runbook
@@ -512,7 +526,7 @@ If you need all rows to stage, remove known non-`/products.json` domains from th
 
 - Store profile extraction: store name (from the TSV, or the scraped homepage `<title>` when the TSV omits it), website, instagram (online), or address (offline).
 - Store branches: one `shopify_stores` row per branch address from the TSV (same url + name, each with its own address and geocoded `lat`/`long`); products are scraped once and linked to the first branch.
-- Shipping/returns capture: both the return/refund policy and the shipping/delivery policy are located independently (Shopify `/policies/*`, common `/pages/*`, combined pages, homepage links) and stored in `shopify_stores.shipping_returns` (labelled `RETURNS:`/`SHIPPING:` sections, each length-capped) and `shopify_stores.shipping_returns_url` (`|`-joined source urls).
+- Shipping/returns capture: both the return/refund policy and the shipping/delivery policy are located independently (Shopify `/policies/*`, common `/pages/*`, combined pages, homepage links) and stored in `shopify_stores.shipping_returns` (labelled `RETURNS:`/`SHIPPING:` sections, each length-capped) and `shopify_stores.shipping_returns_url` (`|`-joined source urls). The completeness/accuracy standard and its maintenance loop are documented in [docs/shipping-returns-policy-standard.md](docs/shipping-returns-policy-standard.md).
 - Product extraction: item name, description, `sku`, `price_cents` (integer), `updated_at`, images, sizes/colors/brand only when explicitly present and associated with product image context.
 - Product extraction also includes `gender_label` (`male` / `female` / `unisex`) only when explicitly present in scraped product data.
 - Kids/children exclusion: items whose name/url/handle contain kid/child/boy/girl/toddler/baby/infant/newborn are dropped (aggressive substring match).
