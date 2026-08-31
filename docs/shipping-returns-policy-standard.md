@@ -99,6 +99,17 @@ Overland is the worked example: its help center was unreachable to the extractor
 
 ---
 
+## Failure modes seen (and the guards)
+
+These are real ways policies silently fell below standard. Each has a cheap guard — apply them.
+
+- **Silent 0-row writes.** `UPDATE shopify_stores SET shipping_returns=… WHERE website ILIKE %needle%` hits **0 rows with no error** when the store has no matching row (0 rows in the table) or a scraped-flag/URL mismatch. The apply is reported "done" but nothing persists. Several manual policies (colbo, marni, edithmachinist, aquelarre, jmclaughlin) were lost this way. **Guard:** assert `cur.rowcount > 0` on every targeted policy write; roll back and surface if 0. Then re-read the row to confirm.
+- **Manual/screenshot captures are unreliable.** They omit facets and *fabricate by conflation* — colbo's stored value claimed free returns (live has a **$10 restocking fee**) and invented "free international over $500" by merging the homepage promo banner with the shipping page (a figure on neither source). **Guard:** never accept a manual capture as final; verify every fact against the store's live `/policies/*` pages, and attribute each figure to the exact page it appears on (banner ≠ policy).
+- **Wrong URL hides the real store.** colbo was known as the apex `colbo.nyc` (404/bot-blocked); the real Shopify store is `shop.colbo.nyc`. Every automated fetch hit the dead URL and kept the thin manual version. **Guard:** when a domain 404s/bot-blocks, try `shop.<domain>` and other subdomains (and confirm `…/products.json` returns real JSON) before declaring it unreachable.
+- **Audit scope blind spot.** A completeness sweep that only scores stores which *have* a row + policy + reachable URL silently skips the ones most likely wrong — 0-row stores and wrong-URL stores. **Guard:** the sweep's target set must be built from a completeness critic ("which stores are missing entirely, keyed by a dead URL, or below the length gate?"), not just "stores that already have a policy."
+
+---
+
 ## Acceptance checks
 
 After any policy work, confirm the batch is at standard:
